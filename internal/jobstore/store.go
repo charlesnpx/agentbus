@@ -120,34 +120,39 @@ type Record struct {
 	WorkspaceKey string `json:"workspaceKey"`
 	RequestID    string `json:"requestId"`
 	Backend      string `json:"backend"`
+	// InputMode snapshots the immutable task mode. Empty legacy records mean fixed.
+	InputMode protocol.InputMode `json:"inputMode,omitempty"`
 	// BackendSessionID is assigned only from a backend's turn-final
 	// observation. An omitted value means the job never produced a resumable
 	// backend session; it is not an unknown-session marker.
-	BackendSessionID string                  `json:"backendSessionId,omitempty"`
-	RetainSession    bool                    `json:"retainSession,omitempty"`
-	Model            string                  `json:"model,omitempty"`
-	ModelReported    string                  `json:"modelReported,omitempty"`
-	CWD              string                  `json:"cwd,omitempty"`
-	Write            bool                    `json:"write"`
-	Effort           string                  `json:"effort,omitempty"`
-	TaskSpec         json.RawMessage         `json:"taskSpec,omitempty"`
-	State            protocol.PublicState    `json:"state"`
-	Starting         bool                    `json:"starting,omitempty"`
-	ProcessClaim     *ProcessClaim           `json:"processClaim,omitempty"`
-	Cleanup          protocol.Cleanup        `json:"cleanup"`
-	CreatedAt        time.Time               `json:"createdAt"`
-	UpdatedAt        time.Time               `json:"updatedAt"`
-	StartedAt        *time.Time              `json:"startedAt,omitempty"`
-	FinishedAt       *time.Time              `json:"finishedAt,omitempty"`
-	FailureClass     protocol.FailureClass   `json:"failureClass,omitempty"`
-	FailureReason    string                  `json:"failureReason,omitempty"`
-	Diagnostics      []string                `json:"diagnostics"`
-	Contract         protocol.ContractResult `json:"contract"`
-	ResultText       string                  `json:"resultText,omitempty"`
-	ResultPath       string                  `json:"resultPath,omitempty"`
-	ResultSHA256     string                  `json:"resultSHA256,omitempty"`
-	ResultBytes      int64                   `json:"resultBytes,omitempty"`
-	Artifacts        ArtifactPaths           `json:"artifacts"`
+	BackendSessionID string                     `json:"backendSessionId,omitempty"`
+	RetainSession    bool                       `json:"retainSession,omitempty"`
+	Model            string                     `json:"model,omitempty"`
+	ModelReported    string                     `json:"modelReported,omitempty"`
+	CWD              string                     `json:"cwd,omitempty"`
+	Write            bool                       `json:"write"`
+	Execution        *protocol.ExecutionPosture `json:"execution,omitempty"`
+	Effort           string                     `json:"effort,omitempty"`
+	TaskSpec         json.RawMessage            `json:"taskSpec,omitempty"`
+	// Steers contains text-free delivery metadata separate from immutable TaskSpec.
+	Steers        []protocol.SteerRecord  `json:"steers,omitempty"`
+	State         protocol.PublicState    `json:"state"`
+	Starting      bool                    `json:"starting,omitempty"`
+	ProcessClaim  *ProcessClaim           `json:"processClaim,omitempty"`
+	Cleanup       protocol.Cleanup        `json:"cleanup"`
+	CreatedAt     time.Time               `json:"createdAt"`
+	UpdatedAt     time.Time               `json:"updatedAt"`
+	StartedAt     *time.Time              `json:"startedAt,omitempty"`
+	FinishedAt    *time.Time              `json:"finishedAt,omitempty"`
+	FailureClass  protocol.FailureClass   `json:"failureClass,omitempty"`
+	FailureReason string                  `json:"failureReason,omitempty"`
+	Diagnostics   []string                `json:"diagnostics"`
+	Contract      protocol.ContractResult `json:"contract"`
+	ResultText    string                  `json:"resultText,omitempty"`
+	ResultPath    string                  `json:"resultPath,omitempty"`
+	ResultSHA256  string                  `json:"resultSHA256,omitempty"`
+	ResultBytes   int64                   `json:"resultBytes,omitempty"`
+	Artifacts     ArtifactPaths           `json:"artifacts"`
 }
 
 // SessionHomeRetained reports whether this record's backend session home is
@@ -530,6 +535,13 @@ func (store *Store) List() ([]Record, error) {
 // MarkStarting commits the private no-relaunch marker before a caller spawns
 // a backend process. Only queued jobs may make this transition.
 func (store *Store) MarkStarting(id string) (Record, error) {
+	return store.MarkStartingWithExecution(id, nil)
+}
+
+// MarkStartingWithExecution commits the starting marker and its effective
+// execution posture atomically before a caller spawns a backend process.
+// Only queued jobs may make this transition.
+func (store *Store) MarkStartingWithExecution(id string, execution *protocol.ExecutionPosture) (Record, error) {
 	if err := validateJobID(id); err != nil {
 		return Record{}, fmt.Errorf("%w: %v", ErrInvalid, err)
 	}
@@ -560,6 +572,7 @@ func (store *Store) MarkStarting(id string) (Record, error) {
 		next.Starting = true
 		next.StartedAt = &now
 		next.UpdatedAt = now
+		next.Execution = execution
 		normalizeRecord(&next)
 		if err := validateRecord(next); err != nil {
 			return err
@@ -753,6 +766,143 @@ func (store *Store) AppendDiagnostic(id, diagnostic string) (Record, error) {
 	return result, err
 }
 
+// RecordSteer appends one text-free steering record. Existing message IDs are
+// returned unchanged so the caller can enforce message identity without
+// rewriting the first receipt.
+func (store *Store) RecordSteer(id string, steer protocol.SteerRecord) (protocol.SteerRecord, bool, error) {
+	if err := validateJobID(id); err != nil {
+		return protocol.SteerRecord{}, false, fmt.Errorf("%w: %v", ErrInvalid, err)
+	}
+	now := time.Now().UTC()
+	if steer.CreatedAt.IsZero() {
+		steer.CreatedAt = now
+	}
+	if steer.UpdatedAt.IsZero() {
+		steer.UpdatedAt = steer.CreatedAt
+	}
+	steer.CreatedAt = steer.CreatedAt.UTC()
+	steer.UpdatedAt = steer.UpdatedAt.UTC()
+	if err := validateSteerRecord(steer); err != nil {
+		return protocol.SteerRecord{}, false, err
+	}
+	var result protocol.SteerRecord
+	var existed bool
+	err := store.update(func(tx *bolt.Tx) error {
+		jobs := tx.Bucket(bucketJobs)
+		if jobs == nil {
+			return fmt.Errorf("%w: missing jobs bucket", ErrCorrupt)
+		}
+		current, err := getRecord(jobs, id)
+		if err != nil {
+			return err
+		}
+		for _, existing := range current.Steers {
+			if existing.MessageID == steer.MessageID {
+				result = existing
+				existed = true
+				return nil
+			}
+		}
+		current.Steers = append(current.Steers, steer)
+		current.UpdatedAt = now
+		normalizeRecord(&current)
+		if err := validateRecord(current); err != nil {
+			return err
+		}
+		if err := putRecord(jobs, current); err != nil {
+			return err
+		}
+		result = steer
+		return nil
+	})
+	return result, existed, err
+}
+
+// UpdateSteer records the outcome of an admitted steering request. An outcome
+// may be written only once, so a late worker cannot overwrite a restart's
+// unknown-delivery reconciliation.
+func (store *Store) UpdateSteer(update protocol.JobSteerRecordUpdate) (protocol.SteerRecord, error) {
+	if err := validateJobID(update.JobID); err != nil {
+		return protocol.SteerRecord{}, fmt.Errorf("%w: %v", ErrInvalid, err)
+	}
+	if update.MessageID == "" || !validSteerStatus(update.Status) || update.Status == protocol.SteerStatusAdmitted {
+		return protocol.SteerRecord{}, fmt.Errorf("%w: invalid steering outcome", ErrInvalid)
+	}
+	var result protocol.SteerRecord
+	err := store.update(func(tx *bolt.Tx) error {
+		jobs := tx.Bucket(bucketJobs)
+		if jobs == nil {
+			return fmt.Errorf("%w: missing jobs bucket", ErrCorrupt)
+		}
+		current, err := getRecord(jobs, update.JobID)
+		if err != nil {
+			return err
+		}
+		for index := range current.Steers {
+			if current.Steers[index].MessageID != update.MessageID {
+				continue
+			}
+			result = current.Steers[index]
+			if result.Status != protocol.SteerStatusAdmitted {
+				return nil
+			}
+			now := time.Now().UTC()
+			current.Steers[index].Status = update.Status
+			current.Steers[index].Mechanism = update.Mechanism
+			current.Steers[index].Reason = update.Reason
+			current.Steers[index].UpdatedAt = now
+			current.UpdatedAt = now
+			result = current.Steers[index]
+			normalizeRecord(&current)
+			if err := validateRecord(current); err != nil {
+				return err
+			}
+			return putRecord(jobs, current)
+		}
+		return fmt.Errorf("%w: steering message not found", ErrInvalid)
+	})
+	return result, err
+}
+
+// MarkPendingSteersUnknown records uncertainty for admitted messages recovered
+// after daemon restart. It never returns them to a delivery queue.
+func (store *Store) MarkPendingSteersUnknown(id string) error {
+	if err := validateJobID(id); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalid, err)
+	}
+	return store.update(func(tx *bolt.Tx) error {
+		jobs := tx.Bucket(bucketJobs)
+		if jobs == nil {
+			return fmt.Errorf("%w: missing jobs bucket", ErrCorrupt)
+		}
+		current, err := getRecord(jobs, id)
+		if err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		changed := false
+		for index := range current.Steers {
+			if current.Steers[index].Status != protocol.SteerStatusAdmitted {
+				continue
+			}
+			current.Steers[index].Status = protocol.SteerStatusUnknown
+			current.Steers[index].Reason = protocol.SteerReasonDeliveryUnconfirmed
+			current.Steers[index].Mechanism = ""
+			current.Steers[index].UpdatedAt = now
+			changed = true
+		}
+		if !changed {
+			return nil
+		}
+		current.UpdatedAt = now
+		normalizeRecord(&current)
+		if err := validateRecord(current); err != nil {
+			return err
+		}
+		return putRecord(jobs, current)
+	})
+}
+
 // MarkTerminal records the first terminal state. Later updates are rejected so
 // a known result can never be overwritten by a late finalization or recovery.
 func (store *Store) MarkTerminal(id string, terminal TerminalUpdate) (Record, error) {
@@ -909,6 +1059,10 @@ func normalizeRecord(record *Record) {
 	if record.Contract.Violations == nil {
 		record.Contract.Violations = []string{}
 	}
+	for index := range record.Steers {
+		record.Steers[index].CreatedAt = record.Steers[index].CreatedAt.UTC()
+		record.Steers[index].UpdatedAt = record.Steers[index].UpdatedAt.UTC()
+	}
 }
 
 func validateRecord(record Record) error {
@@ -920,6 +1074,9 @@ func validateRecord(record Record) error {
 	}
 	if !validPublicState(record.State) {
 		return fmt.Errorf("%w: invalid public state %q", ErrInvalid, record.State)
+	}
+	if record.InputMode != "" && record.InputMode != protocol.InputModeFixed && record.InputMode != protocol.InputModeSteerable {
+		return fmt.Errorf("%w: invalid input mode %q", ErrInvalid, record.InputMode)
 	}
 	if record.Starting && record.State != protocol.PublicStateRunning {
 		return fmt.Errorf("%w: starting marker requires running public state", ErrInvalid)
@@ -951,7 +1108,48 @@ func validateRecord(record Record) error {
 	if record.ResultText != "" && record.State != protocol.PublicStateCompleted {
 		return fmt.Errorf("%w: result text requires completed state", ErrInvalid)
 	}
+	seenSteers := make(map[string]struct{}, len(record.Steers))
+	for _, steer := range record.Steers {
+		if err := validateSteerRecord(steer); err != nil {
+			return err
+		}
+		if _, exists := seenSteers[steer.MessageID]; exists {
+			return fmt.Errorf("%w: duplicate steering message ID", ErrInvalid)
+		}
+		seenSteers[steer.MessageID] = struct{}{}
+	}
 	return nil
+}
+
+func validateSteerRecord(steer protocol.SteerRecord) error {
+	if steer.MessageID == "" || len(steer.MessageID) > 256 {
+		return fmt.Errorf("%w: steering message ID must be 1 to 256 bytes", ErrInvalid)
+	}
+	if len(steer.TextSHA256) != sha256.Size*2 {
+		return fmt.Errorf("%w: steering text digest is invalid", ErrInvalid)
+	}
+	if _, err := hex.DecodeString(steer.TextSHA256); err != nil {
+		return fmt.Errorf("%w: steering text digest is invalid", ErrInvalid)
+	}
+	if steer.TextBytes <= 0 || steer.TextBytes > 64*1024 {
+		return fmt.Errorf("%w: steering text size is invalid", ErrInvalid)
+	}
+	if !validSteerStatus(steer.Status) {
+		return fmt.Errorf("%w: invalid steering status %q", ErrInvalid, steer.Status)
+	}
+	if steer.CreatedAt.IsZero() || steer.UpdatedAt.IsZero() {
+		return fmt.Errorf("%w: steering timestamps are required", ErrInvalid)
+	}
+	return nil
+}
+
+func validSteerStatus(status protocol.SteerStatus) bool {
+	switch status {
+	case protocol.SteerStatusAdmitted, protocol.SteerStatusDelivered, protocol.SteerStatusRejected, protocol.SteerStatusUnknown:
+		return true
+	default:
+		return false
+	}
 }
 
 func (claim ProcessClaim) validate() error {

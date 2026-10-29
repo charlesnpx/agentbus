@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -393,7 +394,17 @@ func runLaunchHelper() int {
 		}
 		sleepForever()
 	case "chatty-hang":
+		stdinClosed := make(chan struct{})
+		go func() {
+			_, _ = io.Copy(io.Discard, os.Stdin)
+			close(stdinClosed)
+		}()
 		for i := 0; ; i++ {
+			select {
+			case <-stdinClosed:
+				return 0
+			default:
+			}
 			if _, err := fmt.Fprintf(os.Stderr, "helper chatty stderr %06d %s\n", i, strings.Repeat("x", 1024)); err != nil {
 				return 2
 			}
@@ -428,9 +439,7 @@ func runLaunchHelper() int {
 }
 
 func sleepForever() {
-	for {
-		time.Sleep(time.Hour)
-	}
+	_, _ = io.Copy(io.Discard, os.Stdin)
 }
 
 func signalLaunchHelperStderrReady() {
@@ -467,7 +476,9 @@ func helperLaunchOptions(t *testing.T, root, mode, pidPath string, timeout time.
 }
 
 type testProcess struct {
-	cmd *exec.Cmd
+	cmd       *exec.Cmd
+	stdin     *os.File
+	closeOnce sync.Once
 }
 
 type stubProcess struct {
@@ -488,42 +499,58 @@ func (process stubProcess) Wait() error {
 }
 
 func testProcessStarter(config ProcessConfig) (Process, error) {
+	stdinRead, stdinWrite, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
 	cmd := exec.Command(config.CommandPath, config.Args...)
 	cmd.Env = config.Env
 	cmd.ExtraFiles = config.ExtraFiles
-	cmd.Stdin = config.Stdin
+	cmd.Stdin = stdinRead
 	cmd.Stdout = config.Stdout
 	cmd.Stderr = config.Stderr
 	if config.Setsid {
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	}
 	if err := cmd.Start(); err != nil {
+		_ = stdinRead.Close()
+		_ = stdinWrite.Close()
 		return nil, err
 	}
-	return testProcess{cmd: cmd}, nil
+	_ = stdinRead.Close()
+	return &testProcess{cmd: cmd, stdin: stdinWrite}, nil
 }
 
 func testProcessStarterWithStderrReady(stderrReady chan<- error) ProcessStarter {
 	return func(config ProcessConfig) (Process, error) {
+		stdinRead, stdinWrite, err := os.Pipe()
+		if err != nil {
+			return nil, err
+		}
 		readyRead, readyWrite, err := os.Pipe()
 		if err != nil {
+			_ = stdinRead.Close()
+			_ = stdinWrite.Close()
 			return nil, err
 		}
 		childFD := readinessFDChildNumber + len(config.ExtraFiles)
 		cmd := exec.Command(config.CommandPath, config.Args...)
 		cmd.Env = upsertEnv(append([]string(nil), config.Env...), launchHelperStderrReadyFDEnv+"="+strconv.Itoa(childFD))
 		cmd.ExtraFiles = append(append([]*os.File(nil), config.ExtraFiles...), readyWrite)
-		cmd.Stdin = config.Stdin
+		cmd.Stdin = stdinRead
 		cmd.Stdout = config.Stdout
 		cmd.Stderr = config.Stderr
 		if config.Setsid {
 			cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 		}
 		if err := cmd.Start(); err != nil {
+			_ = stdinRead.Close()
+			_ = stdinWrite.Close()
 			_ = readyRead.Close()
 			_ = readyWrite.Close()
 			return nil, err
 		}
+		_ = stdinRead.Close()
 		_ = readyWrite.Close()
 		go func() {
 			defer readyRead.Close()
@@ -539,19 +566,20 @@ func testProcessStarterWithStderrReady(stderrReady chan<- error) ProcessStarter 
 			}
 			stderrReady <- nil
 		}()
-		return testProcess{cmd: cmd}, nil
+		return &testProcess{cmd: cmd, stdin: stdinWrite}, nil
 	}
 }
 
-func (process testProcess) PID() int {
+func (process *testProcess) PID() int {
 	return process.cmd.Process.Pid
 }
 
-func (process testProcess) Kill() error {
+func (process *testProcess) Kill() error {
+	process.closeOnce.Do(func() { _ = process.stdin.Close() })
 	return process.cmd.Process.Kill()
 }
 
-func (process testProcess) Wait() error {
+func (process *testProcess) Wait() error {
 	return process.cmd.Wait()
 }
 

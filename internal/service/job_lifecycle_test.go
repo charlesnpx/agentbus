@@ -936,8 +936,8 @@ func TestJobCancelAfterSpawnRecordsCleanupOutcome(t *testing.T) {
 		waitForExit bool
 		wantCleanup protocol.Cleanup
 	}{
-		{name: "clean inside grace", argv: []string{"sleep", "30"}, waitForExit: true, wantCleanup: protocol.CleanupClean},
-		{name: "uncertain outside grace", argv: []string{"sh", "-c", "trap '' TERM; printf 'term-trap-ready\\n'; while :; do sleep 1; done"}, readyLine: "term-trap-ready\n", wantCleanup: protocol.CleanupUncertain},
+		{name: "clean inside grace", argv: []string{"sh", "-c", "while IFS= read -r ignored; do :; done"}, waitForExit: true, wantCleanup: protocol.CleanupClean},
+		{name: "uncertain outside grace", argv: []string{"sh", "-c", "trap '' TERM; printf 'term-trap-ready\\n'; while IFS= read -r ignored; do :; done"}, readyLine: "term-trap-ready\n", wantCleanup: protocol.CleanupUncertain},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			interrupted := false
@@ -1331,17 +1331,27 @@ func startProcessGroup(t *testing.T, readyLine string, argv ...string) (*exec.Cm
 	t.Helper()
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
 	var stdout io.ReadCloser
 	if readyLine != "" {
 		var err error
 		stdout, err = cmd.StdoutPipe()
 		if err != nil {
+			_ = stdin.Close()
 			t.Fatal(err)
 		}
 	}
 	if err := cmd.Start(); err != nil {
+		_ = stdin.Close()
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		_ = stdin.Close()
+		stopProcessGroupFixture(t, cmd)
+	})
 	pid := cmd.Process.Pid
 	pgid, err := syscall.Getpgid(pid)
 	if err != nil {
@@ -1370,6 +1380,18 @@ func startProcessGroup(t *testing.T, readyLine string, argv ...string) (*exec.Cm
 		}
 	}
 	return cmd, jobstore.ProcessClaim{PID: pid, PGID: pgid, StartToken: info.StartTime}
+}
+
+func stopProcessGroupFixture(t *testing.T, cmd *exec.Cmd) {
+	t.Helper()
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	if cmd.ProcessState == nil {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}
 }
 
 func stopWaitedProcessGroup(pgid int, waitDone <-chan error) {

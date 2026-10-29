@@ -288,6 +288,13 @@ func TestStatusHumanProjectionIncludesOperatorFieldsAndNeverResultText(t *testin
 	record.Failure = &protocol.JobFailureWire{Class: protocol.FailureClassBackendError, Reason: "provider stopped"}
 	record.Contract = &protocol.ContractResult{Evaluated: true, Compliant: false}
 	record.LogPaths = &protocol.LogPathsWire{Stdout: "/logs/out", Stderr: "/logs/err"}
+	record.Execution = &protocol.ExecutionPosture{
+		Intent: "inspect", Network: "denied", GitMetadata: "read-only", Enforcement: "os-sandbox",
+	}
+	record.Steers = []protocol.SteerSummaryWire{{
+		MessageID: "message-1", Status: protocol.SteerStatusDelivered,
+		Mechanism: "native", Time: finished.Add(time.Minute),
+	}}
 	a := testApp(t)
 	a.clientConnect = fakeConnector(&fakeProtocolClient{records: map[string]agentclient.JobGetResult{"job-1": record}})
 
@@ -296,16 +303,18 @@ func TestStatusHumanProjectionIncludesOperatorFieldsAndNeverResultText(t *testin
 		t.Fatalf("status exit=%d stderr=%q", code, stderr)
 	}
 	for _, want := range []string{
-		"jobId=job-1 state=failed backend=codex cleanup=clean age=",
+		"jobId=job-1 state=failed backend=codex cleanup=clean queuedAt=",
 		"createdAt=2026-01-02T03:04:05Z",
 		"startedAt=2026-01-02T03:05:05Z",
 		"finishedAt=2026-01-02T03:06:05Z",
 		"timeout.effective=1800000 timeout.source=client",
-		"model=gpt-5 tags=a=first,z=last",
+		"inputMode=fixed model=gpt-5 tags=a=first,z=last",
 		"result.bytes=18 result.sha256=sha256:aaaaaaaaaaaa",
 		"failure.class=backend_error failure.reason=provider stopped",
 		"contract.evaluated=true contract.compliant=false",
 		"logPaths.stdout=/logs/out logPaths.stderr=/logs/err",
+		`execution={"intent":"inspect","sourceWritable":false,"network":"denied","gitMetadata":"read-only","enforcement":"os-sandbox"}`,
+		"steer.messageId=message-1 status=delivered mechanism=native time=2026-01-02T03:07:05Z",
 	} {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("status output missing %q:\n%s", want, stdout)
@@ -313,6 +322,40 @@ func TestStatusHumanProjectionIncludesOperatorFieldsAndNeverResultText(t *testin
 	}
 	if strings.Contains(stdout, "secret result text") || strings.Contains(stdout, "/state/results/job-1") {
 		t.Fatalf("status exposed result text or path: %q", stdout)
+	}
+}
+
+func TestSteerCommandReceiptAndExitCodes(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		status protocol.SteerStatus
+		want   int
+	}{
+		{name: "admitted", status: protocol.SteerStatusAdmitted, want: 0},
+		{name: "delivered", status: protocol.SteerStatusDelivered, want: 0},
+		{name: "rejected", status: protocol.SteerStatusRejected, want: 17},
+		{name: "unknown", status: protocol.SteerStatusUnknown, want: 18},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := &fakeProtocolClient{steer: agentclient.JobSteerResult{
+				JobID: "job-1", MessageID: "message-1", Status: test.status,
+				Reason: protocol.SteerReasonDeliveryUnconfirmed,
+			}}
+			a := testApp(t)
+			a.clientConnect = fakeConnector(client)
+			var stdout, stderr bytes.Buffer
+			code := a.run(context.Background(), []string{
+				"steer", "--job", "job-1", "--request-id", "message-1", "--message-file", "-", "--json",
+			}, strings.NewReader("follow-up"), &stdout, &stderr)
+			if code != test.want || stderr.Len() != 0 {
+				t.Fatalf("steer exit=%d stderr=%q, want exit=%d", code, stderr.String(), test.want)
+			}
+			var receipt agentclient.JobSteerResult
+			decodeJSON(t, stdout.String(), &receipt)
+			if receipt.Status != test.status || client.steerParams.JobID != "job-1" || client.steerParams.MessageID != "message-1" || client.steerParams.Text != "follow-up" {
+				t.Fatalf("steer receipt=%#v params=%#v", receipt, client.steerParams)
+			}
+		})
 	}
 }
 
@@ -340,7 +383,7 @@ func TestStatusListHumanProjectionIncludesFailureClassAndContractVerdict(t *test
 	if code != 0 || stderr != "" {
 		t.Fatalf("status list exit=%d stderr=%q", code, stderr)
 	}
-	if !strings.Contains(stdout, "jobId=job-1 state=running backend=codex cleanup=uncertain age=") ||
+	if !strings.Contains(stdout, "jobId=job-1 state=running backend=codex cleanup=uncertain queuedAt=") ||
 		!strings.Contains(stdout, "failure.class=backend_error") ||
 		!strings.Contains(stdout, "contract.evaluated=true contract.compliant=false") ||
 		!strings.Contains(stdout, "tags=team=core itemCount=3") ||
@@ -706,6 +749,7 @@ func TestCancelFetchesRecordForContractExitCode(t *testing.T) {
 
 func TestProtocolErrorsAndStartupFailuresKeepTypedExitCodes(t *testing.T) {
 	unknown := &protocol.RPCError{Object: *protocol.NewError(protocol.ErrorUnknownJob, "not found", protocol.ErrorData{JobID: "missing"})}
+	queueFull := &protocol.RPCError{Object: *protocol.NewError(protocol.ErrorQueueFull, "queue full", protocol.ErrorData{})}
 	startup := &daemonlaunch.StartupError{Kind: daemonlaunch.ErrReadinessEOF}
 	for _, tt := range []struct {
 		name string
@@ -713,6 +757,7 @@ func TestProtocolErrorsAndStartupFailuresKeepTypedExitCodes(t *testing.T) {
 		want int
 	}{
 		{"unknown job", unknown, cliExitUnknownJob},
+		{"queue full", queueFull, 19},
 		{"startup", startup, cliExitDaemonStartupFailure},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -755,17 +800,32 @@ func TestServeForegroundStartupFailureUsesExit11(t *testing.T) {
 func TestStartBackgroundDaemonWritesPIDAfterReady(t *testing.T) {
 	a := testApp(t)
 	a.daemonLauncher = func(_ context.Context, opts daemonlaunch.Options) (daemonlaunch.Result, error) {
-		if got, want := opts.Args, []string{"serve", "--foreground"}; !slices.Equal(got, want) {
+		if got, want := opts.Args, []string{"serve", "--foreground", "--max-jobs", "4", "--max-jobs-per-backend", "2", "--max-queued", "64"}; !slices.Equal(got, want) {
 			t.Fatalf("launch args=%v want=%v", got, want)
 		}
 		return daemonlaunch.Result{PID: 4242, CanonicalStateRoot: a.stateRoot}, nil
 	}
-	if err := a.startBackgroundDaemon(context.Background()); err != nil {
+	if err := a.startBackgroundDaemon(context.Background(), 4, 2, 64); err != nil {
 		t.Fatal(err)
 	}
 	raw, err := os.ReadFile(filepath.Join(a.stateRoot, "agentbus.pid"))
 	if err != nil || string(raw) != "4242\n" {
 		t.Fatalf("pid file=(%q,%v)", raw, err)
+	}
+}
+
+func TestServeConcurrencyFlagsReachBackgroundDaemon(t *testing.T) {
+	a := testApp(t)
+	a.daemonLauncher = func(_ context.Context, opts daemonlaunch.Options) (daemonlaunch.Result, error) {
+		want := []string{"serve", "--foreground", "--max-jobs", "3", "--max-jobs-per-backend", "1", "--max-queued", "9"}
+		if !slices.Equal(opts.Args, want) {
+			t.Fatalf("launch args = %v, want %v", opts.Args, want)
+		}
+		return daemonlaunch.Result{PID: 4242, CanonicalStateRoot: a.stateRoot}, nil
+	}
+	code, stdout, stderr := runTestCLI(t, a, []string{"serve", "--max-jobs", "3", "--max-jobs-per-backend", "1", "--max-queued", "9"})
+	if code != 0 || stdout != "" || stderr != "" {
+		t.Fatalf("serve = (%d, %q, %q), want successful background start", code, stdout, stderr)
 	}
 }
 
@@ -831,6 +891,8 @@ type fakeProtocolClient struct {
 	transcriptParams []agentclient.JobTranscriptParams
 	transcriptFunc   func(agentclient.JobTranscriptParams, int) (agentclient.JobTranscriptResult, error)
 	cancels          map[string]agentclient.JobCancelResult
+	steer            agentclient.JobSteerResult
+	steerParams      agentclient.JobSteerParams
 	cancelParams     []agentclient.JobCancelParams
 	err              error
 }
@@ -882,6 +944,14 @@ func (c *fakeProtocolClient) JobCancel(_ context.Context, params agentclient.Job
 		return agentclient.JobCancelResult{}, &protocol.RPCError{Object: *protocol.NewError(protocol.ErrorUnknownJob, "not found", protocol.ErrorData{JobID: params.JobID})}
 	}
 	return result, nil
+}
+
+func (c *fakeProtocolClient) Steer(_ context.Context, params agentclient.JobSteerParams) (agentclient.JobSteerResult, error) {
+	if c.err != nil {
+		return agentclient.JobSteerResult{}, c.err
+	}
+	c.steerParams = params
+	return c.steer, nil
 }
 
 func (c *fakeProtocolClient) Close() error { return nil }

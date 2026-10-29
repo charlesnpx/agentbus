@@ -316,6 +316,33 @@ func TestJobGetReflectWalksEveryRecordField(t *testing.T) {
 	assertReflectDecoded(t, reflect.ValueOf(want), reflect.ValueOf(got), "job.get record")
 }
 
+func TestSteerUsesJobSteerWireMethod(t *testing.T) {
+	want := JobSteerResult{
+		JobID: "job-steer", MessageID: "message-1", Status: protocol.SteerStatusAdmitted,
+	}
+	client, requests, done := newOneShotClient(t, protocol.Response{Result: want})
+	params := JobSteerParams{JobID: "job-steer", MessageID: "message-1", Text: "continue"}
+	got, err := client.Steer(context.Background(), params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := <-requests
+	if request.Method != protocol.MethodJobSteer {
+		t.Fatalf("method = %q, want %q", request.Method, protocol.MethodJobSteer)
+	}
+	var gotParams JobSteerParams
+	if err := json.Unmarshal(request.Params, &gotParams); err != nil {
+		t.Fatalf("decode job.steer params: %v", err)
+	}
+	if gotParams != params {
+		t.Fatalf("job.steer params = %#v, want %#v", gotParams, params)
+	}
+	assertOneShotClientDone(t, done)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("job.steer result = %#v, want %#v", got, want)
+	}
+}
+
 func TestJobListReflectWalksEverySummaryField(t *testing.T) {
 	want := reflectPopulatedValue[JobSummaryWire](t)
 	params := JobListParams{
@@ -1244,43 +1271,52 @@ func TestAutostartedDaemonSurvivesLauncherProcessGroupTermination(t *testing.T) 
 		t.Fatal(err)
 	}
 	helperPID := cmd.Process.Pid
-	if err := cmd.Wait(); err != nil {
+	pidPath := filepath.Join(root, "agentbus.pid")
+	daemonPID := 0
+	helperWaited := false
+	t.Cleanup(func() {
+		if daemonPID == 0 {
+			if pidData, readErr := os.ReadFile(pidPath); readErr == nil {
+				daemonPID, _ = strconv.Atoi(strings.TrimSpace(string(pidData)))
+			}
+		}
+		if daemonPID > 0 {
+			if err := syscall.Kill(daemonPID, syscall.SIGTERM); err == nil {
+				deadline := time.Now().Add(5 * time.Second)
+				for syscall.Kill(daemonPID, 0) == nil && time.Now().Before(deadline) {
+					time.Sleep(20 * time.Millisecond)
+				}
+				if syscall.Kill(daemonPID, 0) == nil {
+					_ = syscall.Kill(daemonPID, syscall.SIGKILL)
+					t.Errorf("autostarted daemon %d did not exit after SIGTERM; sent SIGKILL", daemonPID)
+				}
+			} else if !errors.Is(err, syscall.ESRCH) {
+				t.Errorf("stop autostarted daemon: %v", err)
+			}
+		}
+		if !helperWaited && cmd.ProcessState == nil {
+			_ = syscall.Kill(-helperPID, syscall.SIGKILL)
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+	})
+	waitErr := cmd.Wait()
+	helperWaited = true
+	if waitErr != nil {
 		if daemonErr, readErr := os.ReadFile(errorPath); readErr == nil && strings.Contains(string(daemonErr), "operation not permitted") {
 			clientTestSkipOrFailBindDenied(t, "process-group detach helper", string(daemonErr))
 		}
-		t.Fatalf("autostart helper failed: %v\n%s", err, output.String())
+		t.Fatalf("autostart helper failed: %v\n%s", waitErr, output.String())
 	}
 
-	pidData, err := os.ReadFile(filepath.Join(root, "agentbus.pid"))
+	pidData, err := os.ReadFile(pidPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	daemonPID, err := strconv.Atoi(strings.TrimSpace(string(pidData)))
+	daemonPID, err = strconv.Atoi(strings.TrimSpace(string(pidData)))
 	if err != nil {
 		t.Fatalf("parse daemon pid %q: %v", pidData, err)
 	}
-	t.Cleanup(func() {
-		if err := syscall.Kill(daemonPID, syscall.SIGTERM); err != nil {
-			if !errors.Is(err, syscall.ESRCH) {
-				t.Errorf("stop autostarted daemon: %v", err)
-			}
-			return
-		}
-		// Verify the daemon actually exits so a detached process can never
-		// outlive the suite; escalate to SIGKILL at the deadline.
-		deadline := time.Now().Add(5 * time.Second)
-		for {
-			if err := syscall.Kill(daemonPID, 0); errors.Is(err, syscall.ESRCH) {
-				return
-			}
-			if time.Now().After(deadline) {
-				_ = syscall.Kill(daemonPID, syscall.SIGKILL)
-				t.Errorf("autostarted daemon %d did not exit after SIGTERM; sent SIGKILL", daemonPID)
-				return
-			}
-			time.Sleep(20 * time.Millisecond)
-		}
-	})
 
 	if err := syscall.Kill(-helperPID, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
 		t.Fatalf("terminate helper process group: %v", err)

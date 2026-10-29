@@ -163,7 +163,7 @@ func assertDirectCommandRunnerContextDoneTerminatesOnce(t *testing.T, ctx contex
 	t.Cleanup(func() { terminateProcessGroup = original })
 
 	running, err := (DirectCommandRunner{CancelGrace: 10 * time.Millisecond}).Start(ctx, ExecSpec{
-		Argv: []string{"/bin/sh", "-c", "trap '' TERM; while :; do sleep 1; done"},
+		Argv: []string{"/bin/sh", "-c", "trap '' TERM; while IFS= read -r ignored; do :; done"},
 	})
 	if err != nil {
 		t.Fatal(err)

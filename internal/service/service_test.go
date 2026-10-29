@@ -6,6 +6,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -705,6 +707,66 @@ func TestJobSubmitRejectsUnknownTaskSpecField(t *testing.T) {
 	outcome := server.handleJobSubmit(raw)
 	if outcome.err == nil || outcome.err.Data.Code != protocol.ErrorInvalidTaskSpec {
 		t.Fatalf("unknown taskSpec field outcome = %#v, want invalid task spec", outcome.err)
+	}
+}
+
+func TestJobSubmitRejectsUnknownInputMode(t *testing.T) {
+	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "codex"}}})
+	for _, mode := range []string{"maybe", ""} {
+		t.Run(fmt.Sprintf("mode-%q", mode), func(t *testing.T) {
+			raw := json.RawMessage(fmt.Sprintf(`{"workspaceKey":"workspace-unknown-input-mode","requestId":"request-unknown-input-mode","taskSpec":{"backend":"codex","cwd":"/workspace","write":false,"prompt":"task","inputMode":%q}}`, mode))
+			outcome := server.handleJobSubmit(raw)
+			if outcome.err == nil || outcome.err.Data.Code != protocol.ErrorInvalidTaskSpec {
+				t.Fatalf("unknown inputMode outcome = %#v, want invalid_task_spec", outcome.err)
+			}
+		})
+	}
+}
+
+func TestOmittedInputModePreservesBaseTaskSpecHash(t *testing.T) {
+	raw := json.RawMessage(`{"workspaceKey":"workspace-omitted-mode","requestId":"request-omitted-mode","taskSpec":{"backend":"codex","cwd":"/workspace","prompt":"do work","write":true}}`)
+	input, err := parseJobSubmitInput(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := sha256.Sum256(input.canonicalTaskSpec)
+	// Golden from the base TaskSpec wire shape, which had no inputMode field.
+	const want = "7a22b85c1404f61b27ea2df61765d20cef408966134b4a5d547f164f6f9d3d97"
+	if gotHex := hex.EncodeToString(got[:]); gotHex != want {
+		t.Fatalf("omitted inputMode request hash = %s, want base golden %s; taskSpec=%s", gotHex, want, input.canonicalTaskSpec)
+	}
+}
+
+func TestInputModeParticipatesInTaskSpecHash(t *testing.T) {
+	base := `{"workspaceKey":"workspace-mode-hash","requestId":"request-mode-hash","taskSpec":{"backend":"codex","cwd":"/workspace","prompt":"do work","write":true}}`
+	steerable := `{"workspaceKey":"workspace-mode-hash","requestId":"request-mode-hash","taskSpec":{"backend":"codex","cwd":"/workspace","prompt":"do work","write":true,"inputMode":"steerable"}}`
+	baseInput, err := parseJobSubmitInput(json.RawMessage(base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	steerableInput, err := parseJobSubmitInput(json.RawMessage(steerable))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sha256.Sum256(baseInput.canonicalTaskSpec) == sha256.Sum256(steerableInput.canonicalTaskSpec) {
+		t.Fatal("steerable TaskSpec hash equals omitted-inputMode base hash")
+	}
+}
+
+func TestLegacyJobProjectsFixedInputMode(t *testing.T) {
+	server := newTestServer(t, t.TempDir(), Config{})
+	record := jobstore.Record{
+		JobID: "legacy-job", WorkspaceKey: "legacy-workspace", RequestID: "legacy-request",
+		Backend: "codex", State: protocol.PublicStateQueued, Cleanup: protocol.CleanupClean,
+		TaskSpec:  json.RawMessage(`{"backend":"codex","cwd":"/workspace","prompt":"task","write":false}`),
+		CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	}
+	wire, err := server.jobRecordWire(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wire.InputMode != protocol.InputModeFixed || wire.Steers == nil || len(wire.Steers) != 0 {
+		t.Fatalf("legacy job projection = inputMode:%q steers:%#v, want fixed and an empty list", wire.InputMode, wire.Steers)
 	}
 }
 

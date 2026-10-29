@@ -200,8 +200,23 @@ func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
 	if record.State.IsTerminal() {
 		return requestOutcome{result: protocol.JobCancelResult{JobID: record.JobID, State: projectedState(record)}}
 	}
+	if record.State == protocol.PublicStateQueued && !record.Starting {
+		if outcome, handled := s.cancelQueuedJob(store, record); handled {
+			return outcome
+		}
+	}
 
 	run := s.activeExecution(record.JobID)
+	if run != nil {
+		if !s.cancelSteering(store, run) {
+			current, getErr := store.Get(record.JobID)
+			if getErr != nil {
+				return jobStoreUnavailable("read completed job after cancellation race", getErr)
+			}
+			return requestOutcome{result: protocol.JobCancelResult{JobID: current.JobID, State: projectedState(current)}}
+		}
+		defer s.finishSteering(store, run)
+	}
 	cleanup, diagnostics := s.cancelActiveOrRecordedProcess(store, record)
 	backendSessionID := record.BackendSessionID
 	if run != nil {
@@ -214,6 +229,7 @@ func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
 				backendSessionID = retired.backendSessionID
 			}
 		}
+		diagnostics = append(diagnostics, run.takeSteerDiagnostics()...)
 		diagnostics = append(diagnostics, run.itemSidecarDiagnostics()...)
 	}
 	diagnostics = appendRecordDiagnostics(record.Diagnostics, diagnostics)
@@ -237,6 +253,66 @@ func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
 		return jobStoreUnavailable("persist cancellation", err)
 	}
 	return requestOutcome{result: protocol.JobCancelResult{JobID: terminal.JobID, State: projectedState(terminal)}}
+}
+
+// cancelQueuedJob commits cancellation while holding the scheduler lock, so a
+// queued record cannot be selected for provider launch between removal and
+// terminalization. A record with a reserved slot uses the normal active-run
+// cancellation path even if MarkStarting has not committed yet.
+func (s *Server) cancelQueuedJob(store *jobstore.Store, record jobstore.Record) (requestOutcome, bool) {
+	s.executionMu.Lock()
+	if _, running := s.executions[record.JobID]; running {
+		s.executionMu.Unlock()
+		return requestOutcome{}, false
+	}
+	index := -1
+	for i, queued := range s.queuedJobs {
+		if queued.record.JobID == record.JobID {
+			index = i
+			break
+		}
+	}
+	terminal, err := store.MarkTerminal(record.JobID, jobstore.TerminalUpdate{
+		State:      protocol.PublicStateCanceled,
+		Cleanup:    protocol.CleanupClean,
+		FinishedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		if errors.Is(err, jobstore.ErrTerminal) {
+			current, getErr := store.Get(record.JobID)
+			if getErr == nil && current.State.IsTerminal() {
+				if index >= 0 {
+					s.removeQueuedJobLocked(index)
+					s.activeJobs.Add(-1)
+				}
+				s.dispatchQueuedLocked()
+				s.executionMu.Unlock()
+				return requestOutcome{result: protocol.JobCancelResult{JobID: current.JobID, State: projectedState(current)}}, true
+			}
+			if getErr == nil {
+				getErr = errors.New("job did not reach a terminal state")
+			}
+			s.executionMu.Unlock()
+			return jobStoreUnavailable("read concurrent terminal cancellation", getErr), true
+		}
+		s.executionMu.Unlock()
+		return jobStoreUnavailable("persist queued cancellation", err), true
+	}
+	if index >= 0 {
+		s.removeQueuedJobLocked(index)
+		s.activeJobs.Add(-1)
+	}
+	s.dispatchQueuedLocked()
+	s.executionMu.Unlock()
+	return requestOutcome{result: protocol.JobCancelResult{JobID: terminal.JobID, State: projectedState(terminal)}}, true
+}
+
+// removeQueuedJobLocked removes an indexed queue item. The caller holds
+// executionMu.
+func (s *Server) removeQueuedJobLocked(index int) {
+	copy(s.queuedJobs[index:], s.queuedJobs[index+1:])
+	s.queuedJobs[len(s.queuedJobs)-1] = queuedJob{}
+	s.queuedJobs = s.queuedJobs[:len(s.queuedJobs)-1]
 }
 
 func jobStoreUnavailable(action string, err error) requestOutcome {
@@ -263,14 +339,29 @@ func (s *Server) jobRecordWire(record jobstore.Record) (protocol.JobRecordWire, 
 	if spec.Tags != nil {
 		tags = *spec.Tags
 	}
+	steers := make([]protocol.SteerSummaryWire, 0, len(record.Steers))
+	for _, steer := range record.Steers {
+		steers = append(steers, protocol.SteerSummaryWire{
+			MessageID: steer.MessageID,
+			Status:    steer.Status,
+			Mechanism: steer.Mechanism,
+			Time:      steer.UpdatedAt,
+		})
+	}
+	inputMode := protocol.EffectiveInputMode(spec.InputMode)
+	if record.InputMode != "" {
+		inputMode = record.InputMode
+	}
 	return protocol.JobRecordWire{
 		JobID:         record.JobID,
 		WorkspaceKey:  record.WorkspaceKey,
 		RequestID:     record.RequestID,
 		Backend:       record.Backend,
+		InputMode:     inputMode,
 		State:         projectedState(record),
 		Tags:          tags,
 		CreatedAt:     record.CreatedAt,
+		QueuedAt:      record.CreatedAt,
 		StartedAt:     record.StartedAt,
 		FinishedAt:    record.FinishedAt,
 		Timeout:       timeout,
@@ -281,6 +372,8 @@ func (s *Server) jobRecordWire(record jobstore.Record) (protocol.JobRecordWire, 
 		Cleanup:       record.Cleanup,
 		LogPaths:      projectLogPaths(record),
 		ModelReported: s.projectedModelReported(record),
+		Execution:     record.Execution,
+		Steers:        steers,
 	}, nil
 }
 
@@ -306,6 +399,7 @@ func (s *Server) jobSummaryWireFromSpec(record jobstore.Record, spec protocol.Ta
 		Tags:          tags,
 		Cleanup:       record.Cleanup,
 		CreatedAt:     record.CreatedAt,
+		QueuedAt:      record.CreatedAt,
 		UpdatedAt:     record.UpdatedAt,
 		ModelReported: s.projectedModelReported(record),
 		FailureClass:  projectFailureClass(record),
@@ -456,6 +550,9 @@ func (s *Server) reconcileRecoveredJobs(store *jobstore.Store) error {
 		return err
 	}
 	for _, record := range records {
+		if err := store.MarkPendingSteersUnknown(record.JobID); err != nil {
+			return fmt.Errorf("reconcile steering receipts for job %s: %w", record.JobID, err)
+		}
 		switch {
 		case record.State == protocol.PublicStateQueued:
 			_, err = store.MarkTerminal(record.JobID, jobstore.TerminalUpdate{
