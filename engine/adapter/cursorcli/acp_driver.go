@@ -37,6 +37,7 @@ type activeACPTurn struct {
 	interruptRequested bool
 	jobCancelled       bool
 	finished           bool
+	steerRequested     bool
 	pendingSteer       *acpSteerRequest
 }
 
@@ -47,7 +48,6 @@ type acpSteerRequest struct {
 	delivery  engine.SteerDelivery
 	err       error
 	completed bool
-	abandoned bool
 }
 
 func (t *activeACPTurn) completeSteerLocked(request *acpSteerRequest, delivery engine.SteerDelivery, err error) {
@@ -117,17 +117,6 @@ func (t *activeACPTurn) prompt(ctx context.Context, rpc *acpRPC, text string, ob
 		if t.pendingSteer != continuation {
 			t.mu.Unlock()
 			return nil, engine.ErrSteerNotActive
-		}
-		if continuation.abandoned {
-			err := continuation.ctx.Err()
-			if err == nil {
-				err = context.Canceled
-			}
-			t.pendingSteer = nil
-			t.completeSteerLocked(continuation, engine.SteerDelivery{}, err)
-			t.finished = true
-			t.mu.Unlock()
-			return nil, err
 		}
 		if err := continuation.ctx.Err(); err != nil {
 			t.pendingSteer = nil
@@ -217,16 +206,6 @@ func (t *activeACPTurn) continueAfterCancelledPrompt(ctx context.Context) (*acpS
 		t.completeSteerLocked(request, engine.SteerDelivery{}, err)
 		return nil, false, err
 	}
-	if request.abandoned {
-		err := request.ctx.Err()
-		if err == nil {
-			err = context.Canceled
-		}
-		t.pendingSteer = nil
-		t.finished = true
-		t.completeSteerLocked(request, engine.SteerDelivery{}, err)
-		return nil, false, err
-	}
 	if err := request.ctx.Err(); err != nil {
 		t.pendingSteer = nil
 		t.finished = true
@@ -249,6 +228,12 @@ func (t *activeACPTurn) finish() {
 		t.completeSteerLocked(t.pendingSteer, engine.SteerDelivery{}, err)
 		t.pendingSteer = nil
 	}
+}
+
+func (t *activeACPTurn) hasSteerRequest() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.steerRequested
 }
 
 func newACPDriver(binary string) *acpDriver {
@@ -329,9 +314,13 @@ func (d *acpDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resumeID str
 			if jobCancelled {
 				// Preserve the existing empty result for an explicit job cancel;
 				// never expose the cancelled segment's partial text as a result.
+				if active.hasSteerRequest() {
+					observer.emitEvent(duplex.ResultSegmentBoundary())
+				}
 				observer.emitEvent(engine.Event{Type: engine.EventResultMessage})
 				return info.sessionID, nil
 			}
+			observer.emitEvent(duplex.ResultSegmentBoundary())
 			observer = &acpTurnObserver{emit: emit}
 			result, err = active.prompt(ctx, rpc, continuation.text, observer, continuation)
 		default:
@@ -381,6 +370,7 @@ func (d *acpDriver) Steer(ctx context.Context, conn *duplex.Conn, msg engine.Ste
 		return engine.SteerDelivery{}, err
 	}
 	active.interruptRequested = true
+	active.steerRequested = true
 	active.mu.Unlock()
 
 	select {
@@ -392,9 +382,6 @@ func (d *acpDriver) Steer(ctx context.Context, conn *duplex.Conn, msg engine.Ste
 			delivery, err := request.delivery, request.err
 			active.mu.Unlock()
 			return delivery, err
-		}
-		if active.pendingSteer == request {
-			request.abandoned = true
 		}
 		active.mu.Unlock()
 		return engine.SteerDelivery{}, ctx.Err()

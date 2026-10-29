@@ -492,6 +492,77 @@ func TestACPSteerInterruptContinuesInOrder(t *testing.T) {
 	runner.assertRetired(t)
 }
 
+func TestACPSteerEmptyContinuationResultDoesNotReuseInterruptedText(t *testing.T) {
+	promptReady := make(chan struct{})
+	continuationReady := make(chan struct{})
+	runner := newFakeACPRunner(t, func(t *testing.T, proc *fakeACPProcess, spec command.ExecSpec) {
+		peer := newACPPeer(t, proc)
+		peer.handshake(false)
+		newSession := peer.expectRequest("session/new")
+		peer.respond(newSession, acpSessionResult("session-empty-continuation", "steer-model"))
+		setMode := peer.expectRequest("session/set_mode")
+		peer.respond(setMode, map[string]any{})
+
+		prompt := peer.expectRequest("session/prompt")
+		if acpPromptText(prompt) != "initial" {
+			t.Fatalf("initial prompt = %#v", prompt)
+		}
+		peer.notify("session/update", map[string]any{
+			"sessionId":     "session-empty-continuation",
+			"sessionUpdate": "agent_message_chunk",
+			"content":       map[string]any{"text": "obsolete answer"},
+		})
+		close(promptReady)
+
+		cancel := peer.expectNotification("session/cancel")
+		if got := nestedString(cancel, "params", "sessionId"); got != "session-empty-continuation" {
+			t.Fatalf("cancel sessionId = %q", got)
+		}
+		peer.respond(prompt, map[string]any{"stopReason": "cancelled"})
+
+		continuation := peer.expectRequest("session/prompt")
+		if got := acpPromptText(continuation); got != "follow-up direction" {
+			t.Fatalf("continuation prompt = %#v", continuation)
+		}
+		close(continuationReady)
+		peer.respond(continuation, map[string]any{"stopReason": "end_turn"})
+		peer.expectStdinClose()
+	})
+
+	session := startFakeCursorSession(t, engine.SessionOpts{CWD: t.TempDir()})
+	steerer := session.(engine.Steerer)
+	events, err := turnWithFakeRunner(t, session, engine.TurnInput{Prompt: "initial", Write: true}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-promptReady:
+	case <-time.After(2 * time.Second):
+		t.Fatal("initial ACP prompt did not stream its answer")
+	}
+	delivery, err := steerer.Steer(context.Background(), engine.SteerMessage{ID: "empty-continuation", Text: "follow-up direction"})
+	if err != nil || delivery.Mechanism != engine.SteerMechanismInterruptContinue || !delivery.Confirmed {
+		t.Fatalf("steer delivery = %#v, err=%v", delivery, err)
+	}
+	select {
+	case <-continuationReady:
+	case <-time.After(2 * time.Second):
+		t.Fatal("continuation ACP prompt was not written")
+	}
+
+	got := collectEvents(t, events, 2*time.Second)
+	if agents := eventsOfType(got, engine.EventAgentText); len(agents) != 1 || agents[0].Text != "obsolete answer" {
+		t.Fatalf("agent text = %#v, want the interrupted segment text", agents)
+	}
+	if results := eventsOfType(got, engine.EventResultMessage); len(results) != 1 || results[0].Text != "" {
+		t.Fatalf("result events = %#v, want one empty result from the final segment", results)
+	}
+	if finals := eventsOfType(got, engine.EventTurnFinal); len(finals) != 1 {
+		t.Fatalf("TurnFinal events = %#v, want exactly one", finals)
+	}
+	runner.assertRetired(t)
+}
+
 func TestACPCancelDropsPendingSteer(t *testing.T) {
 	promptReady := make(chan struct{})
 	cancelSeen := make(chan struct{})
@@ -505,6 +576,11 @@ func TestACPCancelDropsPendingSteer(t *testing.T) {
 		setMode := peer.expectRequest("session/set_mode")
 		peer.respond(setMode, map[string]any{})
 		prompt := peer.expectRequest("session/prompt")
+		peer.notify("session/update", map[string]any{
+			"sessionId":     "session-cancel-steer",
+			"sessionUpdate": "agent_message_chunk",
+			"content":       map[string]any{"text": "obsolete answer"},
+		})
 		close(promptReady)
 		peer.expectNotification("session/cancel")
 		close(cancelSeen)
@@ -572,8 +648,90 @@ func TestACPCancelDropsPendingSteer(t *testing.T) {
 	if len(finals) != 1 || finals[0].TurnFinal == nil || !finals[0].TurnFinal.Canceled {
 		t.Fatalf("TurnFinal events = %#v, want one cancelled turn final", finals)
 	}
+	if agents := eventsOfType(got, engine.EventAgentText); len(agents) != 1 || agents[0].Text != "obsolete answer" {
+		t.Fatalf("cancelled steer agent text = %#v, want the streamed partial text", agents)
+	}
 	if results := eventsOfType(got, engine.EventResultMessage); len(results) > 1 || (len(results) == 1 && results[0].Text != "") {
 		t.Fatalf("cancelled steer result events = %#v, want no partial segment result", results)
+	}
+	runner.assertRetired(t)
+}
+
+func TestACPCancelEmptyResultDoesNotReusePartialText(t *testing.T) {
+	promptReady := make(chan struct{})
+	cancelSeen := make(chan struct{})
+	finishCancelledPrompt := make(chan struct{})
+	runner := newFakeACPRunner(t, func(t *testing.T, proc *fakeACPProcess, spec command.ExecSpec) {
+		peer := newACPPeer(t, proc)
+		peer.handshake(false)
+		newSession := peer.expectRequest("session/new")
+		peer.respond(newSession, acpSessionResult("session-empty-cancel", "steer-model"))
+		setMode := peer.expectRequest("session/set_mode")
+		peer.respond(setMode, map[string]any{})
+
+		prompt := peer.expectRequest("session/prompt")
+		peer.notify("session/update", map[string]any{
+			"sessionId":     "session-empty-cancel",
+			"sessionUpdate": "agent_message_chunk",
+			"content":       map[string]any{"text": "obsolete answer"},
+		})
+		close(promptReady)
+		peer.expectNotification("session/cancel")
+		close(cancelSeen)
+		<-finishCancelledPrompt
+		peer.respond(prompt, map[string]any{"stopReason": "cancelled"})
+		peer.expectStdinClose()
+	})
+
+	session := startFakeCursorSession(t, engine.SessionOpts{CWD: t.TempDir()})
+	steerer := session.(engine.Steerer)
+	events, err := turnWithFakeRunner(t, session, engine.TurnInput{Prompt: "initial", Write: true}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-promptReady:
+	case <-time.After(2 * time.Second):
+		t.Fatal("initial ACP prompt did not stream its answer")
+	}
+	steerDone := make(chan error, 1)
+	go func() {
+		_, err := steerer.Steer(context.Background(), engine.SteerMessage{ID: "pending-cancel", Text: "must be dropped"})
+		steerDone <- err
+	}()
+	select {
+	case <-cancelSeen:
+	case <-time.After(2 * time.Second):
+		t.Fatal("steer did not send ACP session/cancel")
+	}
+	interruptCtx, cancelInterrupt := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelInterrupt()
+	interruptDone := make(chan error, 1)
+	go func() { interruptDone <- session.Interrupt(interruptCtx) }()
+	select {
+	case err := <-steerDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("pending steer error = %v, want cancellation", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("pending steer did not observe explicit cancellation")
+	}
+	close(finishCancelledPrompt)
+	select {
+	case err := <-interruptDone:
+		if err != nil {
+			t.Fatalf("explicit cancellation interrupt = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("explicit cancellation interrupt did not settle")
+	}
+
+	got := collectEvents(t, events, 2*time.Second)
+	if agents := eventsOfType(got, engine.EventAgentText); len(agents) != 1 || agents[0].Text != "obsolete answer" {
+		t.Fatalf("agent text = %#v, want the cancelled segment partial text", agents)
+	}
+	if results := eventsOfType(got, engine.EventResultMessage); len(results) != 1 || results[0].Text != "" {
+		t.Fatalf("cancel result events = %#v, want one empty result", results)
 	}
 	runner.assertRetired(t)
 }
