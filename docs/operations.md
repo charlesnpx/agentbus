@@ -196,23 +196,25 @@ That JSON is byte-identical to `agentbus result --json` and deliberately
 includes inline result text when the record has it.
 
 The full record includes an `execution` object after the job starts. It records
-`intent` (`inspect` or `edit`), `sourceWritable`, `scratch`, a cache-path map,
-`shell`, `localIPC`, `network`, `gitMetadata`, and `enforcement`. These are
-descriptive values, not a capability negotiation. `sourceWritable` reports the
-selected inspect/edit mode; `enforcement` says whether the backend provides an
-OS sandbox, agent permissions, or no filesystem boundary. Codex uses OS sandbox
+`intent` (`inspect`, `verify`, or `edit`), `sourceWritable`, `scratch`, a
+cache-path map, `shell`, `localIPC`, `network`, `gitMetadata`, and
+`enforcement`. Verify uses `intent: verify` and `sourceWritable: false`; its
+`frozenCopy` and `frozenSource` fields identify the disposable source snapshot.
+It has `gitMetadata: none` and `enforcement: os-sandbox`. These fields describe
+the selected posture, not a capability negotiation. Codex uses OS sandbox
 enforcement and denies job network access. Agentbus checks that the Codex
 sandbox can start before launching app-server; failure is `backend_unavailable`
 and does not weaken the sandbox. Trusted full-access Codex writes have no shell
-or IPC confinement. `localIPC` is `denied` by default, `private-dir` for a Codex
-edit with the local IPC profile, and `unenforced` for trusted full-access Codex
-writes and Claude/Cursor.
+or IPC confinement. `localIPC` is `denied` by default, `private-dir` for a
+Codex edit or Verify with the local IPC profile on macOS, and `unenforced` for
+trusted full-access Codex writes and Claude/Cursor. The existing Linux
+Unix-socket sandbox refusal also applies to Verify.
 That profile allows Unix sockets under the private per-job temp directory and
 TCP loopback; the job shares loopback with the host. Cursor uses agent-mode permissions,
 which do not sandbox filesystem or network access at the OS level. Claude has
 no filesystem or network sandbox; its read-only shell tool list is restricted,
 while Claude write and Cursor shell execution are unenforced by Agentbus. The
-execution object is a start-time snapshot. This unit has no `verify` intent.
+execution object is a start-time snapshot.
 
 agentbus result --job <id> reads the same full record. For a completed job it
 writes the authoritative result to standard output. It writes failure detail or

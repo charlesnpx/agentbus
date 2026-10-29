@@ -830,15 +830,6 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		if record.Backend == "codex" {
 			opts.WriteSandboxRoot = cache.root
 		}
-		if spec.LocalIPC {
-			ipcRoot, rootErr := createLocalIPCRoot()
-			if rootErr != nil {
-				s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassBackendUnavailable, rootErr, nil)
-				return
-			}
-			opts.LocalIPCRoot = ipcRoot
-			s.rememberManagedLocalIPCRoot(record.JobID, ipcRoot)
-		}
 		if spec.Verify {
 			frozenCopyPath = filepath.Join(cache.root, "src")
 			identity, copyErr := createFrozenCopyContext(jobCtx, record.CWD, frozenCopyPath)
@@ -852,6 +843,15 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 			}
 			frozenSource = &identity
 			opts.CWD = frozenCopyPath
+		}
+		if spec.LocalIPC {
+			ipcRoot, rootErr := createLocalIPCRoot()
+			if rootErr != nil {
+				s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassBackendUnavailable, rootErr, nil)
+				return
+			}
+			opts.LocalIPCRoot = ipcRoot
+			s.rememberManagedLocalIPCRoot(record.JobID, ipcRoot)
 		}
 		opts.WriteEnvOverlay = map[string]string{
 			"GOCACHE":              cache.goBuild,
@@ -1603,12 +1603,23 @@ func (s *Server) markTerminal(store *jobstore.Store, jobID string, terminal jobs
 			terminal.Cleanup = protocol.CleanupUncertain
 			terminal.Diagnostics = append(terminal.Diagnostics, "inspect managed Codex home terminal record: "+getErr.Error())
 		} else if current.State.IsTerminal() {
+			if recordUsesVerify(current) {
+				if copyErr := removeFrozenCopyFromManagedHome(home); copyErr != nil {
+					log.Printf("agentbus service: job %s frozen verification copy cleanup after terminal race: %v", jobID, copyErr)
+				}
+			}
 			home.close()
 			s.discardRecordedLocalIPCRoot(current)
 			return
 		} else {
 			cleanupRecord = current
 			cleanupRecord.State = terminal.State
+			if recordUsesVerify(cleanupRecord) {
+				if copyErr := removeFrozenCopyFromManagedHome(home); copyErr != nil {
+					terminal.Cleanup = protocol.CleanupUncertain
+					terminal.Diagnostics = append(terminal.Diagnostics, "frozen verification copy cleanup: "+copyErr.Error())
+				}
+			}
 		}
 	}
 	_, err := store.MarkTerminal(jobID, terminal)

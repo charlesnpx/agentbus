@@ -3,6 +3,7 @@
 package service
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -415,6 +416,12 @@ func finalizeManagedCodexHome(home *managedCodexHome, record jobstore.Record, cl
 		return cleanup, diagnostics
 	}
 	defer home.close()
+	if recordUsesVerify(record) {
+		if err := removeFrozenCopyFromManagedHome(home); err != nil {
+			cleanup = protocol.CleanupUncertain
+			diagnostics = append(diagnostics, "frozen verification copy cleanup: "+err.Error())
+		}
+	}
 	if cleanup != protocol.CleanupClean || record.SessionHomeRetained() {
 		return cleanup, diagnostics
 	}
@@ -422,6 +429,43 @@ func finalizeManagedCodexHome(home *managedCodexHome, record jobstore.Record, cl
 		return protocol.CleanupUncertain, append(diagnostics, "managed Codex home cleanup: "+err.Error())
 	}
 	return cleanup, diagnostics
+}
+
+func recordUsesVerify(record jobstore.Record) bool {
+	if record.Execution != nil && record.Execution.Intent == "verify" {
+		return true
+	}
+	var taskSpec struct {
+		Verify bool `json:"verify"`
+	}
+	return json.Unmarshal(record.TaskSpec, &taskSpec) == nil && taskSpec.Verify
+}
+
+func removeFrozenCopyFromManagedHome(home *managedCodexHome) error {
+	if home == nil || home.directoryFD < 0 {
+		return errors.New("managed Codex home identity is unavailable")
+	}
+	if err := verifyManagedCodexHomeIdentity(home); err != nil {
+		return err
+	}
+	if err := removeManagedCodexHomeChildIfPresent(home.directoryFD, "src"); err != nil {
+		return fmt.Errorf("remove managed src directory: %w", err)
+	}
+	return verifyManagedCodexHomeIdentity(home)
+}
+
+func removeManagedCodexHomeChildIfPresent(parentFD int, name string) error {
+	var stat unix.Stat_t
+	if err := unix.Fstatat(parentFD, name, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return nil
+		}
+		return err
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFDIR {
+		return errors.New("managed artifact is not a real directory")
+	}
+	return removeManagedCodexHomeChild(parentFD, name)
 }
 
 func removeManagedCodexHome(home *managedCodexHome) error {
@@ -551,6 +595,53 @@ func openExistingManagedDirectory(root string, components ...string) (int, error
 
 func openExistingManagedCodexHomeParent(layout engine.WorkspaceLayout) (int, error) {
 	return openExistingManagedDirectory(layout.Root, "workspaces", layout.Key, "codex")
+}
+
+func openExistingManagedCodexHome(layout engine.WorkspaceLayout, jobID string) (*managedCodexHome, error) {
+	if jobID == "" || filepath.Base(jobID) != jobID || jobID == "." || jobID == ".." {
+		return nil, errors.New("invalid managed Codex home directory name")
+	}
+	parentFD, err := openExistingManagedCodexHomeParent(layout)
+	if err != nil {
+		return nil, err
+	}
+	directoryFD, err := openManagedDirectoryAt(parentFD, jobID)
+	if err != nil {
+		_ = unix.Close(parentFD)
+		return nil, err
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstat(directoryFD, &stat); err != nil {
+		_ = unix.Close(directoryFD)
+		_ = unix.Close(parentFD)
+		return nil, err
+	}
+	return &managedCodexHome{
+		path:        filepath.Join(layout.Codex, jobID),
+		name:        jobID,
+		parentFD:    parentFD,
+		directoryFD: directoryFD,
+		dev:         uint64(stat.Dev),
+		ino:         uint64(stat.Ino),
+	}, nil
+}
+
+func (s *Server) cleanupVerifyFrozenCopyForRecord(record jobstore.Record, cleanup protocol.Cleanup, diagnostics []string) (protocol.Cleanup, []string) {
+	if s == nil || !recordUsesVerify(record) {
+		return cleanup, diagnostics
+	}
+	home, err := openExistingManagedCodexHome(engine.WorkspaceLayout{Root: s.stateRoot, Key: engine.WorkspaceKey(record.CWD)}, record.JobID)
+	if errors.Is(err, unix.ENOENT) {
+		return cleanup, diagnostics
+	}
+	if err != nil {
+		return protocol.CleanupUncertain, append(diagnostics, "frozen verification copy cleanup: open managed Codex home: "+err.Error())
+	}
+	defer home.close()
+	if err := removeFrozenCopyFromManagedHome(home); err != nil {
+		return protocol.CleanupUncertain, append(diagnostics, "frozen verification copy cleanup: "+err.Error())
+	}
+	return cleanup, diagnostics
 }
 
 func openManagedDirectoryAt(parentFD int, name string) (int, error) {

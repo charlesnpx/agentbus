@@ -299,6 +299,214 @@ func TestVerifyExecutionUsesAndRemovesFrozenScratch(t *testing.T) {
 	}
 }
 
+func TestFailedVerifyRemovesFrozenCopyAndRetainsSessionHome(t *testing.T) {
+	repo := newFrozenTestRepo(t)
+	var started engine.SessionOpts
+	backend := newCodexSandboxTestBackend(t, func(_ context.Context, opts engine.SessionOpts) (engine.Session, error) {
+		started = opts
+		return nil, errors.New("provider start failed")
+	})
+	server := newExecutionServer(t, backend)
+	server.codexSandboxProbe = func(context.Context, string) error { return nil }
+	record := queuedVerifyExecutionRecord(t, server, repo, false)
+
+	runExecution(t, server, record)
+	got := mustGetStoredJob(t, server, record.JobID)
+	if got.State != protocol.PublicStateFailed {
+		t.Fatalf("verify state = %q, want failed", got.State)
+	}
+	if started.CWD == "" {
+		t.Fatal("verify backend did not receive a frozen copy path")
+	}
+	if _, err := os.Lstat(started.CWD); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed verify frozen copy stat error = %v, want removed", err)
+	}
+	home := started.EnvOverlay["CODEX_HOME"]
+	if home == "" {
+		t.Fatal("verify backend did not receive its managed session home")
+	}
+	if info, err := os.Stat(home); err != nil || !info.IsDir() {
+		t.Fatalf("failed verify session home info=%v err=%v, want retained directory", info, err)
+	}
+}
+
+func TestVerifyFrozenCopyCleanupFailureIsRecordedAsUncertain(t *testing.T) {
+	repo := newFrozenTestRepo(t)
+	server := newExecutionServer(t, newCodexSandboxTestBackend(t, nil))
+	record := queuedVerifyExecutionRecord(t, server, repo, false)
+	layout, err := engine.LayoutForWorkspace(server.stateRoot, record.CWD)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, err := createManagedCodexHome(layout, record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer home.close()
+	target := filepath.Join(t.TempDir(), "outside")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(home.path, "src")); err != nil {
+		t.Fatal(err)
+	}
+	server.rememberManagedCodexHome(record.JobID, home)
+
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.markTerminal(store, record.JobID, jobstore.TerminalUpdate{
+		State: protocol.PublicStateFailed, Cleanup: protocol.CleanupClean,
+		FailureClass: protocol.FailureClassInternal, FailureReason: "verification failed",
+	})
+	got := mustGetStoredJob(t, server, record.JobID)
+	if got.Cleanup != protocol.CleanupUncertain {
+		t.Fatalf("cleanup = %q, want uncertain", got.Cleanup)
+	}
+	if !strings.Contains(strings.Join(got.Diagnostics, "\n"), "frozen verification copy cleanup") {
+		t.Fatalf("diagnostics = %q, want frozen-copy cleanup failure", got.Diagnostics)
+	}
+	if info, err := os.Lstat(filepath.Join(home.path, "src")); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("unexpected src path info=%v err=%v, want retained symlink", info, err)
+	}
+	if info, err := os.Stat(target); err != nil || !info.IsDir() {
+		t.Fatalf("symlink target info=%v err=%v, want untouched directory", info, err)
+	}
+}
+
+func TestVerifyRestartReconciliationRemovesLeftoverFrozenCopy(t *testing.T) {
+	repo := newFrozenTestRepo(t)
+	server := newExecutionServer(t, newCodexSandboxTestBackend(t, nil))
+	record := queuedVerifyExecutionRecord(t, server, repo, false)
+	layout, err := engine.LayoutForWorkspace(server.stateRoot, record.CWD)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, err := createManagedCodexHome(layout, record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer home.close()
+	src := filepath.Join(home.path, "src")
+	if err := os.Mkdir(src, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeFrozenTestFile(t, filepath.Join(src, "leftover.txt"), "left behind before restart", 0o600)
+
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.reconcileRecoveredJobs(store); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != protocol.PublicStateFailed {
+		t.Fatalf("reconciled verify state = %q, want failed", got.State)
+	}
+	if _, err := os.Lstat(src); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("reconciled frozen copy stat error = %v, want removed", err)
+	}
+	if info, err := os.Stat(home.path); err != nil || !info.IsDir() {
+		t.Fatalf("reconciled session home info=%v err=%v, want retained directory", info, err)
+	}
+}
+
+func TestVerifyLocalIPCCreationFollowsFrozenCopy(t *testing.T) {
+	originalGOOS := localIPCGOOS
+	localIPCGOOS = "darwin"
+	t.Cleanup(func() { localIPCGOOS = originalGOOS })
+	originalTempRoot := localIPCTempRoot
+	localIPCTempRoot = filepath.Join(t.TempDir(), "missing-parent")
+	t.Cleanup(func() { localIPCTempRoot = originalTempRoot })
+
+	t.Run("copy failure precedes IPC failure", func(t *testing.T) {
+		originalLimit := frozenCopyMaxBytes
+		frozenCopyMaxBytes = 1
+		t.Cleanup(func() { frozenCopyMaxBytes = originalLimit })
+		repo := newFrozenTestRepo(t)
+		backend := newCodexSandboxTestBackend(t, nil)
+		server := newExecutionServer(t, backend)
+		server.codexSandboxProbe = func(context.Context, string) error { return nil }
+		record := queuedVerifyExecutionRecord(t, server, repo, true)
+
+		runExecution(t, server, record)
+		got := mustGetStoredJob(t, server, record.JobID)
+		if got.State != protocol.PublicStateFailed || got.FailureClass != protocol.FailureClassInternal || !strings.Contains(got.FailureReason, "byte bound") {
+			t.Fatalf("copy failure = state:%s class:%s reason:%q, want internal byte-bound failure before IPC setup", got.State, got.FailureClass, got.FailureReason)
+		}
+	})
+
+	t.Run("IPC failure removes the completed copy", func(t *testing.T) {
+		repo := newFrozenTestRepo(t)
+		backend := newCodexSandboxTestBackend(t, nil)
+		server := newExecutionServer(t, backend)
+		server.codexSandboxProbe = func(context.Context, string) error { return nil }
+		record := queuedVerifyExecutionRecord(t, server, repo, true)
+
+		runExecution(t, server, record)
+		got := mustGetStoredJob(t, server, record.JobID)
+		if got.State != protocol.PublicStateFailed || got.FailureClass != protocol.FailureClassBackendUnavailable {
+			t.Fatalf("IPC failure = state:%s class:%s reason:%q, want backend_unavailable", got.State, got.FailureClass, got.FailureReason)
+		}
+		layout, err := engine.LayoutForWorkspace(server.stateRoot, record.CWD)
+		if err != nil {
+			t.Fatal(err)
+		}
+		src := filepath.Join(layout.Codex, record.JobID, "src")
+		if _, err := os.Lstat(src); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("frozen copy after IPC failure = %v, want removed", err)
+		}
+	})
+}
+
+func TestPruneReclaimsLeftoverVerifySourceCopy(t *testing.T) {
+	server := newTestServer(t, t.TempDir(), Config{})
+	cwd := t.TempDir()
+	layout, err := engine.LayoutForWorkspace(server.stateRoot, cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const jobID = "job_prune_verify_src"
+	home, err := createManagedCodexHome(layout, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer home.close()
+	src := filepath.Join(home.path, "src")
+	if err := os.Mkdir(src, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeFrozenTestFile(t, filepath.Join(src, "leftover.txt"), "left behind after a crash", 0o600)
+	outside := filepath.Join(t.TempDir(), "outside.txt")
+	writeFrozenTestFile(t, outside, "must remain", 0o600)
+	if err := os.Symlink(outside, filepath.Join(src, "external-link")); err != nil {
+		t.Fatal(err)
+	}
+
+	var result protocol.ArtifactsPruneResult
+	server.pruneJobCodexArtifacts(server.stateRoot, jobstore.Record{JobID: jobID, CWD: layout.Workspace}, false, &result)
+	found := false
+	for _, item := range result.Removed {
+		if item.Kind == "src" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("prune removed items = %+v, skipped=%+v; want src", result.Removed, result.Skipped)
+	}
+	if _, err := os.Lstat(src); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("pruned source copy stat error = %v, want removed", err)
+	}
+	if contents, err := os.ReadFile(outside); err != nil || string(contents) != "must remain" {
+		t.Fatalf("symlink target after pruning = %q, err=%v, want untouched", contents, err)
+	}
+}
+
 func queuedVerifyExecutionRecord(t *testing.T, server *Server, cwd string, localIPC bool) jobstore.Record {
 	t.Helper()
 	spec := protocol.TaskSpec{Backend: "codex", CWD: cwd, Prompt: "run verification", Verify: true, LocalIPC: localIPC}
