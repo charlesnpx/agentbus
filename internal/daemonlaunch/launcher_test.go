@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -54,6 +55,37 @@ func TestLaunchFailedRecordIncludesDiagnosticAndStderr(t *testing.T) {
 		t.Fatalf("stderr tail not surfaced: %+v / %v", startup, err)
 	}
 	assertPIDGone(t, readPIDFile(t, pidPath))
+}
+
+func TestLaunchStarterFailureWritesStartupDiagnostic(t *testing.T) {
+	root := shortLaunchTempDir(t)
+	startErr := errors.New("exec failed")
+	_, err := Launch(context.Background(), Options{
+		CommandPath: "daemon",
+		StateRoot:   root,
+		Starter: func(ProcessConfig) (Process, error) {
+			return nil, startErr
+		},
+	})
+	if err == nil {
+		t.Fatal("Launch succeeded, want process start failure")
+	}
+	var startup *StartupError
+	if !errors.As(err, &startup) || !errors.Is(err, ErrStartupFailed) || !errors.Is(err, startErr) {
+		t.Fatalf("Launch error = %T %v, want typed process start failure", err, err)
+	}
+	if startup.Code != CodeProcessStartFailed || startup.Phase != "launching daemon process" {
+		t.Fatalf("startup error = %+v, want process_start_failed in launch phase", startup)
+	}
+	diagnostic, readErr := os.ReadFile(startup.DiagnosticPath)
+	if readErr != nil {
+		t.Fatalf("read startup diagnostic %q: %v", startup.DiagnosticPath, readErr)
+	}
+	if !strings.Contains(string(diagnostic), CodeProcessStartFailed) ||
+		!strings.Contains(string(diagnostic), "launching daemon process") ||
+		!strings.Contains(string(diagnostic), startErr.Error()) {
+		t.Fatalf("startup diagnostic = %q, want code, phase, and cause", diagnostic)
+	}
 }
 
 func TestLaunchSetsid(t *testing.T) {
@@ -105,6 +137,37 @@ func TestLaunchTimeoutKillsAndReaps(t *testing.T) {
 		t.Fatalf("stderr tail = %q, want hang stderr", startup.StderrTail)
 	}
 	assertPIDGone(t, readPIDFile(t, pidPath))
+}
+
+func TestLaunchBusyStoreAndReadinessTimeoutCarryPhaseAndCause(t *testing.T) {
+	busyRoot := shortLaunchTempDir(t)
+	_, err := Launch(context.Background(), helperLaunchOptions(t, busyRoot, "busy-store", "", 2*time.Second))
+	if err == nil {
+		t.Fatal("Launch busy-store helper succeeded")
+	}
+	var busy *StartupError
+	if !errors.As(err, &busy) || !errors.Is(err, ErrStoreBusy) {
+		t.Fatalf("busy-store error = %T %v, want ErrStoreBusy", err, err)
+	}
+	if busy.Code != CodeStoreBusy || busy.Phase != "opening job store" || !strings.Contains(busy.StderrTail, "helper busy-store stderr") {
+		t.Fatalf("busy-store startup error = %+v, want store phase, code, and stderr", busy)
+	}
+	if _, err := os.Stat(busy.DiagnosticPath); err != nil {
+		t.Fatalf("busy-store diagnostic path %q: %v", busy.DiagnosticPath, err)
+	}
+
+	timeoutRoot := shortLaunchTempDir(t)
+	timeoutErr, _ := launchTimeoutAfterHelperStderr(t, timeoutRoot, "hang", filepath.Join(timeoutRoot, "helper.pid"))
+	var timeout *StartupError
+	if !errors.As(timeoutErr, &timeout) || !errors.Is(timeoutErr, ErrReadinessTimeout) {
+		t.Fatalf("readiness-timeout error = %T %v, want ErrReadinessTimeout", timeoutErr, timeoutErr)
+	}
+	if timeout.Code != CodeReadinessTimeout || timeout.Phase != "waiting for daemon readiness" || !strings.Contains(timeout.StderrTail, "helper hang stderr") {
+		t.Fatalf("readiness-timeout startup error = %+v, want readiness phase, code, and stderr", timeout)
+	}
+	if _, err := os.Stat(timeout.DiagnosticPath); err != nil {
+		t.Fatalf("readiness-timeout diagnostic path %q: %v", timeout.DiagnosticPath, err)
+	}
 }
 
 func TestLaunchTimeoutKillsChattyChildAndBoundsStderr(t *testing.T) {
@@ -318,6 +381,10 @@ func runLaunchHelper() int {
 		fmt.Fprintln(os.Stderr, "helper failed stderr")
 		_ = reporter.Failed("strict admission support unavailable", "strict diagnostic from helper")
 		return 1
+	case "busy-store":
+		fmt.Fprintln(os.Stderr, "helper busy-store stderr")
+		_ = reporter.FailedAt("opening job store", CodeStoreBusy, "jobstore root busy")
+		return 1
 	case "crash":
 		fmt.Fprintln(os.Stderr, "helper crash stderr")
 		return 42
@@ -327,7 +394,17 @@ func runLaunchHelper() int {
 		}
 		sleepForever()
 	case "chatty-hang":
+		stdinClosed := make(chan struct{})
+		go func() {
+			_, _ = io.Copy(io.Discard, os.Stdin)
+			close(stdinClosed)
+		}()
 		for i := 0; ; i++ {
+			select {
+			case <-stdinClosed:
+				return 0
+			default:
+			}
 			if _, err := fmt.Fprintf(os.Stderr, "helper chatty stderr %06d %s\n", i, strings.Repeat("x", 1024)); err != nil {
 				return 2
 			}
@@ -362,9 +439,7 @@ func runLaunchHelper() int {
 }
 
 func sleepForever() {
-	for {
-		time.Sleep(time.Hour)
-	}
+	_, _ = io.Copy(io.Discard, os.Stdin)
 }
 
 func signalLaunchHelperStderrReady() {
@@ -401,7 +476,9 @@ func helperLaunchOptions(t *testing.T, root, mode, pidPath string, timeout time.
 }
 
 type testProcess struct {
-	cmd *exec.Cmd
+	cmd       *exec.Cmd
+	stdin     *os.File
+	closeOnce sync.Once
 }
 
 type stubProcess struct {
@@ -422,42 +499,58 @@ func (process stubProcess) Wait() error {
 }
 
 func testProcessStarter(config ProcessConfig) (Process, error) {
+	stdinRead, stdinWrite, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
 	cmd := exec.Command(config.CommandPath, config.Args...)
 	cmd.Env = config.Env
 	cmd.ExtraFiles = config.ExtraFiles
-	cmd.Stdin = config.Stdin
+	cmd.Stdin = stdinRead
 	cmd.Stdout = config.Stdout
 	cmd.Stderr = config.Stderr
 	if config.Setsid {
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	}
 	if err := cmd.Start(); err != nil {
+		_ = stdinRead.Close()
+		_ = stdinWrite.Close()
 		return nil, err
 	}
-	return testProcess{cmd: cmd}, nil
+	_ = stdinRead.Close()
+	return &testProcess{cmd: cmd, stdin: stdinWrite}, nil
 }
 
 func testProcessStarterWithStderrReady(stderrReady chan<- error) ProcessStarter {
 	return func(config ProcessConfig) (Process, error) {
+		stdinRead, stdinWrite, err := os.Pipe()
+		if err != nil {
+			return nil, err
+		}
 		readyRead, readyWrite, err := os.Pipe()
 		if err != nil {
+			_ = stdinRead.Close()
+			_ = stdinWrite.Close()
 			return nil, err
 		}
 		childFD := readinessFDChildNumber + len(config.ExtraFiles)
 		cmd := exec.Command(config.CommandPath, config.Args...)
 		cmd.Env = upsertEnv(append([]string(nil), config.Env...), launchHelperStderrReadyFDEnv+"="+strconv.Itoa(childFD))
 		cmd.ExtraFiles = append(append([]*os.File(nil), config.ExtraFiles...), readyWrite)
-		cmd.Stdin = config.Stdin
+		cmd.Stdin = stdinRead
 		cmd.Stdout = config.Stdout
 		cmd.Stderr = config.Stderr
 		if config.Setsid {
 			cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 		}
 		if err := cmd.Start(); err != nil {
+			_ = stdinRead.Close()
+			_ = stdinWrite.Close()
 			_ = readyRead.Close()
 			_ = readyWrite.Close()
 			return nil, err
 		}
+		_ = stdinRead.Close()
 		_ = readyWrite.Close()
 		go func() {
 			defer readyRead.Close()
@@ -473,19 +566,20 @@ func testProcessStarterWithStderrReady(stderrReady chan<- error) ProcessStarter 
 			}
 			stderrReady <- nil
 		}()
-		return testProcess{cmd: cmd}, nil
+		return &testProcess{cmd: cmd, stdin: stdinWrite}, nil
 	}
 }
 
-func (process testProcess) PID() int {
+func (process *testProcess) PID() int {
 	return process.cmd.Process.Pid
 }
 
-func (process testProcess) Kill() error {
+func (process *testProcess) Kill() error {
+	process.closeOnce.Do(func() { _ = process.stdin.Close() })
 	return process.cmd.Process.Kill()
 }
 
-func (process testProcess) Wait() error {
+func (process *testProcess) Wait() error {
 	return process.cmd.Wait()
 }
 

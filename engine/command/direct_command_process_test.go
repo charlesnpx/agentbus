@@ -21,7 +21,7 @@ import (
 
 func TestTerminateProcessGroupExitsOnSIGTERMWithoutEscalation(t *testing.T) {
 	const grace = 300 * time.Millisecond
-	cmd, terminator, _ := startTerminationTestProcess(t, "trap 'exit 0' TERM; printf 'ready\\n'; while :; do :; done", grace)
+	cmd, terminator, _ := startTerminationTestProcess(t, "trap 'exit 0' TERM; printf 'ready\\n'; while IFS= read -r ignored; do :; done", grace)
 	requireStartToken(t, terminator.capturedProcessRef())
 	var calls []syscall.Signal
 	groupGone := false
@@ -52,13 +52,13 @@ func TestTerminateProcessGroupExitsOnSIGTERMWithoutEscalation(t *testing.T) {
 
 func TestTerminateProcessGroupEscalatesProcessIgnoringSIGTERM(t *testing.T) {
 	const grace = 50 * time.Millisecond
-	cmd, terminator, _ := startTerminationTestProcess(t, "trap '' TERM; printf 'ready\\n'; while :; do :; done", grace)
+	cmd, terminator, _ := startTerminationTestProcess(t, "trap '' TERM; printf 'ready\\n'; while IFS= read -r ignored; do :; done", grace)
 	requireStartToken(t, terminator.capturedProcessRef())
 	var calls []syscall.Signal
 	setProcessGroupSignal(t, func(_ int, signal syscall.Signal) error {
 		calls = append(calls, signal)
 		if signal == syscall.SIGKILL {
-			return cmd.Process.Kill()
+			return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		}
 		return nil
 	})
@@ -79,7 +79,7 @@ func TestTerminateProcessGroupEscalatesProcessIgnoringSIGTERM(t *testing.T) {
 
 func TestTerminateProcessGroupMismatchedTokenSendsNoSignal(t *testing.T) {
 	const grace = 300 * time.Millisecond
-	cmd, terminator, ref := startTerminationTestProcess(t, "trap '' TERM; printf 'ready\\n'; while :; do :; done", grace)
+	cmd, terminator, ref := startTerminationTestProcess(t, "trap '' TERM; printf 'ready\\n'; while IFS= read -r ignored; do :; done", grace)
 	requireStartToken(t, ref)
 	ref.StartTime += "-wrong"
 	setTerminatorProcessRef(terminator, ref)
@@ -103,7 +103,7 @@ func TestTerminateProcessGroupMismatchedTokenSendsNoSignal(t *testing.T) {
 
 func TestTerminateProcessGroupMissingTokenSendsNoSignal(t *testing.T) {
 	const grace = 300 * time.Millisecond
-	cmd, terminator, ref := startTerminationTestProcess(t, "trap '' TERM; printf 'ready\\n'; while :; do :; done", grace)
+	cmd, terminator, ref := startTerminationTestProcess(t, "trap '' TERM; printf 'ready\\n'; while IFS= read -r ignored; do :; done", grace)
 	requireStartToken(t, ref)
 	ref.StartTime = ""
 	setTerminatorProcessRef(terminator, ref)
@@ -189,7 +189,7 @@ func TestDirectCommandRunnerCanceledWithMismatchedTokenKeepsWritingProcessAlive(
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	running, err := (DirectCommandRunner{CancelGrace: 10 * time.Millisecond}).Start(ctx, ExecSpec{
-		Argv: []string{"/usr/bin/yes"},
+		Argv: []string{"/bin/sh", "-c", `exec 3<&0; (while IFS= read -r ignored; do :; done <&3; kill -KILL "$$") & while :; do printf 'y'; done`},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -457,7 +457,7 @@ func TestDirectCommandRunnerKilledCancellationRetainsExecutionFailure(t *testing
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	running, err := (DirectCommandRunner{CancelGrace: 10 * time.Millisecond}).Start(ctx, ExecSpec{
-		Argv: []string{"/bin/sh", "-c", "trap '' TERM; printf 'ready\\n'; while :; do :; done"},
+		Argv: []string{"/bin/sh", "-c", "trap '' TERM; printf 'ready\\n'; while IFS= read -r ignored; do :; done"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -586,7 +586,7 @@ func TestTerminateProcessGroupPermissionDeniedStopsWithoutWaitingOrEscalating(t 
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cmd, terminator, ref := startTerminationTestProcess(t, "trap '' TERM; printf 'ready\\n'; while :; do :; done", grace)
+			cmd, terminator, ref := startTerminationTestProcess(t, "trap '' TERM; printf 'ready\\n'; while IFS= read -r ignored; do :; done", grace)
 			requireStartToken(t, ref)
 			var calls []syscall.Signal
 			probeCalls := 0
@@ -632,17 +632,26 @@ func startTerminationTestProcess(t *testing.T, script string, grace time.Duratio
 
 	cmd := exec.Command("/bin/sh", "-c", script)
 	setProcessGroup(cmd)
-	stdout, err := cmd.StdoutPipe()
+	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		t.Fatal(err)
 	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		_ = stdin.Close()
+		t.Fatal(err)
+	}
 	if err := cmd.Start(); err != nil {
+		_ = stdin.Close()
 		t.Fatal(err)
 	}
 	terminator := &directTerminator{cmd: cmd, grace: grace}
 	terminator.captureProcessRef()
 	ref := terminator.capturedProcessRef()
-	t.Cleanup(func() { stopTerminationTestProcess(t, cmd) })
+	t.Cleanup(func() {
+		_ = stdin.Close()
+		stopTerminationTestProcess(t, cmd)
+	})
 
 	line, err := bufio.NewReader(stdout).ReadString('\n')
 	if err != nil {
@@ -713,12 +722,15 @@ func assertProcessRunning(t *testing.T, pid int) {
 
 func stopTerminationTestProcess(t *testing.T, cmd *exec.Cmd) {
 	t.Helper()
-	if cmd == nil || cmd.Process == nil || cmd.ProcessState != nil {
+	if cmd == nil || cmd.Process == nil {
 		return
 	}
-	_ = cmd.Process.Kill()
-	if err := cmd.Wait(); err != nil && cmd.ProcessState == nil {
-		t.Errorf("cleanup Wait() error = %v", err)
+	if cmd.ProcessState == nil {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		_ = cmd.Process.Kill()
+		if err := cmd.Wait(); err != nil && cmd.ProcessState == nil {
+			t.Errorf("cleanup Wait() error = %v", err)
+		}
 	}
 }
 
@@ -728,15 +740,16 @@ func stopDirectRunningCommand(t *testing.T, command *directRunningCommand) {
 		return
 	}
 	command.startWait()
-	// Tests already own the direct child. Cleanup deliberately avoids the
-	// production process-group path because environments may deny it.
+	// Tests own this process group, including any fixture descendants. Close
+	// stdin so EOF-aware helpers can exit, then ensure the whole group is gone.
+	if command.stdin != nil {
+		_ = command.stdin.Close()
+	}
 	if command.cmd.Process != nil {
+		_ = syscall.Kill(-command.cmd.Process.Pid, syscall.SIGKILL)
 		if err := command.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
 			t.Errorf("cleanup direct child kill error = %v", err)
 		}
-	}
-	if command.stdin != nil {
-		_ = command.stdin.Close()
 	}
 	if command.stdout != nil {
 		_ = command.stdout.Close()

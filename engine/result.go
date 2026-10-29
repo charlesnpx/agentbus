@@ -222,6 +222,15 @@ func (w *CappedLogWriter) Close() error {
 	return w.file.Close()
 }
 
+// CapturedBytes reports the provider payload bytes successfully written before
+// the log cap. It is intended for bounded capture diagnostics.
+func (w *CappedLogWriter) CapturedBytes() int64 {
+	if w == nil {
+		return 0
+	}
+	return w.written
+}
+
 func (w *CappedLogWriter) markTruncated() error {
 	if w.truncated {
 		return nil

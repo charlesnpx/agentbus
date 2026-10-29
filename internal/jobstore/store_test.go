@@ -108,6 +108,48 @@ func TestSubmitReplayMatchesOnlyCanonicalTaskSpec(t *testing.T) {
 	}
 }
 
+func TestListPageReturnsOrderedNonOverlappingPages(t *testing.T) {
+	store := newTestStore(t)
+	defer closeTestStore(t, store)
+	for i := range 5 {
+		requestID := "page-" + strconv.Itoa(i)
+		_, _, err := store.SubmitTx(RequestKey{WorkspaceKey: "workspace-page", RequestID: requestID}, testTaskSpec(requestID), func(string) (Record, error) {
+			return Record{Backend: "codex"}, nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	want, err := store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := ""
+	var got []Record
+	for {
+		page, next, more, err := store.ListPage(2, after)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, page...)
+		if !more {
+			break
+		}
+		if next == "" || next == after {
+			t.Fatalf("page cursor did not advance: after=%q next=%q", after, next)
+		}
+		after = next
+	}
+	if len(got) != len(want) {
+		t.Fatalf("paged records = %d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i].JobID != want[i].JobID {
+			t.Fatalf("paged record %d = %s, want %s", i, got[i].JobID, want[i].JobID)
+		}
+	}
+}
+
 func TestSubmitNewRecordForcesQueuedState(t *testing.T) {
 	store := newTestStore(t)
 	defer closeTestStore(t, store)

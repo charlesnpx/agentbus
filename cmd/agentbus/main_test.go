@@ -288,6 +288,9 @@ func TestStatusHumanProjectionIncludesOperatorFieldsAndNeverResultText(t *testin
 	record.Failure = &protocol.JobFailureWire{Class: protocol.FailureClassBackendError, Reason: "provider stopped"}
 	record.Contract = &protocol.ContractResult{Evaluated: true, Compliant: false}
 	record.LogPaths = &protocol.LogPathsWire{Stdout: "/logs/out", Stderr: "/logs/err"}
+	record.Execution = &protocol.ExecutionPosture{
+		Intent: "inspect", Network: "denied", GitMetadata: "read-only", Enforcement: "os-sandbox",
+	}
 	record.Steers = []protocol.SteerSummaryWire{{
 		MessageID: "message-1", Status: protocol.SteerStatusDelivered,
 		Mechanism: "native", Time: finished.Add(time.Minute),
@@ -300,7 +303,7 @@ func TestStatusHumanProjectionIncludesOperatorFieldsAndNeverResultText(t *testin
 		t.Fatalf("status exit=%d stderr=%q", code, stderr)
 	}
 	for _, want := range []string{
-		"jobId=job-1 state=failed backend=codex cleanup=clean age=",
+		"jobId=job-1 state=failed backend=codex cleanup=clean queuedAt=",
 		"createdAt=2026-01-02T03:04:05Z",
 		"startedAt=2026-01-02T03:05:05Z",
 		"finishedAt=2026-01-02T03:06:05Z",
@@ -310,6 +313,7 @@ func TestStatusHumanProjectionIncludesOperatorFieldsAndNeverResultText(t *testin
 		"failure.class=backend_error failure.reason=provider stopped",
 		"contract.evaluated=true contract.compliant=false",
 		"logPaths.stdout=/logs/out logPaths.stderr=/logs/err",
+		`execution={"intent":"inspect","sourceWritable":false,"network":"denied","gitMetadata":"read-only","enforcement":"os-sandbox"}`,
 		"steer.messageId=message-1 status=delivered mechanism=native time=2026-01-02T03:07:05Z",
 	} {
 		if !strings.Contains(stdout, want) {
@@ -379,7 +383,7 @@ func TestStatusListHumanProjectionIncludesFailureClassAndContractVerdict(t *test
 	if code != 0 || stderr != "" {
 		t.Fatalf("status list exit=%d stderr=%q", code, stderr)
 	}
-	if !strings.Contains(stdout, "jobId=job-1 state=running backend=codex cleanup=uncertain age=") ||
+	if !strings.Contains(stdout, "jobId=job-1 state=running backend=codex cleanup=uncertain queuedAt=") ||
 		!strings.Contains(stdout, "failure.class=backend_error") ||
 		!strings.Contains(stdout, "contract.evaluated=true contract.compliant=false") ||
 		!strings.Contains(stdout, "tags=team=core itemCount=3") ||
@@ -520,6 +524,20 @@ func TestTranscriptForwardsSelectorsAndPrintsDigest(t *testing.T) {
 	decodeJSON(t, stdout, &decoded)
 	if decoded.ItemCount != transcript.ItemCount || len(decoded.Items) != 1 || decoded.Items[0].Ordinal != 7 {
 		t.Fatalf("JSON transcript = %#v", decoded)
+	}
+}
+
+func TestTranscriptShowsPrunedIndication(t *testing.T) {
+	record := detailedRecord(protocol.PublicStateCompleted)
+	client := &fakeProtocolClient{
+		records:     map[string]agentclient.JobGetResult{"job-1": record},
+		transcripts: map[string]agentclient.JobTranscriptResult{"job-1": {State: protocol.PublicStateCompleted, Gap: true, Pruned: true}},
+	}
+	a := testApp(t)
+	a.clientConnect = fakeConnector(client)
+	code, stdout, stderr := runTestCLI(t, a, []string{"transcript", "--job", "job-1"})
+	if code != 0 || stderr != "" || !strings.Contains(stdout, "pruned=true") {
+		t.Fatalf("pruned transcript=(%d,%q,%q)", code, stdout, stderr)
 	}
 }
 
@@ -745,6 +763,7 @@ func TestCancelFetchesRecordForContractExitCode(t *testing.T) {
 
 func TestProtocolErrorsAndStartupFailuresKeepTypedExitCodes(t *testing.T) {
 	unknown := &protocol.RPCError{Object: *protocol.NewError(protocol.ErrorUnknownJob, "not found", protocol.ErrorData{JobID: "missing"})}
+	queueFull := &protocol.RPCError{Object: *protocol.NewError(protocol.ErrorQueueFull, "queue full", protocol.ErrorData{})}
 	startup := &daemonlaunch.StartupError{Kind: daemonlaunch.ErrReadinessEOF}
 	for _, tt := range []struct {
 		name string
@@ -752,6 +771,7 @@ func TestProtocolErrorsAndStartupFailuresKeepTypedExitCodes(t *testing.T) {
 		want int
 	}{
 		{"unknown job", unknown, cliExitUnknownJob},
+		{"queue full", queueFull, 19},
 		{"startup", startup, cliExitDaemonStartupFailure},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -794,17 +814,76 @@ func TestServeForegroundStartupFailureUsesExit11(t *testing.T) {
 func TestStartBackgroundDaemonWritesPIDAfterReady(t *testing.T) {
 	a := testApp(t)
 	a.daemonLauncher = func(_ context.Context, opts daemonlaunch.Options) (daemonlaunch.Result, error) {
-		if got, want := opts.Args, []string{"serve", "--foreground"}; !slices.Equal(got, want) {
+		if got, want := opts.Args, []string{"serve", "--foreground", "--max-jobs", "4", "--max-jobs-per-backend", "2", "--max-queued", "64", "--prune-interval", "24h0m0s"}; !slices.Equal(got, want) {
 			t.Fatalf("launch args=%v want=%v", got, want)
 		}
 		return daemonlaunch.Result{PID: 4242, CanonicalStateRoot: a.stateRoot}, nil
 	}
-	if err := a.startBackgroundDaemon(context.Background()); err != nil {
+	if err := a.startBackgroundDaemon(context.Background(), 4, 2, 64, 24*time.Hour); err != nil {
 		t.Fatal(err)
 	}
 	raw, err := os.ReadFile(filepath.Join(a.stateRoot, "agentbus.pid"))
 	if err != nil || string(raw) != "4242\n" {
 		t.Fatalf("pid file=(%q,%v)", raw, err)
+	}
+}
+
+func TestPruneDefaultsToDryRunAndSupportsApply(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		args  []string
+		apply bool
+	}{
+		{name: "default dry-run", args: []string{"prune", "--json"}},
+		{name: "apply", args: []string{"prune", "--apply"}, apply: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dryRun := !test.apply
+			client := &fakeProtocolClient{prune: agentclient.ArtifactsPruneResult{
+				DryRun:              dryRun,
+				SuccessfulOlderThan: "168h",
+				FailedOlderThan:     "720h",
+				WouldRemove:         []agentclient.PruneItem{{JobID: "job-1", Kind: "log", Path: "/state/artifacts/logs/job-1.stdout.log", Bytes: 3}},
+				Removed:             []agentclient.PruneItem{},
+				Skipped:             []agentclient.PruneSkip{{JobID: "job-2", Reason: "session is retained"}},
+				WouldRemoveBytes:    3,
+			}}
+			a := testApp(t)
+			a.clientConnect = fakeConnector(client)
+			code, stdout, stderr := runTestCLI(t, a, test.args)
+			if code != 0 || stderr != "" {
+				t.Fatalf("prune=(%d,%q,%q)", code, stdout, stderr)
+			}
+			if len(client.pruneParams) != 1 {
+				t.Fatalf("prune params = %+v", client.pruneParams)
+			}
+			params := client.pruneParams[0]
+			if params.DryRun == nil || *params.DryRun != !test.apply || params.SuccessfulOlderThan != "168h0m0s" || params.FailedOlderThan != "720h0m0s" {
+				t.Fatalf("prune params = %+v", params)
+			}
+			if test.apply {
+				if !strings.Contains(stdout, "mode=apply") || !strings.Contains(stdout, "skipped jobId=job-2") {
+					t.Fatalf("apply output = %q", stdout)
+				}
+			} else if !strings.Contains(stdout, `"wouldRemoveBytes":3`) || !strings.Contains(stdout, `"dryRun":true`) {
+				t.Fatalf("dry-run JSON = %q", stdout)
+			}
+		})
+	}
+}
+
+func TestServeConcurrencyFlagsReachBackgroundDaemon(t *testing.T) {
+	a := testApp(t)
+	a.daemonLauncher = func(_ context.Context, opts daemonlaunch.Options) (daemonlaunch.Result, error) {
+		want := []string{"serve", "--foreground", "--max-jobs", "3", "--max-jobs-per-backend", "1", "--max-queued", "9"}
+		if !slices.Equal(opts.Args, want) {
+			t.Fatalf("launch args = %v, want %v", opts.Args, want)
+		}
+		return daemonlaunch.Result{PID: 4242, CanonicalStateRoot: a.stateRoot}, nil
+	}
+	code, stdout, stderr := runTestCLI(t, a, []string{"serve", "--max-jobs", "3", "--max-jobs-per-backend", "1", "--max-queued", "9"})
+	if code != 0 || stdout != "" || stderr != "" {
+		t.Fatalf("serve = (%d, %q, %q), want successful background start", code, stdout, stderr)
 	}
 }
 
@@ -870,6 +949,8 @@ type fakeProtocolClient struct {
 	transcriptParams []agentclient.JobTranscriptParams
 	transcriptFunc   func(agentclient.JobTranscriptParams, int) (agentclient.JobTranscriptResult, error)
 	cancels          map[string]agentclient.JobCancelResult
+	prune            agentclient.ArtifactsPruneResult
+	pruneParams      []agentclient.ArtifactsPruneParams
 	steer            agentclient.JobSteerResult
 	steerParams      agentclient.JobSteerParams
 	cancelParams     []agentclient.JobCancelParams
@@ -923,6 +1004,14 @@ func (c *fakeProtocolClient) JobCancel(_ context.Context, params agentclient.Job
 		return agentclient.JobCancelResult{}, &protocol.RPCError{Object: *protocol.NewError(protocol.ErrorUnknownJob, "not found", protocol.ErrorData{JobID: params.JobID})}
 	}
 	return result, nil
+}
+
+func (c *fakeProtocolClient) ArtifactsPrune(_ context.Context, params agentclient.ArtifactsPruneParams) (agentclient.ArtifactsPruneResult, error) {
+	if c.err != nil {
+		return agentclient.ArtifactsPruneResult{}, c.err
+	}
+	c.pruneParams = append(c.pruneParams, params)
+	return c.prune, nil
 }
 
 func (c *fakeProtocolClient) Steer(_ context.Context, params agentclient.JobSteerParams) (agentclient.JobSteerResult, error) {

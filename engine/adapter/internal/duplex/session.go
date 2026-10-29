@@ -218,28 +218,24 @@ func (s *Session) TurnWithRunner(ctx context.Context, input engine.TurnInput, ru
 
 	var stderr bytes.Buffer
 	var stderrLog *engine.CappedLogWriter
+	stderrCapture := &captureWarningTracker{source: "stderr"}
 	stderrWriter := io.Writer(&stderr)
 	if input.LogPaths.Stderr != "" {
 		stderrLog, err = engine.NewCappedLogWriter(input.LogPaths.Stderr, 0)
 		if err != nil {
-			driverCancel()
-			turnCancel()
-			s.mu.Unlock()
-			return nil, err
+			stderrCapture.fail(err)
+			stderrLog = nil
+		} else {
+			stderrWriter = io.MultiWriter(&stderr, stderrCapture.tolerantWriter(stderrLog))
 		}
-		stderrWriter = io.MultiWriter(&stderr, stderrLog)
 	}
 	var stdoutLog *engine.CappedLogWriter
+	stdoutCapture := &captureWarningTracker{source: "stdout"}
 	if input.LogPaths.Stdout != "" {
 		stdoutLog, err = engine.NewCappedLogWriter(input.LogPaths.Stdout, 0)
 		if err != nil {
-			if stderrLog != nil {
-				_ = stderrLog.Close()
-			}
-			driverCancel()
-			turnCancel()
-			s.mu.Unlock()
-			return nil, err
+			stdoutCapture.fail(err)
+			stdoutLog = nil
 		}
 	}
 
@@ -272,7 +268,7 @@ func (s *Session) TurnWithRunner(ctx context.Context, input engine.TurnInput, ru
 	}
 	retirement := startRetirement(turnCtx, running)
 	stdoutPipe := running.Stdout()
-	conn := newConn(running.Stdin(), stdoutPipe, stdoutWriter, running, retirement)
+	conn := newConn(running.Stdin(), stdoutPipe, stdoutWriter, stdoutCapture, running, retirement)
 	active := &activeTurn{running: running, conn: conn, retirement: retirement}
 	s.active = active
 	s.mu.Unlock()
@@ -289,7 +285,7 @@ func (s *Session) TurnWithRunner(ctx context.Context, input engine.TurnInput, ru
 	}
 
 	events := make(chan engine.Event, eventBufferSize)
-	go s.runTurn(driverCtx, driverCancel, turnCtx, turnCancel, input, resumeID, active, stdoutPipe, running.Stderr(), stderrWriter, &stderr, stdoutLog, stderrLog, events)
+	go s.runTurn(driverCtx, driverCancel, turnCtx, turnCancel, input, resumeID, active, stdoutPipe, running.Stderr(), stderrWriter, &stderr, stdoutLog, stderrLog, stderrCapture, events)
 	return events, nil
 }
 
@@ -330,7 +326,7 @@ func normalizeEnvironment(goos string, layers ...[]string) []string {
 	return env
 }
 
-func (s *Session) runTurn(driverCtx context.Context, driverCancel context.CancelFunc, turnCtx context.Context, turnCancel context.CancelFunc, input engine.TurnInput, resumeID string, active *activeTurn, stdoutPipe io.ReadCloser, stderrPipe io.ReadCloser, stderrWriter io.Writer, stderr *bytes.Buffer, stdoutLog *engine.CappedLogWriter, stderrLog *engine.CappedLogWriter, events chan<- engine.Event) {
+func (s *Session) runTurn(driverCtx context.Context, driverCancel context.CancelFunc, turnCtx context.Context, turnCancel context.CancelFunc, input engine.TurnInput, resumeID string, active *activeTurn, stdoutPipe io.ReadCloser, stderrPipe io.ReadCloser, stderrWriter io.Writer, stderr *bytes.Buffer, stdoutLog *engine.CappedLogWriter, stderrLog *engine.CappedLogWriter, stderrCapture *captureWarningTracker, events chan<- engine.Event) {
 	defer close(events)
 	defer turnCancel()
 	defer driverCancel()
@@ -404,10 +400,21 @@ func (s *Session) runTurn(driverCtx context.Context, driverCancel context.Cancel
 	}
 	emitCompletionEvents(disposition, events, result.err, earlyExit, observation, stderr, stderrCopyErr)
 	if stdoutLog != nil {
-		_ = stdoutLog.Close()
+		if err := stdoutLog.Close(); err != nil {
+			active.conn.capture.setWritten(stdoutLog.CapturedBytes())
+			active.conn.capture.fail(err)
+		}
 	}
 	if stderrLog != nil {
-		_ = stderrLog.Close()
+		if err := stderrLog.Close(); err != nil {
+			stderrCapture.setWritten(stderrLog.CapturedBytes())
+			stderrCapture.fail(err)
+		}
+	}
+	for _, warning := range []*captureWarning{active.conn.captureWarning(), stderrCapture.snapshot()} {
+		if warning != nil {
+			events <- warningWithMetadata(warning.text(), warning.event())
+		}
 	}
 
 	// Clear active before channel closure, preserving the existing guarantee that
