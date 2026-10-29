@@ -513,22 +513,6 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		return
 	}
 
-	// This durable transaction is intentionally separate from the later claim
-	// transaction in activeExecution.persistProcessClaim.
-	started, err := store.MarkStarting(record.JobID)
-	if err != nil {
-		// A failed or ambiguous starting commit must never license a spawn. Try
-		// to make that failure durable so the job remains visible; markTerminal
-		// logs and leaves it alone if that write also fails.
-		s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("commit starting transition: %w", err), nil)
-		log.Printf("agentbus service: job %s starting commit failed; backend was not launched: %v", record.JobID, err)
-		return
-	}
-	record = started
-	if run.cancellationRequested() {
-		return
-	}
-
 	if strings.TrimSpace(record.Artifacts.Log) == "" {
 		s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, errors.New("job log artifact path is missing"), nil)
 		return
@@ -550,13 +534,18 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		Effort:  record.Effort,
 		Timeout: timeout,
 	}
+	var (
+		layout  engine.WorkspaceLayout
+		managed *managedCodexHome
+		cache   jobCachePaths
+		caches  map[string]string
+	)
 	if record.Backend == "codex" {
-		layout, err := engine.LayoutForWorkspace(s.stateRoot, record.CWD)
+		layout, err = engine.LayoutForWorkspace(s.stateRoot, record.CWD)
 		if err != nil {
 			s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("prepare Codex workspace layout: %w", err), nil)
 			return
 		}
-		var managed *managedCodexHome
 		if resumeTarget != nil {
 			codexHome, err := s.resumeCodexHome(store, *resumeTarget)
 			if err != nil {
@@ -580,24 +569,82 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 				opts.EnvOverlay = map[string]string{"CODEX_HOME": codexHome}
 			}
 		}
-		if record.Write {
-			cache, managed, cacheErr := prepareCodexJobCache(layout, record.JobID, managed)
-			if managed != nil {
-				s.rememberManagedCodexHome(record.JobID, managed)
-			}
-			if cacheErr != nil {
-				s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("prepare Codex job cache: %w", cacheErr), nil)
-				return
-			}
-			opts.WriteSandboxRoot = cache.root
-			// Override unconditionally: inherited host cache and temporary paths are
-			// outside the write sandbox, which is the condition this cache fixes.
-			opts.WriteEnvOverlay = map[string]string{
-				"GOCACHE":    cache.goBuild,
-				"GOMODCACHE": cache.goMod,
-				"TMPDIR":     cache.tmp,
-			}
+		if opts.EnvOverlay == nil {
+			opts.EnvOverlay = make(map[string]string)
 		}
+		// The offline Codex sandbox may read the daemon's populated module
+		// cache, but does not get a private empty replacement or network access.
+		if s.moduleCache != "" {
+			opts.EnvOverlay["GOMODCACHE"] = s.moduleCache
+		}
+		opts.EnvOverlay["GOPROXY"] = "off"
+	} else if record.Write {
+		layout, err = engine.LayoutForWorkspace(s.stateRoot, record.CWD)
+		if err != nil {
+			s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("prepare job workspace layout: %w", err), nil)
+			return
+		}
+	}
+	if record.Write {
+		cache, managed, err = prepareJobCache(layout, record.JobID, managed)
+		if managed != nil {
+			s.rememberManagedCodexHome(record.JobID, managed)
+		}
+		if err != nil {
+			s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("prepare job cache: %w", err), nil)
+			return
+		}
+		if record.Backend == "codex" {
+			opts.WriteSandboxRoot = cache.root
+		}
+		opts.WriteEnvOverlay = map[string]string{
+			"GOCACHE":              cache.goBuild,
+			"TMPDIR":               cache.tmp,
+			"npm_config_cache":     cache.npm,
+			"COREPACK_HOME":        cache.corepack,
+			"XDG_CACHE_HOME":       cache.xdg,
+			"npm_config_store_dir": cache.pnpm,
+			"YARN_CACHE_FOLDER":    cache.yarn,
+		}
+		caches = make(map[string]string, len(opts.WriteEnvOverlay)+1)
+		for key, value := range opts.WriteEnvOverlay {
+			caches[key] = value
+		}
+	}
+	if record.Backend == "codex" && s.moduleCache != "" {
+		if caches == nil {
+			caches = make(map[string]string, 1)
+		}
+		caches["GOMODCACHE"] = s.moduleCache
+	}
+	if len(caches) == 0 {
+		caches = nil
+	}
+	scratch := ""
+	if record.Write {
+		scratch = cache.root
+	}
+	posture := executionPosture(record.Backend, record.Write, scratch, caches)
+	if run.cancellationRequested() {
+		s.discardManagedCodexHome(record.JobID)
+		return
+	}
+
+	// Persist the execution description in the same transaction as the
+	// starting marker, before a backend process can be spawned.
+	started, err := store.MarkStartingWithExecution(record.JobID, &posture)
+	if err != nil {
+		s.discardManagedCodexHome(record.JobID)
+		// A failed or ambiguous starting commit must never license a spawn. Try
+		// to make that failure durable so the job remains visible; markTerminal
+		// logs and leaves it alone if that write also fails.
+		s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("commit starting transition: %w", err), nil)
+		log.Printf("agentbus service: job %s starting commit failed; backend was not launched: %v", record.JobID, err)
+		return
+	}
+	record = started
+	if run.cancellationRequested() {
+		return
 	}
 	resumeSessionID := ""
 	if resumeTarget != nil {

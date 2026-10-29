@@ -18,9 +18,10 @@ import (
 
 var codexHomeLinkedFiles = []string{"auth.json", "config.toml"}
 
-// managedCodexHome records both the directory identity created for one job and
-// directory handles pinned to its original parents. Cleanup only removes a
-// leaf after it still resolves to this identity through the pinned parent.
+// managedCodexHome records the private per-job state directory identity and
+// directory handles pinned to its original parents. Writable jobs also keep
+// their scratch and caches in this leaf. Cleanup only removes it after it
+// still resolves to this identity through the pinned parent.
 type managedCodexHome struct {
 	path        string
 	name        string
@@ -31,10 +32,14 @@ type managedCodexHome struct {
 }
 
 type jobCachePaths struct {
-	root    string
-	goBuild string
-	goMod   string
-	tmp     string
+	root     string
+	goBuild  string
+	tmp      string
+	npm      string
+	corepack string
+	xdg      string
+	pnpm     string
+	yarn     string
 }
 
 func (home *managedCodexHome) close() {
@@ -121,13 +126,12 @@ func (s *Server) prepareCodexHome(layout engine.WorkspaceLayout, jobID string) (
 	return path, managed, nil
 }
 
-// prepareCodexJobCache creates the private Go cache and temporary directories
-// inside the accepted job's managed Codex state leaf. It runs before the
-// adapter starts an app-server process, so toolchains never race directory
-// creation under their sandbox.
-func prepareCodexJobCache(layout engine.WorkspaceLayout, jobID string, managed *managedCodexHome) (jobCachePaths, *managedCodexHome, error) {
+// prepareJobCache creates private scratch and build-tool cache directories
+// inside the accepted job's managed state leaf. It runs before the adapter
+// starts so tools never race directory creation under their sandbox.
+func prepareJobCache(layout engine.WorkspaceLayout, jobID string, managed *managedCodexHome) (jobCachePaths, *managedCodexHome, error) {
 	if jobID == "" || filepath.Base(jobID) != jobID || jobID == "." || jobID == ".." {
-		return jobCachePaths{}, managed, fmt.Errorf("invalid Codex job directory name")
+		return jobCachePaths{}, managed, fmt.Errorf("invalid job cache directory name")
 	}
 	if managed == nil {
 		var err error
@@ -137,24 +141,28 @@ func prepareCodexJobCache(layout engine.WorkspaceLayout, jobID string, managed *
 		}
 	}
 	if managed.directoryFD < 0 {
-		return jobCachePaths{}, managed, errors.New("managed Codex job directory is unavailable")
+		return jobCachePaths{}, managed, errors.New("managed job cache directory is unavailable")
 	}
 	root, err := filepath.Abs(managed.path)
 	if err != nil {
-		return jobCachePaths{}, managed, fmt.Errorf("resolve managed Codex job cache path: %w", err)
+		return jobCachePaths{}, managed, fmt.Errorf("resolve managed job cache path: %w", err)
 	}
 	paths := jobCachePaths{
-		root:    root,
-		goBuild: filepath.Join(root, "cache", "go-build"),
-		goMod:   filepath.Join(root, "cache", "go-mod"),
-		tmp:     filepath.Join(root, "tmp"),
+		root:     root,
+		goBuild:  filepath.Join(root, "cache", "go-build"),
+		tmp:      filepath.Join(root, "tmp"),
+		npm:      filepath.Join(root, "cache", "npm"),
+		corepack: filepath.Join(root, "cache", "corepack"),
+		xdg:      filepath.Join(root, "cache", "xdg"),
+		pnpm:     filepath.Join(root, "cache", "pnpm"),
+		yarn:     filepath.Join(root, "cache", "yarn"),
 	}
 	cacheFD, err := createManagedDirectory(managed.directoryFD, "cache")
 	if err != nil {
 		return paths, managed, err
 	}
 	defer unix.Close(cacheFD)
-	for _, name := range []string{"go-build", "go-mod"} {
+	for _, name := range []string{"go-build", "npm", "corepack", "xdg", "pnpm", "yarn"} {
 		directoryFD, err := createManagedDirectory(cacheFD, name)
 		if err != nil {
 			return paths, managed, err
@@ -171,15 +179,15 @@ func prepareCodexJobCache(layout engine.WorkspaceLayout, jobID string, managed *
 
 func createManagedDirectory(parentFD int, name string) (int, error) {
 	if err := unix.Mkdirat(parentFD, name, 0o700); err != nil {
-		return -1, fmt.Errorf("create managed Codex job directory %s: %w", name, err)
+		return -1, fmt.Errorf("create managed job cache directory %s: %w", name, err)
 	}
 	directoryFD, err := unix.Openat(parentFD, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return -1, fmt.Errorf("open managed Codex job directory %s: %w", name, err)
+		return -1, fmt.Errorf("open managed job cache directory %s: %w", name, err)
 	}
 	if err := unix.Fchmod(directoryFD, 0o700); err != nil {
 		_ = unix.Close(directoryFD)
-		return -1, fmt.Errorf("secure managed Codex job directory %s: %w", name, err)
+		return -1, fmt.Errorf("secure managed job cache directory %s: %w", name, err)
 	}
 	return directoryFD, nil
 }
@@ -550,4 +558,17 @@ func (s *Server) closeManagedCodexHome(jobID string) {
 	if home := s.takeManagedCodexHome(jobID); home != nil {
 		home.close()
 	}
+}
+
+// discardManagedCodexHome removes a prepared per-job state leaf when the job
+// is canceled or cannot commit its starting transition before a backend runs.
+func (s *Server) discardManagedCodexHome(jobID string) {
+	home := s.takeManagedCodexHome(jobID)
+	if home == nil {
+		return
+	}
+	if err := removeManagedCodexHome(home); err != nil {
+		log.Printf("agentbus service: discard managed job state %s: %v", home.path, err)
+	}
+	home.close()
 }

@@ -121,31 +121,32 @@ type Record struct {
 	// BackendSessionID is assigned only from a backend's turn-final
 	// observation. An omitted value means the job never produced a resumable
 	// backend session; it is not an unknown-session marker.
-	BackendSessionID string                  `json:"backendSessionId,omitempty"`
-	RetainSession    bool                    `json:"retainSession,omitempty"`
-	Model            string                  `json:"model,omitempty"`
-	ModelReported    string                  `json:"modelReported,omitempty"`
-	CWD              string                  `json:"cwd,omitempty"`
-	Write            bool                    `json:"write"`
-	Effort           string                  `json:"effort,omitempty"`
-	TaskSpec         json.RawMessage         `json:"taskSpec,omitempty"`
-	State            protocol.PublicState    `json:"state"`
-	Starting         bool                    `json:"starting,omitempty"`
-	ProcessClaim     *ProcessClaim           `json:"processClaim,omitempty"`
-	Cleanup          protocol.Cleanup        `json:"cleanup"`
-	CreatedAt        time.Time               `json:"createdAt"`
-	UpdatedAt        time.Time               `json:"updatedAt"`
-	StartedAt        *time.Time              `json:"startedAt,omitempty"`
-	FinishedAt       *time.Time              `json:"finishedAt,omitempty"`
-	FailureClass     protocol.FailureClass   `json:"failureClass,omitempty"`
-	FailureReason    string                  `json:"failureReason,omitempty"`
-	Diagnostics      []string                `json:"diagnostics"`
-	Contract         protocol.ContractResult `json:"contract"`
-	ResultText       string                  `json:"resultText,omitempty"`
-	ResultPath       string                  `json:"resultPath,omitempty"`
-	ResultSHA256     string                  `json:"resultSHA256,omitempty"`
-	ResultBytes      int64                   `json:"resultBytes,omitempty"`
-	Artifacts        ArtifactPaths           `json:"artifacts"`
+	BackendSessionID string                     `json:"backendSessionId,omitempty"`
+	RetainSession    bool                       `json:"retainSession,omitempty"`
+	Model            string                     `json:"model,omitempty"`
+	ModelReported    string                     `json:"modelReported,omitempty"`
+	CWD              string                     `json:"cwd,omitempty"`
+	Write            bool                       `json:"write"`
+	Execution        *protocol.ExecutionPosture `json:"execution,omitempty"`
+	Effort           string                     `json:"effort,omitempty"`
+	TaskSpec         json.RawMessage            `json:"taskSpec,omitempty"`
+	State            protocol.PublicState       `json:"state"`
+	Starting         bool                       `json:"starting,omitempty"`
+	ProcessClaim     *ProcessClaim              `json:"processClaim,omitempty"`
+	Cleanup          protocol.Cleanup           `json:"cleanup"`
+	CreatedAt        time.Time                  `json:"createdAt"`
+	UpdatedAt        time.Time                  `json:"updatedAt"`
+	StartedAt        *time.Time                 `json:"startedAt,omitempty"`
+	FinishedAt       *time.Time                 `json:"finishedAt,omitempty"`
+	FailureClass     protocol.FailureClass      `json:"failureClass,omitempty"`
+	FailureReason    string                     `json:"failureReason,omitempty"`
+	Diagnostics      []string                   `json:"diagnostics"`
+	Contract         protocol.ContractResult    `json:"contract"`
+	ResultText       string                     `json:"resultText,omitempty"`
+	ResultPath       string                     `json:"resultPath,omitempty"`
+	ResultSHA256     string                     `json:"resultSHA256,omitempty"`
+	ResultBytes      int64                      `json:"resultBytes,omitempty"`
+	Artifacts        ArtifactPaths              `json:"artifacts"`
 }
 
 // SessionHomeRetained reports whether this record's backend session home is
@@ -528,6 +529,13 @@ func (store *Store) List() ([]Record, error) {
 // MarkStarting commits the private no-relaunch marker before a caller spawns
 // a backend process. Only queued jobs may make this transition.
 func (store *Store) MarkStarting(id string) (Record, error) {
+	return store.MarkStartingWithExecution(id, nil)
+}
+
+// MarkStartingWithExecution commits the starting marker and its effective
+// execution posture atomically before a caller spawns a backend process.
+// Only queued jobs may make this transition.
+func (store *Store) MarkStartingWithExecution(id string, execution *protocol.ExecutionPosture) (Record, error) {
 	if err := validateJobID(id); err != nil {
 		return Record{}, fmt.Errorf("%w: %v", ErrInvalid, err)
 	}
@@ -558,6 +566,7 @@ func (store *Store) MarkStarting(id string) (Record, error) {
 		next.Starting = true
 		next.StartedAt = &now
 		next.UpdatedAt = now
+		next.Execution = execution
 		normalizeRecord(&next)
 		if err := validateRecord(next); err != nil {
 			return err

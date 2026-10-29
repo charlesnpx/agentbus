@@ -669,6 +669,11 @@ func printJobRecordStatus(out io.Writer, record agentclient.JobGetResult) {
 		printLogPathTruncationStatus(out, "stdout", record.LogPaths.Stdout, record.LogPaths.StdoutTruncated)
 		printLogPathTruncationStatus(out, "stderr", record.LogPaths.Stderr, record.LogPaths.StderrTruncated)
 	}
+	if record.Execution != nil {
+		if encoded, err := json.Marshal(record.Execution); err == nil {
+			fmt.Fprintf(out, " execution=%s", encoded)
+		}
+	}
 	fmt.Fprintln(out)
 }
 

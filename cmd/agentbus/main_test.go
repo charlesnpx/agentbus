@@ -92,6 +92,9 @@ func TestStatusHumanProjectionIncludesOperatorFieldsAndNeverResultText(t *testin
 	record.Failure = &protocol.JobFailureWire{Class: protocol.FailureClassBackendError, Reason: "provider stopped"}
 	record.Contract = &protocol.ContractResult{Evaluated: true, Compliant: false}
 	record.LogPaths = &protocol.LogPathsWire{Stdout: "/logs/out", Stderr: "/logs/err"}
+	record.Execution = &protocol.ExecutionPosture{
+		Intent: "inspect", Network: "denied", GitMetadata: "read-only", Enforcement: "os-sandbox",
+	}
 	a := testApp(t)
 	a.clientConnect = fakeConnector(&fakeProtocolClient{records: map[string]agentclient.JobGetResult{"job-1": record}})
 
@@ -110,6 +113,7 @@ func TestStatusHumanProjectionIncludesOperatorFieldsAndNeverResultText(t *testin
 		"failure.class=backend_error failure.reason=provider stopped",
 		"contract.evaluated=true contract.compliant=false",
 		"logPaths.stdout=/logs/out logPaths.stderr=/logs/err",
+		`execution={"intent":"inspect","sourceWritable":false,"network":"denied","gitMetadata":"read-only","enforcement":"os-sandbox"}`,
 	} {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("status output missing %q:\n%s", want, stdout)

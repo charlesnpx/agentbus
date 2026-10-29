@@ -37,6 +37,29 @@ command.
 Set AGENTBUS_STATE_ROOT to select daemon state. Otherwise Agentbus uses
 $XDG_STATE_HOME/agentbus or ~/.local/state/agentbus.
 
+Writable jobs get private Go build, temporary, npm, Corepack, pnpm, and Yarn
+caches under their managed state directory, outside the repository. Codex
+workspace-write jobs can write there through the OS sandbox's managed writable
+root. Agentbus resolves the daemon's `GOMODCACHE` once (from the daemon
+environment, or `go env GOMODCACHE` with a short timeout) and leaves jobs
+pointing at that populated host cache for reads; it never replaces it with an
+empty per-job directory. The Codex sandbox allows reading the host module cache
+on macOS and Linux while keeping it outside the writable roots. If no cache
+path resolves, Agentbus leaves `GOMODCACHE` at its default. Codex jobs set
+`GOPROXY=off`, so a missing module fails with Go's own offline lookup error
+instead of repeated DNS retries. `-mod=readonly` only restricts module-file
+changes; it is not a filesystem sandbox.
+
+Inspect jobs receive no job-private scratch or writable caches: current
+read-only backend modes do not enforce a writable root outside the submitted
+workspace. `job.get` and `agentbus status --job <id>` expose the execution
+posture recorded at start, including intent, source write mode, scratch/cache
+paths, network and Git metadata policy, and enforcement strength. Codex uses
+its OS sandbox, Cursor uses agent-mode permissions, and Claude has no filesystem
+or network sandbox. `sourceWritable` reflects the selected inspect/edit mode;
+`enforcement` identifies whether that mode has an OS sandbox, agent permissions,
+or no filesystem boundary.
+
 `configure-codex-sandbox` adds Agentbus's state and cache roots to
 `$CODEX_HOME/config.toml` (or `~/.codex/config.toml`), preserving existing TOML
 comments and formatting. Repeat `--writable-root` to add another absolute root.

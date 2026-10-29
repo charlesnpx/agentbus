@@ -15,6 +15,7 @@ type JobCancelParams = protocol.JobCancelParams
 type JobCancelResult = protocol.JobCancelResult
 type JobGetParams = protocol.JobGetParams
 type JobGetResult = protocol.JobRecordWire
+type ExecutionPosture = protocol.ExecutionPosture
 type JobListParams = protocol.JobListParams
 type JobListResult = protocol.JobListResult
 type JobSummaryWire = protocol.JobSummaryWire
