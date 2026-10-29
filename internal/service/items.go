@@ -21,6 +21,7 @@ const (
 	transcriptItemTextCap       = 4 * 1024
 	transcriptItemFileCap       = 16 * 1024 * 1024
 	itemSidecarDiagnosticPrefix = "item sidecar "
+	captureWarningPrefix        = "capture warning: "
 )
 
 var (

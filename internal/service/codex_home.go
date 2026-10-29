@@ -406,9 +406,9 @@ func linkManagedCodexHomeFile(sourceHome string, destination *managedCodexHome, 
 	return nil
 }
 
-// finalizeManagedCodexHome executes cleanup before committing the terminal
-// record, so a failed identity-checked removal is reflected on the independent
-// cleanup axis without rewriting a known result or public state.
+// finalizeManagedCodexHome executes cleanup after the terminal record is
+// committed, so a failed terminal write can never remove a session home still
+// named by the record.
 func finalizeManagedCodexHome(home *managedCodexHome, record jobstore.Record, cleanup protocol.Cleanup, diagnostics []string) (protocol.Cleanup, []string) {
 	if home == nil {
 		return cleanup, diagnostics

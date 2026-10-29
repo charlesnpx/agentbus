@@ -1070,12 +1070,19 @@ func TestConnectAutostartSurfacesLauncherFailureOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 0 {
+	if len(entries) != 1 || entries[0].Name() != "startup-diagnostic.log" {
 		names := make([]string, 0, len(entries))
 		for _, entry := range entries {
 			names = append(names, entry.Name())
 		}
-		t.Fatalf("state root entries after unsupported autostart = %v, want empty root", names)
+		t.Fatalf("state root entries after unsupported autostart = %v, want startup-diagnostic.log", names)
+	}
+	diagnostic, err := os.ReadFile(filepath.Join(root, entries[0].Name()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(diagnostic), "strict diagnostic from autostart helper") || !strings.Contains(string(diagnostic), "autostart helper startup stderr") {
+		t.Fatalf("startup diagnostic = %q, want failed frame and stderr tail", diagnostic)
 	}
 }
 

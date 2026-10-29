@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,7 +19,10 @@ import (
 	"github.com/charlesnpx/agentbus/internal/jobstore"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 	"github.com/charlesnpx/agentbus/internal/schema"
+	"golang.org/x/sys/unix"
 )
+
+const lowStateRootSpaceThresholdBytes uint64 = 256 * 1024 * 1024
 
 // activeExecution is deliberately small. The retained adapter and
 // command.DirectCommandRunner own process-group creation, TERM, bounded wait,
@@ -690,6 +694,13 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("resolve resume target: %w", err), nil)
 		return
 	}
+	if diagnostic := stateRootSpaceDiagnostic(s.stateRoot); diagnostic != "" {
+		if updated, appendErr := store.AppendDiagnostic(record.JobID, diagnostic); appendErr != nil {
+			log.Printf("agentbus service: job %s cannot record state-root space diagnostic: %v", record.JobID, appendErr)
+		} else {
+			record = updated
+		}
+	}
 	if err := jobCtx.Err(); err != nil {
 		s.finishStartError(store, record, jobCtx, err)
 		return
@@ -1264,6 +1275,9 @@ func drainTurnEvents(s *Server, run *activeExecution, events <-chan engine.Event
 func absorbTurnEvent(run *activeExecution, outcome *turnOutcome, assistant *strings.Builder, result *string, hasResult *bool, items *itemAssembler, event engine.Event) {
 	rawText := authoritativeText(event)
 	items.absorb(event, rawText)
+	if captureWarning, _ := event.Metadata["agentbusCaptureWarning"].(bool); captureWarning {
+		outcome.diagnostics = append(outcome.diagnostics, rawText)
+	}
 	switch event.Type {
 	case engine.EventModelReported:
 		model := strings.TrimSpace(event.ModelReported)
@@ -1340,8 +1354,9 @@ func cleanupForRun(run *activeExecution, cleanup protocol.Cleanup, diagnostics [
 func (s *Server) recordExecutionCompletion(store *jobstore.Store, record jobstore.Record, text string, cleanup protocol.Cleanup, diagnostics []string, contract protocol.ContractResult, backendSessionID string) {
 	info, err := spillAuthoritativeResult(record, []byte(text))
 	if err != nil {
-		// The spill failure makes this a failed record, which may be resumed.
-		s.recordExecutionFailureWithSessionID(store, record, cleanup, protocol.FailureClassInternal, fmt.Errorf("spill authoritative result: %w", err), diagnostics, backendSessionID)
+		// Result persistence is mandatory for an authoritative completion. Keep
+		// the provider session and partial transcript available as a failed job.
+		s.recordExecutionFailureWithSessionID(store, record, cleanup, protocol.FailureClassStorage, fmt.Errorf("persist final result artifact: %w", err), diagnostics, backendSessionID)
 		return
 	}
 	resultText := info.Text
@@ -1352,15 +1367,16 @@ func (s *Server) recordExecutionCompletion(store *jobstore.Store, record jobstor
 	// store keeps the session ID for retained completed records so they can be
 	// resumed as a new job, and clears it for other completed records.
 	s.markTerminal(store, record.JobID, jobstore.TerminalUpdate{
-		State:        protocol.PublicStateCompleted,
-		Cleanup:      cleanup,
-		Diagnostics:  diagnostics,
-		Contract:     contract,
-		ResultText:   resultText,
-		ResultPath:   info.ResultPath,
-		ResultSHA256: info.SHA256,
-		ResultBytes:  info.Bytes,
-		FinishedAt:   time.Now().UTC(),
+		State:            protocol.PublicStateCompleted,
+		Cleanup:          cleanup,
+		BackendSessionID: backendSessionID,
+		Diagnostics:      appendRecordDiagnostics(record.Diagnostics, diagnostics),
+		Contract:         contract,
+		ResultText:       resultText,
+		ResultPath:       info.ResultPath,
+		ResultSHA256:     info.SHA256,
+		ResultBytes:      info.Bytes,
+		FinishedAt:       time.Now().UTC(),
 	})
 }
 
@@ -1378,7 +1394,7 @@ func (s *Server) recordExecutionFailureWithSessionID(store *jobstore.Store, reco
 		BackendSessionID: backendSessionID,
 		FailureClass:     class,
 		FailureReason:    executionFailureReason(cause),
-		Diagnostics:      diagnostics,
+		Diagnostics:      appendRecordDiagnostics(record.Diagnostics, diagnostics),
 		FinishedAt:       time.Now().UTC(),
 	})
 }
@@ -1411,28 +1427,92 @@ func (s *Server) markTerminal(store *jobstore.Store, jobID string, terminal jobs
 	if s.cancellationPending(jobID) {
 		return
 	}
-	if home := s.takeManagedCodexHome(jobID); home != nil {
+	var (
+		home          *managedCodexHome
+		cleanupRecord jobstore.Record
+	)
+	if home = s.takeManagedCodexHome(jobID); home != nil {
 		current, getErr := store.Get(jobID)
 		if getErr != nil {
 			home.close()
+			home = nil
 			terminal.Cleanup = protocol.CleanupUncertain
 			terminal.Diagnostics = append(terminal.Diagnostics, "inspect managed Codex home terminal record: "+getErr.Error())
 		} else if current.State.IsTerminal() {
 			home.close()
 			return
 		} else {
-			cleanupRecord := current
+			cleanupRecord = current
 			cleanupRecord.State = terminal.State
-			terminal.Cleanup, terminal.Diagnostics = finalizeManagedCodexHome(home, cleanupRecord, terminal.Cleanup, terminal.Diagnostics)
 		}
 	}
 	_, err := store.MarkTerminal(jobID, terminal)
-	if err == nil || errors.Is(err, jobstore.ErrTerminal) {
+	if err == nil {
+		if home != nil {
+			cleanup, diagnostics := finalizeManagedCodexHome(home, cleanupRecord, terminal.Cleanup, terminal.Diagnostics)
+			if cleanup != terminal.Cleanup && len(diagnostics) > len(terminal.Diagnostics) {
+				log.Printf("agentbus service: job %s managed Codex home cleanup after terminal write: %s", jobID, diagnostics[len(diagnostics)-1])
+			}
+		}
+		return
+	}
+	if errors.Is(err, jobstore.ErrTerminal) {
+		if home != nil {
+			home.close()
+		}
 		// ErrTerminal is the store-enforced first-terminal-wins result. A
 		// later observer never retries or overwrites that recorded outcome.
 		return
 	}
+	if terminal.State == protocol.PublicStateCompleted {
+		storageCause := fmt.Errorf("persist terminal job record: %w", err)
+		storageDiagnostic := "storage failure: " + executionFailureReason(storageCause)
+		failed := jobstore.TerminalUpdate{
+			State:            protocol.PublicStateFailed,
+			Cleanup:          terminal.Cleanup,
+			BackendSessionID: terminal.BackendSessionID,
+			FailureClass:     protocol.FailureClassStorage,
+			FailureReason:    executionFailureReason(storageCause),
+			Diagnostics:      appendRecordDiagnostics(terminal.Diagnostics, []string{storageDiagnostic}),
+			FinishedAt:       time.Now().UTC(),
+		}
+		if _, failureErr := store.MarkTerminal(jobID, failed); failureErr == nil {
+			if home != nil {
+				home.close()
+			}
+			return
+		} else if !errors.Is(failureErr, jobstore.ErrTerminal) {
+			err = errors.Join(err, fmt.Errorf("persist storage failure terminal record: %w", failureErr))
+		}
+	}
+	if home != nil {
+		home.close()
+	}
 	log.Printf("agentbus service: job %s terminal write failed: %v", jobID, err)
+}
+
+func appendRecordDiagnostics(recordDiagnostics, additional []string) []string {
+	result := append([]string(nil), recordDiagnostics...)
+	return append(result, additional...)
+}
+
+func stateRootSpaceDiagnostic(root string) string {
+	var stats unix.Statfs_t
+	if err := unix.Statfs(root, &stats); err != nil {
+		return ""
+	}
+	if stats.Bavail <= 0 || stats.Bsize <= 0 {
+		return fmt.Sprintf("low state-root free space: less than %d bytes available; warning threshold is %d bytes", uint64(0), lowStateRootSpaceThresholdBytes)
+	}
+	blocks, blockSize := uint64(stats.Bavail), uint64(stats.Bsize)
+	available := ^uint64(0)
+	if blocks <= math.MaxUint64/blockSize {
+		available = blocks * blockSize
+	}
+	if available >= lowStateRootSpaceThresholdBytes {
+		return ""
+	}
+	return fmt.Sprintf("low state-root free space: %d bytes available; warning threshold is %d bytes", available, lowStateRootSpaceThresholdBytes)
 }
 
 func executionFailureReason(err error) string {

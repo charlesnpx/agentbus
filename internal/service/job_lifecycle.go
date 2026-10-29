@@ -232,6 +232,7 @@ func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
 		diagnostics = append(diagnostics, run.takeSteerDiagnostics()...)
 		diagnostics = append(diagnostics, run.itemSidecarDiagnostics()...)
 	}
+	diagnostics = appendRecordDiagnostics(record.Diagnostics, diagnostics)
 	terminal, err := store.MarkTerminal(record.JobID, jobstore.TerminalUpdate{
 		State:            protocol.PublicStateCanceled,
 		Cleanup:          cleanup,
@@ -367,6 +368,7 @@ func (s *Server) jobRecordWire(record jobstore.Record) (protocol.JobRecordWire, 
 		Result:        projectResult(record),
 		Contract:      projectContract(record, spec),
 		Failure:       projectFailure(record),
+		Diagnostics:   append([]string(nil), record.Diagnostics...),
 		Cleanup:       record.Cleanup,
 		LogPaths:      projectLogPaths(record),
 		ModelReported: s.projectedModelReported(record),

@@ -103,6 +103,7 @@ func (s *Server) jobTranscript(record jobstore.Record, params protocol.JobTransc
 	}
 	result.Gap = result.Gap ||
 		hasItemSidecarFailure(record.Diagnostics) ||
+		hasCaptureWarning(record.Diagnostics) ||
 		record.State == protocol.PublicStateUnknown ||
 		result.State == protocol.PublicStateRunning
 	if !record.State.IsTerminal() {
@@ -122,6 +123,15 @@ func emptyJobTranscript(record jobstore.Record) protocol.JobTranscriptResult {
 		ItemCount: 0,
 		Gap:       false,
 	}
+}
+
+func hasCaptureWarning(diagnostics []string) bool {
+	for _, diagnostic := range diagnostics {
+		if strings.HasPrefix(diagnostic, captureWarningPrefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func transcriptSidecarPath(record jobstore.Record) (string, bool, error) {

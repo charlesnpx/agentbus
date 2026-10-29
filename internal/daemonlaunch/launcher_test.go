@@ -57,6 +57,37 @@ func TestLaunchFailedRecordIncludesDiagnosticAndStderr(t *testing.T) {
 	assertPIDGone(t, readPIDFile(t, pidPath))
 }
 
+func TestLaunchStarterFailureWritesStartupDiagnostic(t *testing.T) {
+	root := shortLaunchTempDir(t)
+	startErr := errors.New("exec failed")
+	_, err := Launch(context.Background(), Options{
+		CommandPath: "daemon",
+		StateRoot:   root,
+		Starter: func(ProcessConfig) (Process, error) {
+			return nil, startErr
+		},
+	})
+	if err == nil {
+		t.Fatal("Launch succeeded, want process start failure")
+	}
+	var startup *StartupError
+	if !errors.As(err, &startup) || !errors.Is(err, ErrStartupFailed) || !errors.Is(err, startErr) {
+		t.Fatalf("Launch error = %T %v, want typed process start failure", err, err)
+	}
+	if startup.Code != CodeProcessStartFailed || startup.Phase != "launching daemon process" {
+		t.Fatalf("startup error = %+v, want process_start_failed in launch phase", startup)
+	}
+	diagnostic, readErr := os.ReadFile(startup.DiagnosticPath)
+	if readErr != nil {
+		t.Fatalf("read startup diagnostic %q: %v", startup.DiagnosticPath, readErr)
+	}
+	if !strings.Contains(string(diagnostic), CodeProcessStartFailed) ||
+		!strings.Contains(string(diagnostic), "launching daemon process") ||
+		!strings.Contains(string(diagnostic), startErr.Error()) {
+		t.Fatalf("startup diagnostic = %q, want code, phase, and cause", diagnostic)
+	}
+}
+
 func TestLaunchSetsid(t *testing.T) {
 	root := shortLaunchTempDir(t)
 	result, err := Launch(context.Background(), helperLaunchOptions(t, root, "ready", "", 2*time.Second))
@@ -106,6 +137,37 @@ func TestLaunchTimeoutKillsAndReaps(t *testing.T) {
 		t.Fatalf("stderr tail = %q, want hang stderr", startup.StderrTail)
 	}
 	assertPIDGone(t, readPIDFile(t, pidPath))
+}
+
+func TestLaunchBusyStoreAndReadinessTimeoutCarryPhaseAndCause(t *testing.T) {
+	busyRoot := shortLaunchTempDir(t)
+	_, err := Launch(context.Background(), helperLaunchOptions(t, busyRoot, "busy-store", "", 2*time.Second))
+	if err == nil {
+		t.Fatal("Launch busy-store helper succeeded")
+	}
+	var busy *StartupError
+	if !errors.As(err, &busy) || !errors.Is(err, ErrStoreBusy) {
+		t.Fatalf("busy-store error = %T %v, want ErrStoreBusy", err, err)
+	}
+	if busy.Code != CodeStoreBusy || busy.Phase != "opening job store" || !strings.Contains(busy.StderrTail, "helper busy-store stderr") {
+		t.Fatalf("busy-store startup error = %+v, want store phase, code, and stderr", busy)
+	}
+	if _, err := os.Stat(busy.DiagnosticPath); err != nil {
+		t.Fatalf("busy-store diagnostic path %q: %v", busy.DiagnosticPath, err)
+	}
+
+	timeoutRoot := shortLaunchTempDir(t)
+	timeoutErr, _ := launchTimeoutAfterHelperStderr(t, timeoutRoot, "hang", filepath.Join(timeoutRoot, "helper.pid"))
+	var timeout *StartupError
+	if !errors.As(timeoutErr, &timeout) || !errors.Is(timeoutErr, ErrReadinessTimeout) {
+		t.Fatalf("readiness-timeout error = %T %v, want ErrReadinessTimeout", timeoutErr, timeoutErr)
+	}
+	if timeout.Code != CodeReadinessTimeout || timeout.Phase != "waiting for daemon readiness" || !strings.Contains(timeout.StderrTail, "helper hang stderr") {
+		t.Fatalf("readiness-timeout startup error = %+v, want readiness phase, code, and stderr", timeout)
+	}
+	if _, err := os.Stat(timeout.DiagnosticPath); err != nil {
+		t.Fatalf("readiness-timeout diagnostic path %q: %v", timeout.DiagnosticPath, err)
+	}
 }
 
 func TestLaunchTimeoutKillsChattyChildAndBoundsStderr(t *testing.T) {
@@ -318,6 +380,10 @@ func runLaunchHelper() int {
 	case "failed":
 		fmt.Fprintln(os.Stderr, "helper failed stderr")
 		_ = reporter.Failed("strict admission support unavailable", "strict diagnostic from helper")
+		return 1
+	case "busy-store":
+		fmt.Fprintln(os.Stderr, "helper busy-store stderr")
+		_ = reporter.FailedAt("opening job store", CodeStoreBusy, "jobstore root busy")
 		return 1
 	case "crash":
 		fmt.Fprintln(os.Stderr, "helper crash stderr")
