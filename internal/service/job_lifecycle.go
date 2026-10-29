@@ -3,12 +3,14 @@
 package service
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -48,7 +50,7 @@ func (s *Server) handleJobGet(raw json.RawMessage) requestOutcome {
 }
 
 // handleJobList returns compact summaries after applying every supplied
-// workspace, tag, and public-state filter.
+// filter and optional newest-first cursor page.
 func (s *Server) handleJobList(raw json.RawMessage) requestOutcome {
 	var params protocol.JobListParams
 	if err := decodeStrict(raw, &params); err != nil {
@@ -56,6 +58,14 @@ func (s *Server) handleJobList(raw json.RawMessage) requestOutcome {
 	}
 	if err := validateJobListParams(params); err != nil {
 		return invalidParams(err)
+	}
+	var cursor *jobListCursor
+	if params.Cursor != "" {
+		decoded, err := decodeJobListCursor(params.Cursor)
+		if err != nil {
+			return invalidParams(err)
+		}
+		cursor = &decoded
 	}
 	store, err := s.ensureJobStore()
 	if err != nil {
@@ -74,18 +84,66 @@ func (s *Server) handleJobList(raw json.RawMessage) requestOutcome {
 		if !jobListMatches(record, spec, params) {
 			continue
 		}
-		jobs = append(jobs, s.jobSummaryWireFromSpec(record, spec))
+		summary := s.jobSummaryWireFromSpec(record, spec)
+		if cursor != nil && !jobListAfterCursor(summary, *cursor) {
+			continue
+		}
+		jobs = append(jobs, summary)
 	}
-	return requestOutcome{result: protocol.JobListResult{Jobs: jobs}}
+	sort.Slice(jobs, func(i, j int) bool {
+		if jobs[i].CreatedAt.Equal(jobs[j].CreatedAt) {
+			return jobs[i].JobID > jobs[j].JobID
+		}
+		return jobs[i].CreatedAt.After(jobs[j].CreatedAt)
+	})
+	result := protocol.JobListResult{Jobs: jobs}
+	if params.Limit > 0 && len(jobs) > params.Limit {
+		result.Truncated = true
+		result.Jobs = jobs[:params.Limit]
+		result.NextCursor = encodeJobListCursor(jobListCursor{CreatedAt: result.Jobs[len(result.Jobs)-1].CreatedAt, JobID: result.Jobs[len(result.Jobs)-1].JobID})
+	}
+	return requestOutcome{result: result}
 }
 
 func validateJobListParams(params protocol.JobListParams) error {
+	if params.Limit < 0 {
+		return errors.New("limit must not be negative")
+	}
 	for _, state := range params.States {
 		if !state.Valid() {
 			return fmt.Errorf("states contains invalid public state %q", state)
 		}
 	}
 	return nil
+}
+
+type jobListCursor struct {
+	CreatedAt time.Time `json:"createdAt"`
+	JobID     string    `json:"jobId"`
+}
+
+func encodeJobListCursor(cursor jobListCursor) string {
+	raw, _ := json.Marshal(cursor)
+	return base64.RawURLEncoding.EncodeToString(raw)
+}
+
+func decodeJobListCursor(value string) (jobListCursor, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil {
+		return jobListCursor{}, errors.New("cursor is invalid")
+	}
+	var cursor jobListCursor
+	if err := json.Unmarshal(raw, &cursor); err != nil || cursor.JobID == "" || cursor.CreatedAt.IsZero() {
+		return jobListCursor{}, errors.New("cursor is invalid")
+	}
+	return cursor, nil
+}
+
+func jobListAfterCursor(summary protocol.JobSummaryWire, cursor jobListCursor) bool {
+	if summary.CreatedAt.Before(cursor.CreatedAt) {
+		return true
+	}
+	return summary.CreatedAt.Equal(cursor.CreatedAt) && summary.JobID < cursor.JobID
 }
 
 func jobListMatches(record jobstore.Record, spec protocol.TaskSpec, params protocol.JobListParams) bool {

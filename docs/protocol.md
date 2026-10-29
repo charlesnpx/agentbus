@@ -170,7 +170,9 @@ All job.list parameters are optional:
 {
   "workspaceKey": "string",
   "tags": {"key": "value"},
-  "states": ["queued", "running"]
+  "states": ["queued", "running"],
+  "limit": 50,
+  "cursor": "opaque-next-page-token"
 }
 ~~~
 
@@ -236,6 +238,15 @@ job. workspaceKey is an opaque, submitter-chosen namespace, and Agentbus
 cannot derive another tool's key. Therefore, status without --job sends no
 workspace filter and lists every workspace; a caller that knows a key can use
 --workspace-key <key> to filter the list.
+
+The wire limit is optional. Omitting it preserves the existing unbounded
+client.JobList behavior; a positive limit returns newest jobs first, ordered by
+createdAt descending and jobId descending for ties. cursor continues strictly
+after the last summary in that ordering. A truncated result contains
+`"truncated": true` and a `nextCursor` that can be sent as `cursor` on the next
+request. When there is no further page, those fields are omitted. The CLI sends
+a limit of 50 by default, supports `--before <nextCursor>` for continuation,
+and uses `--all` to omit the wire limit.
 
 ## job.transcript
 
