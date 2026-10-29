@@ -247,12 +247,14 @@ func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
 			// wins, so return that durable fact without overwriting it.
 			current, getErr := store.Get(record.JobID)
 			if getErr == nil {
+				s.discardRecordedLocalIPCRoot(current)
 				return requestOutcome{result: protocol.JobCancelResult{JobID: current.JobID, State: projectedState(current)}}
 			}
 			return jobStoreUnavailable("read concurrent terminal cancellation", getErr)
 		}
 		return jobStoreUnavailable("persist cancellation", err)
 	}
+	s.discardRecordedLocalIPCRoot(terminal)
 	return requestOutcome{result: protocol.JobCancelResult{JobID: terminal.JobID, State: projectedState(terminal)}}
 }
 
@@ -284,6 +286,7 @@ func (s *Server) cancelQueuedJob(store *jobstore.Store, record jobstore.Record) 
 		if errors.Is(err, jobstore.ErrTerminal) {
 			current, getErr := store.Get(record.JobID)
 			if getErr == nil && current.State.IsTerminal() {
+				s.discardRecordedLocalIPCRoot(current)
 				if index >= 0 {
 					s.removeQueuedJobLocked(index)
 					s.activeJobs.Add(-1)
@@ -305,6 +308,7 @@ func (s *Server) cancelQueuedJob(store *jobstore.Store, record jobstore.Record) 
 		s.removeQueuedJobLocked(index)
 		s.activeJobs.Add(-1)
 	}
+	s.discardRecordedLocalIPCRoot(terminal)
 	s.dispatchQueuedLocked()
 	s.executionMu.Unlock()
 	return requestOutcome{result: protocol.JobCancelResult{JobID: terminal.JobID, State: projectedState(terminal)}}, true
@@ -646,11 +650,13 @@ func (s *Server) reconcileRecoveredJobs(store *jobstore.Store) error {
 			// A terminal record is deliberately untouched. In particular, do
 			// not use MarkTerminal here: even a logically equivalent rewrite
 			// would violate the byte-for-byte preservation requirement.
+			s.discardRecordedLocalIPCRoot(record)
 			continue
 		}
 		if err != nil && !errors.Is(err, jobstore.ErrTerminal) {
 			return fmt.Errorf("reconcile recovered job %s: %w", record.JobID, err)
 		}
+		s.discardRecordedLocalIPCRoot(record)
 	}
 	return nil
 }

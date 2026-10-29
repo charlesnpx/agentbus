@@ -11,6 +11,7 @@ import (
 
 func TestExecutionPostureByBackend(t *testing.T) {
 	writeCaches := map[string]string{"GOCACHE": "job-cache/go-build"}
+	localIPCCaches := map[string]string{"GOCACHE": "job-cache/go-build", "TMPDIR": "private-ipc"}
 	tests := []struct {
 		name      string
 		backend   string
@@ -44,8 +45,8 @@ func TestExecutionPostureByBackend(t *testing.T) {
 			localIPC:  true,
 			sandboxed: true,
 			want: protocol.ExecutionPosture{
-				Intent: "edit", SourceWritable: true, Scratch: "job-cache", Caches: writeCaches,
-				Shell: "sandboxed", Network: "denied", LocalIPC: "scratch", GitMetadata: "read-only", Enforcement: "os-sandbox",
+				Intent: "edit", SourceWritable: true, Scratch: "job-cache", Caches: localIPCCaches,
+				Shell: "sandboxed", Network: "denied", LocalIPC: "private-dir", GitMetadata: "read-only", Enforcement: "os-sandbox",
 			},
 		},
 		{
@@ -97,6 +98,9 @@ func TestExecutionPostureByBackend(t *testing.T) {
 			if test.write {
 				scratch = "job-cache"
 				caches = writeCaches
+				if test.localIPC {
+					caches = localIPCCaches
+				}
 			}
 			got := executionPosture(test.backend, test.write, test.localIPC, test.sandboxed, scratch, caches)
 			if !reflect.DeepEqual(got, test.want) {

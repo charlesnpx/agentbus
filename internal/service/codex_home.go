@@ -740,11 +740,14 @@ func (s *Server) closeManagedCodexHome(jobID string) {
 // is canceled or cannot commit its starting transition before a backend runs.
 func (s *Server) discardManagedCodexHome(jobID string) {
 	home := s.takeManagedCodexHome(jobID)
-	if home == nil {
-		return
+	localIPCRoot := s.takeManagedLocalIPCRoot(jobID)
+	if home != nil {
+		if err := removeManagedCodexHome(home); err != nil {
+			log.Printf("agentbus service: discard managed job state %s: %v", home.path, err)
+		}
+		home.close()
 	}
-	if err := removeManagedCodexHome(home); err != nil {
-		log.Printf("agentbus service: discard managed job state %s: %v", home.path, err)
+	if err := removeLocalIPCRoot(localIPCRoot); err != nil {
+		logLocalIPCCleanup(jobID, localIPCRoot, err)
 	}
-	home.close()
 }

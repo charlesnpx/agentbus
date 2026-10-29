@@ -61,10 +61,10 @@ func (d *appServerDriver) ExecSpec(_ string, opts engine.SessionOpts, _ engine.T
 		if !opts.Write {
 			return command.ExecSpec{}, errors.New("Codex local IPC requires a write-enabled job")
 		}
-		if opts.CWD == "" || opts.WriteSandboxRoot == "" {
-			return command.ExecSpec{}, errors.New("Codex local IPC requires workspace and scratch roots")
+		if opts.CWD == "" || opts.WriteSandboxRoot == "" || opts.LocalIPCRoot == "" {
+			return command.ExecSpec{}, errors.New("Codex local IPC requires workspace, scratch, and private temp roots")
 		}
-		argv = append(argv, localIPCConfigArgs(opts.CWD, opts.WriteSandboxRoot)...)
+		argv = append(argv, localIPCConfigArgs(opts.CWD, opts.WriteSandboxRoot, opts.LocalIPCRoot)...)
 	}
 	return command.ExecSpec{
 		Argv: argv,
@@ -1228,7 +1228,7 @@ func threadParams(opts engine.SessionOpts, input engine.TurnInput, resumeID stri
 	params := map[string]any{
 		"approvalPolicy": "never",
 	}
-	if opts.LocalIPC {
+	if opts.LocalIPC && input.Write {
 		params["permissions"] = localIPCPermissionProfile
 	} else {
 		params["sandbox"] = sandboxMode(input.Write)
@@ -1254,7 +1254,7 @@ func turnStartParams(threadID string, opts engine.SessionOpts, input engine.Turn
 			"text": input.Prompt,
 		}},
 	}
-	if opts.LocalIPC {
+	if opts.LocalIPC && input.Write {
 		params["permissions"] = localIPCPermissionProfile
 	} else {
 		params["sandboxPolicy"] = sandboxPolicy(input.Write, opts.CWD, opts.WriteSandboxRoot, writePolicy)
@@ -1271,13 +1271,13 @@ func turnStartParams(threadID string, opts engine.SessionOpts, input engine.Turn
 	return params
 }
 
-func localIPCConfigArgs(workspace, scratch string) []string {
+func localIPCConfigArgs(workspace, scratch, ipcRoot string) []string {
 	type filesystemEntry struct {
 		path       string
 		permission string
 	}
-	entries := make([]filesystemEntry, 0, 5)
-	indices := make(map[string]int, 5)
+	entries := make([]filesystemEntry, 0, 6)
+	indices := make(map[string]int, 6)
 	setFilesystemPermission := func(path, permission string) {
 		if index, ok := indices[path]; ok {
 			entries[index].permission = permission
@@ -1289,6 +1289,7 @@ func localIPCConfigArgs(workspace, scratch string) []string {
 	setFilesystemPermission(":root", "read")
 	setFilesystemPermission(workspace, "write")
 	setFilesystemPermission(scratch, "write")
+	setFilesystemPermission(ipcRoot, "write")
 	setFilesystemPermission("/tmp", "write")
 	setFilesystemPermission(filepath.Join(workspace, ".git"), "read")
 	filesystemParts := make([]string, 0, len(entries))
@@ -1302,7 +1303,7 @@ func localIPCConfigArgs(workspace, scratch string) []string {
 		"-c", "permissions." + localIPCPermissionProfile + ".filesystem=" + filesystem,
 		"-c", "permissions." + localIPCPermissionProfile + ".network.enabled=true",
 		"-c", "permissions." + localIPCPermissionProfile + ".network.allow_local_binding=true",
-		"-c", "permissions." + localIPCPermissionProfile + ".network.unix_sockets={" + tomlString(scratch) + "=\"allow\"}",
+		"-c", "permissions." + localIPCPermissionProfile + ".network.unix_sockets={" + tomlString(ipcRoot) + "=\"allow\"}",
 	}
 }
 

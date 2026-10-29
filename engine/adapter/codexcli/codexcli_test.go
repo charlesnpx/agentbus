@@ -121,14 +121,15 @@ func TestAppServerInitializeHandshakePrecedesTurnAndFailureIsTerminal(t *testing
 func TestAppServerLocalIPCUsesScopedPermissionsProfile(t *testing.T) {
 	cwd := `/work/a"b\c`
 	scratch := `/scratch/d"e\f`
+	ipcRoot := `/tmp/ipc/r"oot\w`
 	wantArgv := []string{
 		"fake-codex", "app-server",
 		"-c", `default_permissions=":workspace"`,
 		"-c", "features.network_proxy=true",
-		"-c", `permissions.agentbus_local_ipc.filesystem={":root"="read","/work/a\"b\\c"="write","/scratch/d\"e\\f"="write","/tmp"="write","/work/a\"b\\c/.git"="read"}`,
+		"-c", `permissions.agentbus_local_ipc.filesystem={":root"="read","/work/a\"b\\c"="write","/scratch/d\"e\\f"="write","/tmp/ipc/r\"oot\\w"="write","/tmp"="write","/work/a\"b\\c/.git"="read"}`,
 		"-c", "permissions.agentbus_local_ipc.network.enabled=true",
 		"-c", "permissions.agentbus_local_ipc.network.allow_local_binding=true",
-		"-c", `permissions.agentbus_local_ipc.network.unix_sockets={"/scratch/d\"e\\f"="allow"}`,
+		"-c", `permissions.agentbus_local_ipc.network.unix_sockets={"/tmp/ipc/r\"oot\\w"="allow"}`,
 	}
 	runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
 		if !reflect.DeepEqual(spec.Argv, wantArgv) {
@@ -157,9 +158,42 @@ func TestAppServerLocalIPCUsesScopedPermissionsProfile(t *testing.T) {
 		peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
 	})
 	session := startFakeCodexSession(t, engine.SessionOpts{
-		CWD: cwd, Write: true, LocalIPC: true, WriteSandboxRoot: scratch,
+		CWD: cwd, Write: true, LocalIPC: true, WriteSandboxRoot: scratch, LocalIPCRoot: ipcRoot,
 	})
 	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "use local IPC", Write: true}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = collectEventsWithTimeout(t, events, 2*time.Second)
+
+	readOnlyRunner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+		if !reflect.DeepEqual(spec.Argv, wantArgv) {
+			t.Fatalf("read-only turn argv = %#v, want local IPC profile available for the session %#v", spec.Argv, wantArgv)
+		}
+		peer := newAppServerPeer(t, proc)
+		peer.handshake()
+		thread := peer.expectRequest("thread/resume")
+		threadParams, ok := thread["params"].(map[string]any)
+		if !ok || threadParams["sandbox"] != "read-only" {
+			t.Fatalf("read-only thread/resume params = %#v, want sandbox read-only", thread["params"])
+		}
+		if _, ok := threadParams["permissions"]; ok {
+			t.Fatalf("read-only thread/resume params contain writable permissions: %#v", threadParams)
+		}
+		peer.respond(thread, threadResult("thread-1"))
+		turn := peer.expectRequest("turn/start")
+		turnParams, ok := turn["params"].(map[string]any)
+		wantPolicy := map[string]any{"type": "readOnly", "networkAccess": false}
+		if !ok || !reflect.DeepEqual(turnParams["sandboxPolicy"], wantPolicy) {
+			t.Fatalf("read-only turn/start params = %#v, want sandboxPolicy %#v", turn["params"], wantPolicy)
+		}
+		if _, ok := turnParams["permissions"]; ok {
+			t.Fatalf("read-only turn/start params contain writable permissions: %#v", turnParams)
+		}
+		peer.respond(turn, turnResult("turn-2"))
+		peer.notify("turn/completed", completedParams("thread-1", "turn-2", "completed", ""))
+	})
+	events, err = turnWithRunner(t, session, engine.TurnInput{Prompt: "correct the result", Write: false}, readOnlyRunner)
 	if err != nil {
 		t.Fatal(err)
 	}

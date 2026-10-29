@@ -153,12 +153,13 @@ type Server struct {
 	codexSandboxResults map[codexSandboxCacheKey]codexSandboxCacheEntry
 	codexSandboxProbe   func(context.Context, string) error
 
-	codexHomeOverride string
-	codexHomeInherit  bool
-	codexAuthHome     string
-	moduleCache       string
-	codexHomesMu      sync.Mutex
-	managedCodexHomes map[string]*managedCodexHome
+	codexHomeOverride    string
+	codexHomeInherit     bool
+	codexAuthHome        string
+	moduleCache          string
+	codexHomesMu         sync.Mutex
+	managedCodexHomes    map[string]*managedCodexHome
+	managedLocalIPCRoots map[string]string
 
 	jobStoreMu sync.Mutex
 	jobStore   *jobstore.Store
@@ -275,33 +276,34 @@ func New(cfg Config) (*Server, error) {
 		}
 	}
 	return &Server{
-		stateRoot:           root,
-		socketPath:          socketPath,
-		token:               token,
-		backends:            backends,
-		backendDefaults:     backendDefaults,
-		backendVersions:     make(map[backendVersionCacheKey]backendVersionCacheEntry),
-		codexSandboxResults: make(map[codexSandboxCacheKey]codexSandboxCacheEntry),
-		codexSandboxProbe:   runCodexSandboxProbe,
-		codexHomeOverride:   cfg.CodexHomeOverride,
-		codexHomeInherit:    cfg.CodexHomeInherit,
-		codexAuthHome:       cfg.CodexAuthHome,
-		moduleCache:         resolveModuleCache(),
-		managedCodexHomes:   make(map[string]*managedCodexHome),
-		processTable:        engine.NativeProcessTable{},
-		processGroups:       engine.NativeProcessGroupSignaler{},
-		processGroupGrace:   engine.DefaultCancelGrace,
-		turnDrainGrace:      engine.DefaultCancelGrace,
-		maxJobs:             cfg.MaxJobs,
-		maxJobsPerBackend:   cfg.MaxJobsPerBackend,
-		maxQueued:           cfg.MaxQueued,
-		runningByBackend:    make(map[string]int),
-		idleTimeout:         idleTimeout,
-		idleCheckInterval:   idleCheckInterval,
-		shutdownTimeout:     normalizeShutdownTimeout(cfg.ShutdownTimeout),
-		pruneInterval:       cfg.PruneInterval,
-		readyHook:           cfg.ReadyHook,
-		lastActivity:        time.Now().UTC(),
+		stateRoot:            root,
+		socketPath:           socketPath,
+		token:                token,
+		backends:             backends,
+		backendDefaults:      backendDefaults,
+		backendVersions:      make(map[backendVersionCacheKey]backendVersionCacheEntry),
+		codexSandboxResults:  make(map[codexSandboxCacheKey]codexSandboxCacheEntry),
+		codexSandboxProbe:    runCodexSandboxProbe,
+		codexHomeOverride:    cfg.CodexHomeOverride,
+		codexHomeInherit:     cfg.CodexHomeInherit,
+		codexAuthHome:        cfg.CodexAuthHome,
+		moduleCache:          resolveModuleCache(),
+		managedCodexHomes:    make(map[string]*managedCodexHome),
+		managedLocalIPCRoots: make(map[string]string),
+		processTable:         engine.NativeProcessTable{},
+		processGroups:        engine.NativeProcessGroupSignaler{},
+		processGroupGrace:    engine.DefaultCancelGrace,
+		turnDrainGrace:       engine.DefaultCancelGrace,
+		maxJobs:              cfg.MaxJobs,
+		maxJobsPerBackend:    cfg.MaxJobsPerBackend,
+		maxQueued:            cfg.MaxQueued,
+		runningByBackend:     make(map[string]int),
+		idleTimeout:          idleTimeout,
+		idleCheckInterval:    idleCheckInterval,
+		shutdownTimeout:      normalizeShutdownTimeout(cfg.ShutdownTimeout),
+		pruneInterval:        cfg.PruneInterval,
+		readyHook:            cfg.ReadyHook,
+		lastActivity:         time.Now().UTC(),
 	}, nil
 }
 

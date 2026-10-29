@@ -101,10 +101,12 @@ type SessionOpts struct {
 	WriteSandboxRoot string
 	// LocalIPC selects the Codex local-IPC permission profile for this job.
 	LocalIPC bool
-	Write    bool
-	Model    string
-	Effort   string
-	Timeout  time.Duration
+	// LocalIPCRoot is the private short temp directory granted for local IPC.
+	LocalIPCRoot string
+	Write        bool
+	Model        string
+	Effort       string
+	Timeout      time.Duration
 }
 
 // TurnInput is the effective input for one backend turn.

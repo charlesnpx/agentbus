@@ -822,6 +822,15 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		if record.Backend == "codex" {
 			opts.WriteSandboxRoot = cache.root
 		}
+		if spec.LocalIPC {
+			ipcRoot, rootErr := createLocalIPCRoot()
+			if rootErr != nil {
+				s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassBackendUnavailable, rootErr, nil)
+				return
+			}
+			opts.LocalIPCRoot = ipcRoot
+			s.rememberManagedLocalIPCRoot(record.JobID, ipcRoot)
+		}
 		opts.WriteEnvOverlay = map[string]string{
 			"GOCACHE":              cache.goBuild,
 			"TMPDIR":               cache.tmp,
@@ -830,6 +839,9 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 			"XDG_CACHE_HOME":       cache.xdg,
 			"npm_config_store_dir": cache.pnpm,
 			"YARN_CACHE_FOLDER":    cache.yarn,
+		}
+		if spec.LocalIPC {
+			opts.WriteEnvOverlay["TMPDIR"] = opts.LocalIPCRoot
 		}
 		caches = make(map[string]string, len(opts.WriteEnvOverlay)+1)
 		for key, value := range opts.WriteEnvOverlay {
@@ -1563,6 +1575,7 @@ func (s *Server) markTerminal(store *jobstore.Store, jobID string, terminal jobs
 			terminal.Diagnostics = append(terminal.Diagnostics, "inspect managed Codex home terminal record: "+getErr.Error())
 		} else if current.State.IsTerminal() {
 			home.close()
+			s.discardRecordedLocalIPCRoot(current)
 			return
 		} else {
 			cleanupRecord = current
@@ -1571,6 +1584,7 @@ func (s *Server) markTerminal(store *jobstore.Store, jobID string, terminal jobs
 	}
 	_, err := store.MarkTerminal(jobID, terminal)
 	if err == nil {
+		s.discardManagedLocalIPCRoot(jobID, "")
 		if home != nil {
 			cleanup, diagnostics := finalizeManagedCodexHome(home, cleanupRecord, terminal.Cleanup, terminal.Diagnostics)
 			if cleanup != terminal.Cleanup && len(diagnostics) > len(terminal.Diagnostics) {
@@ -1583,6 +1597,7 @@ func (s *Server) markTerminal(store *jobstore.Store, jobID string, terminal jobs
 		if home != nil {
 			home.close()
 		}
+		s.discardManagedLocalIPCRoot(jobID, "")
 		// ErrTerminal is the store-enforced first-terminal-wins result. A
 		// later observer never retries or overwrites that recorded outcome.
 		return
@@ -1600,12 +1615,15 @@ func (s *Server) markTerminal(store *jobstore.Store, jobID string, terminal jobs
 			FinishedAt:       time.Now().UTC(),
 		}
 		if _, failureErr := store.MarkTerminal(jobID, failed); failureErr == nil {
+			s.discardManagedLocalIPCRoot(jobID, "")
 			if home != nil {
 				home.close()
 			}
 			return
 		} else if !errors.Is(failureErr, jobstore.ErrTerminal) {
 			err = errors.Join(err, fmt.Errorf("persist storage failure terminal record: %w", failureErr))
+		} else {
+			s.discardManagedLocalIPCRoot(jobID, "")
 		}
 	}
 	if home != nil {

@@ -19,15 +19,20 @@ import (
 
 func runtimeHygieneRecord(t *testing.T, server *Server, cwd, requestID string, write bool) jobstore.Record {
 	t.Helper()
-	canonicalCWD, err := engine.CanonicalWorkspace(cwd)
-	if err != nil {
-		t.Fatal(err)
-	}
 	spec := protocol.TaskSpec{
 		Backend: "codex",
 		CWD:     cwd,
 		Prompt:  "runtime hygiene test",
 		Write:   write,
+	}
+	return runtimeHygieneRecordForSpec(t, server, cwd, requestID, spec)
+}
+
+func runtimeHygieneRecordForSpec(t *testing.T, server *Server, cwd, requestID string, spec protocol.TaskSpec) jobstore.Record {
+	t.Helper()
+	canonicalCWD, err := engine.CanonicalWorkspace(cwd)
+	if err != nil {
+		t.Fatal(err)
 	}
 	raw, err := json.Marshal(spec)
 	if err != nil {
@@ -210,6 +215,132 @@ func TestCodexWriteTurnOmitsGOMODCACHEWhenHostCacheCannotResolve(t *testing.T) {
 	}
 	if _, ok := started.WriteEnvOverlay["GOMODCACHE"]; ok {
 		t.Fatalf("WriteEnvOverlay unexpectedly set GOMODCACHE: %#v", started.WriteEnvOverlay)
+	}
+}
+
+func TestCodexLocalIPCUsesPrivateTMPDIRAndRemovesItAtCompletion(t *testing.T) {
+	originalGOOS := localIPCGOOS
+	localIPCGOOS = "darwin"
+	t.Cleanup(func() { localIPCGOOS = originalGOOS })
+	originalTempRoot := localIPCTempRoot
+	tempRoot, err := os.MkdirTemp("/tmp", "agentbus-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		localIPCTempRoot = originalTempRoot
+		_ = os.RemoveAll(tempRoot)
+	})
+	localIPCTempRoot = tempRoot
+
+	var started engine.SessionOpts
+	backend := &executionFakeBackend{name: "codex"}
+	backend.start = func(_ context.Context, opts engine.SessionOpts) (engine.Session, error) {
+		started = opts
+		if opts.LocalIPCRoot == "" || opts.WriteEnvOverlay["TMPDIR"] != opts.LocalIPCRoot {
+			t.Fatalf("LocalIPCRoot=%q WriteEnvOverlay=%#v, want private TMPDIR", opts.LocalIPCRoot, opts.WriteEnvOverlay)
+		}
+		if len(opts.LocalIPCRoot) > localIPCRootMaxBytes || !strings.HasPrefix(filepath.Base(opts.LocalIPCRoot), "agentbus-ipc-") {
+			t.Fatalf("LocalIPCRoot = %q, want a short agentbus-ipc directory", opts.LocalIPCRoot)
+		}
+		info, err := os.Stat(opts.LocalIPCRoot)
+		if err != nil {
+			t.Fatalf("private IPC directory before launch: %v", err)
+		}
+		if !info.IsDir() || info.Mode().Perm() != 0o700 {
+			t.Fatalf("private IPC directory mode/type = %s, want directory 0700", info.Mode())
+		}
+		for key, path := range opts.WriteEnvOverlay {
+			if key == "TMPDIR" {
+				continue
+			}
+			relative, err := filepath.Rel(opts.WriteSandboxRoot, path)
+			if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+				t.Fatalf("WriteEnvOverlay[%q] = %q is outside scratch %q", key, path, opts.WriteSandboxRoot)
+			}
+		}
+		return claimedResultSession("local IPC result"), nil
+	}
+	server := newTestServer(t, t.TempDir(), Config{
+		Backends:      []engine.Backend{backend},
+		CodexAuthHome: filepath.Join(t.TempDir(), "missing-auth-home"),
+	})
+	cwd := t.TempDir()
+	record := runtimeHygieneRecordForSpec(t, server, cwd, "local-ipc-private-tmp", protocol.TaskSpec{
+		Backend: "codex", CWD: cwd, Prompt: "runtime hygiene test", Write: true, LocalIPC: true,
+	})
+	runExecution(t, server, record)
+
+	if started.LocalIPCRoot == "" {
+		t.Fatal("local IPC job did not start its backend")
+	}
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != protocol.PublicStateCompleted || got.Execution == nil {
+		t.Fatalf("terminal record = %+v, want completed with execution posture", got)
+	}
+	if got.Execution.LocalIPC != "private-dir" || got.Execution.Caches["TMPDIR"] != started.LocalIPCRoot {
+		t.Fatalf("execution posture = %+v, want private-dir and TMPDIR %q", got.Execution, started.LocalIPCRoot)
+	}
+	if _, err := os.Stat(started.LocalIPCRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("private IPC directory after completion = %v, want removed", err)
+	}
+}
+
+func TestCodexLocalIPCRejectsLongPrivateTMPDIRBeforeLaunch(t *testing.T) {
+	originalGOOS := localIPCGOOS
+	localIPCGOOS = "darwin"
+	t.Cleanup(func() { localIPCGOOS = originalGOOS })
+	originalTempRoot := localIPCTempRoot
+	longRoot := filepath.Join(t.TempDir(), strings.Repeat("x", 96))
+	if err := os.MkdirAll(longRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	localIPCTempRoot = longRoot
+	t.Cleanup(func() { localIPCTempRoot = originalTempRoot })
+
+	starts := 0
+	backend := &executionFakeBackend{name: "codex"}
+	backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) {
+		starts++
+		return claimedResultSession("unexpected launch"), nil
+	}
+	server := newTestServer(t, t.TempDir(), Config{
+		Backends:      []engine.Backend{backend},
+		CodexAuthHome: filepath.Join(t.TempDir(), "missing-auth-home"),
+	})
+	cwd := t.TempDir()
+	record := runtimeHygieneRecordForSpec(t, server, cwd, "local-ipc-long-tmp", protocol.TaskSpec{
+		Backend: "codex", CWD: cwd, Prompt: "runtime hygiene test", Write: true, LocalIPC: true,
+	})
+	runExecution(t, server, record)
+
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != protocol.PublicStateFailed || got.FailureClass != protocol.FailureClassBackendUnavailable || !strings.Contains(got.FailureReason, "80 bytes") {
+		t.Fatalf("long local IPC path result = %+v, want backend_unavailable with the 80-byte limit", got)
+	}
+	if starts != 0 {
+		t.Fatalf("backend Start calls = %d, want no launch", starts)
+	}
+	entries, err := os.ReadDir(longRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("long temp root entries = %#v, want the rejected directory removed", entries)
 	}
 }
 

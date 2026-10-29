@@ -56,7 +56,7 @@ func executionPosture(backend string, write, localIPC, codexSandboxed bool, scra
 			posture.Network = "denied"
 			posture.LocalIPC = "denied"
 			if localIPC {
-				posture.LocalIPC = "scratch"
+				posture.LocalIPC = "private-dir"
 			}
 			posture.GitMetadata = "read-only"
 		} else {
