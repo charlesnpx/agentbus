@@ -778,6 +778,100 @@ func TestClaudeResultStatusMapping(t *testing.T) {
 	}
 }
 
+func TestClaudeStructuredRateLimitCarriesProviderEvidence(t *testing.T) {
+	resetAt := "2026-10-28T23:15:00Z"
+	runner := newFakeClaudeRunner(t, func(t *testing.T, proc *fakeClaudeProcess, _ command.ExecSpec) {
+		peer := newClaudePeer(t, proc)
+		peer.handshake()
+		peer.expectUser("quota")
+		peer.write(map[string]any{
+			"type": "result", "subtype": "error_during_execution", "is_error": true,
+			"error": map[string]any{
+				"type": "rate_limit_error", "message": "weekly usage limit reached", "reset_at": resetAt,
+			},
+		})
+	})
+	session := startFakeClaudeSession(t, engine.SessionOpts{})
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "quota"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	var failure *engine.ProviderFailureError
+	for _, event := range got {
+		if event.Type == engine.EventTerminalError && errors.As(event.Err, &failure) {
+			break
+		}
+	}
+	if failure == nil {
+		t.Fatalf("events = %#v, want structured provider failure", got)
+	}
+	if failure.Evidence.Class != "usage_limit" || failure.Evidence.Code != "rate_limit_error" || failure.Evidence.Message != "weekly usage limit reached" || failure.Evidence.RetryAfter == nil || failure.Evidence.RetryAfter.Format(time.RFC3339) != resetAt {
+		t.Fatalf("provider evidence = %+v, want usage limit code/message/reset", failure.Evidence)
+	}
+}
+
+func TestClaudeAssistantModelObservationReplacesSystemModel(t *testing.T) {
+	runner := newFakeClaudeRunner(t, func(t *testing.T, proc *fakeClaudeProcess, _ command.ExecSpec) {
+		peer := newClaudePeer(t, proc)
+		peer.handshake()
+		peer.expectUser("observe model")
+		peer.emitSystem("session-model", "model-a")
+		peer.write(map[string]any{
+			"type": "assistant",
+			"message": map[string]any{
+				"role":    "assistant",
+				"model":   "model-b",
+				"content": []any{},
+			},
+		})
+		peer.emitResult("success", false, "done")
+	})
+
+	session := startFakeClaudeSession(t, engine.SessionOpts{})
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "observe model"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observations := eventsOfType(collectEventsWithTimeout(t, events, 2*time.Second), engine.EventModelReported)
+	if len(observations) != 2 || observations[0].ModelReported != "model-a" || observations[len(observations)-1].ModelReported != "model-b" {
+		t.Fatalf("model observations = %#v, want model-a followed by latest model-b", observations)
+	}
+}
+
+func TestClaudePermissionErrorWith403IsNotAuthentication(t *testing.T) {
+	runner := newFakeClaudeRunner(t, func(t *testing.T, proc *fakeClaudeProcess, _ command.ExecSpec) {
+		peer := newClaudePeer(t, proc)
+		peer.handshake()
+		peer.expectUser("permission denied")
+		peer.write(map[string]any{
+			"type": "error",
+			"error": map[string]any{
+				"type":    "permission_error",
+				"status":  403,
+				"message": "permission denied",
+			},
+		})
+	})
+
+	session := startFakeClaudeSession(t, engine.SessionOpts{})
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "permission denied"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	for _, event := range got {
+		var failure *engine.ProviderFailureError
+		if event.Type == engine.EventTerminalError && errors.As(event.Err, &failure) {
+			if failure.Evidence.Class == "authentication" {
+				t.Fatalf("provider failure = %+v, want permission_error status 403 not classified as authentication", failure.Evidence)
+			}
+			return
+		}
+	}
+	t.Fatalf("events = %#v, want structured permission failure", got)
+}
+
 func TestClaudeSessionIDCapturedAndResumed(t *testing.T) {
 	runner := newFakeClaudeRunner(t,
 		func(t *testing.T, proc *fakeClaudeProcess, spec command.ExecSpec) {

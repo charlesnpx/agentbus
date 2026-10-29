@@ -52,6 +52,10 @@ type ProbedBackendDescriptor struct {
 
 func (b *Backend) Name() string { return b.NameValue }
 
+func (b *Backend) BackendInspection() engine.BackendInspection {
+	return engine.BackendInspection{Executable: b.binary()}
+}
+
 func (b *Backend) Preflight(ctx context.Context) (engine.Health, error) {
 	probed, err := ProbeBackend(ctx, command.DirectProbeRunner{}, b.staticDescriptor())
 	if err != nil {

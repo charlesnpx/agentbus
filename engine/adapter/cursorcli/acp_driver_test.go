@@ -803,6 +803,7 @@ func TestACPNegativeTerminalProtocolBranches(t *testing.T) {
 		name         string
 		run          func(*testing.T, *acpPeer)
 		terminalText string
+		providerCode string
 		wantResult   bool
 		interrupted  bool
 	}{
@@ -818,6 +819,7 @@ func TestACPNegativeTerminalProtocolBranches(t *testing.T) {
 				peer.expectStdinClose()
 			},
 			terminalText: "could not verify Cursor mode: set mode rejected",
+			providerCode: "-32000",
 		},
 		{
 			name: "error data message is included",
@@ -835,6 +837,7 @@ func TestACPNegativeTerminalProtocolBranches(t *testing.T) {
 				peer.expectStdinClose()
 			},
 			terminalText: "could not verify Cursor mode: Invalid params: Invalid model value: definitely-not-a-model",
+			providerCode: "-32602",
 		},
 		{
 			name: "unsupported reverse request is method not found",
@@ -892,6 +895,12 @@ func TestACPNegativeTerminalProtocolBranches(t *testing.T) {
 				}
 				if test.interrupted && !errors.Is(terminal[0].Err, engine.ErrTurnInterrupted) {
 					t.Fatalf("terminal event error = %v, want ErrTurnInterrupted", terminal[0].Err)
+				}
+				if test.providerCode != "" {
+					var providerFailure *engine.ProviderFailureError
+					if !errors.As(terminal[0].Err, &providerFailure) || providerFailure.Evidence.Code != test.providerCode || providerFailure.Evidence.Message == "" {
+						t.Fatalf("terminal event provider evidence = %#v, want code %q and message", terminal[0].Err, test.providerCode)
+					}
 				}
 			} else if len(terminal) != 0 {
 				t.Fatalf("events = %#v, did not want terminal error", got)

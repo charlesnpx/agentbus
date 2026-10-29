@@ -58,6 +58,7 @@ type app struct {
 }
 
 type protocolClient interface {
+	BackendInspect(context.Context, agentclient.BackendInspectParams) (agentclient.BackendInspectResult, error)
 	JobGet(context.Context, agentclient.JobGetParams) (agentclient.JobGetResult, error)
 	JobList(context.Context, agentclient.JobListParams) (agentclient.JobListResult, error)
 	JobTranscript(context.Context, agentclient.JobTranscriptParams) (agentclient.JobTranscriptResult, error)
@@ -141,6 +142,8 @@ func (a *app) run(ctx context.Context, args []string, stdin io.Reader, out, errO
 	switch command {
 	case "version":
 		return a.runVersion(args[1:], out, errOut)
+	case "backends":
+		return a.runBackends(ctx, args[1:], out, errOut)
 	case "serve":
 		return a.runServe(ctx, args[1:], errOut)
 	case "status":
@@ -164,7 +167,7 @@ func (a *app) run(ctx context.Context, args []string, stdin io.Reader, out, errO
 
 func knownCommand(command string) bool {
 	switch command {
-	case "version", "serve", "status", "transcript", "result", "cancel", "configure-codex-sandbox":
+	case "version", "backends", "serve", "status", "transcript", "result", "cancel", "prune", "steer", "configure-codex-sandbox":
 		return true
 	default:
 		return false
@@ -184,8 +187,10 @@ func printCommandHelp(out io.Writer, command string) {
 	switch command {
 	case "version":
 		fmt.Fprintln(out, "Usage: agentbus version [--json]")
+	case "backends":
+		fmt.Fprintln(out, "Usage: agentbus backends [--json]")
 	case "serve":
-		fmt.Fprintln(out, "Usage: agentbus serve [--foreground]")
+		fmt.Fprintln(out, "Usage: agentbus serve [--foreground] [--max-jobs <n>] [--max-jobs-per-backend <n>] [--max-queued <n>] [--prune-interval 24h]")
 	case "status":
 		fmt.Fprintln(out, "Usage: agentbus status [--job <id>] [--workspace-key <key>] [--tag <key=value>] [--state <state>] [--limit <n>] [--before <cursor> | --all] [--json]")
 	case "transcript":
@@ -194,11 +199,58 @@ func printCommandHelp(out io.Writer, command string) {
 		fmt.Fprintln(out, "Usage: agentbus result --job <id> [--wait [--wait-timeout <duration>]] [--json]")
 	case "cancel":
 		fmt.Fprintln(out, "Usage: agentbus cancel --job <id> [--json]")
+	case "prune":
+		fmt.Fprintln(out, "Usage: agentbus prune [--apply] [--successful-older-than 168h] [--failed-older-than 720h] [--json]")
+	case "steer":
+		fmt.Fprintln(out, "Usage: agentbus steer --job <id> --request-id <messageId> --message-file <path|-> [--json]")
 	case "configure-codex-sandbox":
 		fmt.Fprintln(out, "Usage: agentbus configure-codex-sandbox [--writable-root <absolute-path>]... [--json]")
 	default:
 		printRootHelp(out)
 	}
+}
+
+func (a *app) runBackends(ctx context.Context, args []string, out, errOut io.Writer) int {
+	fs := newCommandFlagSet("backends", errOut)
+	jsonOut := fs.Bool("json", false, "emit backend.inspect response")
+	if code, ok := parseFlags(fs, args); !ok {
+		return code
+	}
+	if fs.NArg() != 0 {
+		return usageError(errOut, "backends does not accept positional arguments")
+	}
+	client, err := a.connectProtocolClient(ctx)
+	if err != nil {
+		return protocolCommandError(errOut, "backends", err)
+	}
+	defer client.Close()
+	result, err := client.BackendInspect(ctx, agentclient.BackendInspectParams{})
+	if err != nil {
+		return protocolCommandError(errOut, "backends", err)
+	}
+	if *jsonOut {
+		return writeOrError(out, errOut, result)
+	}
+	for _, backend := range result.Backends {
+		fmt.Fprintf(out, "backend=%s", backend.Backend)
+		if backend.ExecutablePath != "" {
+			fmt.Fprintf(out, " executablePath=%q", backend.ExecutablePath)
+		}
+		if backend.Version != "" {
+			fmt.Fprintf(out, " version=%q", backend.Version)
+		}
+		if backend.DefaultModel != "" {
+			fmt.Fprintf(out, " defaultModel=%q", backend.DefaultModel)
+		}
+		if backend.DefaultEffort != "" {
+			fmt.Fprintf(out, " defaultEffort=%q", backend.DefaultEffort)
+		}
+		if backend.Error != "" {
+			fmt.Fprintf(out, " error=%q", backend.Error)
+		}
+		fmt.Fprintln(out)
+	}
+	return 0
 }
 
 func (a *app) runVersion(args []string, out, errOut io.Writer) int {
@@ -248,6 +300,7 @@ func (a *app) runServe(ctx context.Context, args []string, errOut io.Writer) int
 	err := agentbusserve.Serve(serveCtx, agentbusserve.Config{
 		StateRoot:         a.stateRoot,
 		Backends:          append([]engine.Backend(nil), a.backends...),
+		BackendDefaults:   configuredBackendDefaults(),
 		CodexHomeOverride: codexHomeOverride,
 		CodexHomeInherit:  codexHomeInherit,
 		CodexAuthHome:     codexAuthHome,
@@ -260,6 +313,21 @@ func (a *app) runServe(ctx context.Context, args []string, errOut io.Writer) int
 		return serveCommandError(errOut, err)
 	}
 	return 0
+}
+
+func configuredBackendDefaults() map[string]agentbusserve.BackendDefaults {
+	defaults := make(map[string]agentbusserve.BackendDefaults)
+	for _, backend := range []string{"codex", "claude", "cursor"} {
+		prefix := "AGENTBUS_" + strings.ToUpper(backend) + "_DEFAULT_"
+		selection := agentbusserve.BackendDefaults{
+			Model:  strings.TrimSpace(os.Getenv(prefix + "MODEL")),
+			Effort: strings.TrimSpace(os.Getenv(prefix + "EFFORT")),
+		}
+		if selection.Model != "" || selection.Effort != "" {
+			defaults[backend] = selection
+		}
+	}
+	return defaults
 }
 
 // codexHomeSettings reads the daemon-owned home controls once at startup.
@@ -1169,12 +1237,49 @@ func printJobRecordStatus(out io.Writer, record agentclient.JobGetResult) {
 	if record.Timeout != nil {
 		fmt.Fprintf(out, " timeout.effective=%d timeout.source=%s", record.Timeout.Effective, record.Timeout.Source)
 	}
-	fmt.Fprintf(out, " inputMode=%s model=%s tags=%s", protocol.EffectiveInputMode(record.InputMode), record.ModelReported, formatTags(record.Tags))
+	fmt.Fprintf(out, " inputMode=%s", protocol.EffectiveInputMode(record.InputMode))
+	if record.Deadline != nil {
+		fmt.Fprintf(out, " deadline=%s", humanTime(*record.Deadline))
+	}
+	if record.RemainingMs != nil {
+		fmt.Fprintf(out, " remainingMs=%d", *record.RemainingMs)
+	}
+	if record.ModelRequested != nil {
+		fmt.Fprintf(out, " model.requested=%q", *record.ModelRequested)
+	}
+	if record.EffortRequested != nil {
+		fmt.Fprintf(out, " effort.requested=%q", *record.EffortRequested)
+	}
+	if record.ModelReported != "" {
+		fmt.Fprintf(out, " model.reported=%q", record.ModelReported)
+	}
+	if record.EffortReported != "" {
+		fmt.Fprintf(out, " effort.reported=%q", record.EffortReported)
+	}
+	fmt.Fprintf(out, " tags=%s", formatTags(record.Tags))
+	if record.Resumable != nil {
+		fmt.Fprintf(out, " resumable.eligible=%t resumable.reason=%q", record.Resumable.Eligible, record.Resumable.Reason)
+	}
+	if record.CancellationReason != "" {
+		fmt.Fprintf(out, " cancellationReason=%s", record.CancellationReason)
+	}
 	if record.Result != nil {
 		fmt.Fprintf(out, " result.bytes=%d result.sha256=%s", record.Result.Bytes, shortSHA256(record.Result.SHA256))
 	}
 	if record.Failure != nil {
 		fmt.Fprintf(out, " failure.class=%s failure.reason=%s", record.Failure.Class, record.Failure.Reason)
+		if record.Failure.ProviderCode != "" {
+			fmt.Fprintf(out, " failure.providerCode=%q", record.Failure.ProviderCode)
+		}
+		if record.Failure.ProviderMessage != "" {
+			fmt.Fprintf(out, " failure.providerMessage=%q", record.Failure.ProviderMessage)
+		}
+		if record.Failure.Stage != "" {
+			fmt.Fprintf(out, " failure.stage=%s", record.Failure.Stage)
+		}
+		if record.Failure.RetryAfter != nil {
+			fmt.Fprintf(out, " failure.retryAfter=%s", humanTime(*record.Failure.RetryAfter))
+		}
 	}
 	if record.Contract != nil {
 		fmt.Fprintf(out, " contract.evaluated=%t contract.compliant=%t", record.Contract.Evaluated, record.Contract.Compliant)
@@ -1497,6 +1602,7 @@ func printRootHelp(out io.Writer) {
 	fmt.Fprint(out, `Usage:
   agentbus --help | -h | help
   agentbus version [--json] (aliases: --version, -version, -V)
+  agentbus backends [--json]
   agentbus serve [--foreground] [--max-jobs <n>] [--max-jobs-per-backend <n>] [--max-queued <n>] [--prune-interval 24h]
   agentbus status [--job <id>] [--workspace-key <key>] [--tag <key=value>] [--state <state>] [--limit <n>] [--before <cursor> | --all] [--json]
   agentbus transcript --job <id> [--follow] [--kind <kind>]... [--last <n>] [--since <rfc3339>] [--since-ordinal <n>] [--limit <n>] [--json]

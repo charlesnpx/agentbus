@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -74,10 +75,11 @@ type BinaryIdentity struct {
 
 // Config configures the one local JSON-RPC daemon.
 type Config struct {
-	StateRoot  string
-	SocketPath string
-	Token      string
-	Backends   []engine.Backend
+	StateRoot       string
+	SocketPath      string
+	Token           string
+	Backends        []engine.Backend
+	BackendDefaults map[string]BackendDefaults
 
 	// CodexHomeOverride selects a fixed CODEX_HOME instead of a per-job home.
 	// It is intended for an operator-owned compatibility configuration.
@@ -97,6 +99,13 @@ type Config struct {
 	MaxQueued         int
 	PruneInterval     time.Duration
 	ReadyHook         func(ServeReadyInfo) error
+}
+
+// BackendDefaults are intentional daemon-side model and effort selections.
+// A task's explicit model or effort always takes precedence.
+type BackendDefaults struct {
+	Model  string
+	Effort string
 }
 
 // ServeReadyInfo identifies the ready daemon for startup launchers.
@@ -133,10 +142,13 @@ func (lifecycle *serveLifecycle) settleAccept() {
 
 // Server serves protocol version 3 over one private Unix socket.
 type Server struct {
-	stateRoot  string
-	socketPath string
-	token      string
-	backends   map[string]engine.Backend
+	stateRoot        string
+	socketPath       string
+	token            string
+	backends         map[string]engine.Backend
+	backendDefaults  map[string]BackendDefaults
+	backendVersionMu sync.Mutex
+	backendVersions  map[backendVersionCacheKey]backendVersionCacheEntry
 
 	codexHomeOverride string
 	codexHomeInherit  bool
@@ -241,6 +253,10 @@ func New(cfg Config) (*Server, error) {
 			backends[backend.Name()] = backend
 		}
 	}
+	backendDefaults := make(map[string]BackendDefaults, len(cfg.BackendDefaults))
+	for name, defaults := range cfg.BackendDefaults {
+		backendDefaults[name] = BackendDefaults{Model: strings.TrimSpace(defaults.Model), Effort: strings.TrimSpace(defaults.Effort)}
+	}
 	idleTimeout := cfg.IdleTimeout
 	if idleTimeout == 0 {
 		idleTimeout = defaultIdleTimeout
@@ -260,6 +276,8 @@ func New(cfg Config) (*Server, error) {
 		socketPath:        socketPath,
 		token:             token,
 		backends:          backends,
+		backendDefaults:   backendDefaults,
+		backendVersions:   make(map[backendVersionCacheKey]backendVersionCacheEntry),
 		codexHomeOverride: cfg.CodexHomeOverride,
 		codexHomeInherit:  cfg.CodexHomeInherit,
 		codexAuthHome:     cfg.CodexAuthHome,

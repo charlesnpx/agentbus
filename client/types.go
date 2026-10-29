@@ -4,6 +4,9 @@ import "github.com/charlesnpx/agentbus/internal/protocol"
 
 type HelloParams = protocol.HelloParams
 type BackendInfo = protocol.BackendInfo
+type BackendInspectParams = protocol.BackendInspectParams
+type BackendInspection = protocol.BackendInspectionWire
+type BackendInspectResult = protocol.BackendInspectResult
 type HelloResult = protocol.HelloResult
 
 // TaskSpec is the client-facing alias of protocol.TaskSpec, including its

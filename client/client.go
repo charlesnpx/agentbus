@@ -979,6 +979,14 @@ func (c *Client) JobCancel(ctx context.Context, params JobCancelParams) (JobCanc
 	return out, err
 }
 
+// BackendInspect returns resolved local executable and version information for
+// each configured backend. Individual backend failures remain in the result.
+func (c *Client) BackendInspect(ctx context.Context, params BackendInspectParams) (BackendInspectResult, error) {
+	var out BackendInspectResult
+	err := c.do(ctx, protocol.MethodBackendInspect, params, &out)
+	return out, err
+}
+
 // ArtifactsPrune previews or removes eligible Agentbus-owned artifacts.
 func (c *Client) ArtifactsPrune(ctx context.Context, params ArtifactsPruneParams) (ArtifactsPruneResult, error) {
 	var out ArtifactsPruneResult

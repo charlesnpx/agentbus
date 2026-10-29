@@ -4,11 +4,12 @@ Agentbus protocol version 3 is a JSON-RPC 2.0 service over a local,
 newline-delimited Unix socket. Each frame is one JSON object followed by a
 newline. The daemon accepts only protocol version 3.
 
-The wire surface has eight methods:
+The wire surface has nine methods:
 
 | Method | Purpose |
 | --- | --- |
 | protocol.hello | Authenticate the connection and confirm the protocol version. |
+| backend.inspect | Inspect configured backend executables and daemon defaults. |
 | job.submit | Create or replay an identified job. |
 | job.get | Read one identified job. |
 | job.list | List compact job summaries with optional workspace, tag, and state filters. |
@@ -90,6 +91,41 @@ available model and effort metadata:
   ]
 }
 ~~~
+
+## backend.inspect
+
+backend.inspect takes an empty parameter object and inspects each configured
+backend independently:
+
+~~~json
+{}
+~~~
+
+~~~json
+{
+  "backends": [
+    {
+      "backend": "codex",
+      "executablePath": "/usr/local/bin/codex",
+      "version": "codex-cli 1.2.3",
+      "defaultModel": "gpt-5-codex",
+      "defaultEffort": "high"
+    },
+    {
+      "backend": "claude",
+      "error": "--version failed: exit status 1"
+    }
+  ]
+}
+~~~
+
+Each entry contains the resolved executable path, the first line of its
+`--version` output, and configured default model/effort when present. A
+per-backend `error` reports path resolution or version-probe failure and does
+not block the other entries. The daemon makes at most one bounded `--version`
+call per executable path and modification time during its lifetime, caching
+both successful results and failures. Inspection does not query provider
+accounts, billing, or model catalogues.
 
 ## job.submit
 
@@ -228,9 +264,12 @@ The result contains compact summaries:
 
 Each summary always contains jobId, backend, state, cleanup, createdAt,
 queuedAt, and updatedAt. queuedAt is the time the job entered the queue;
-startedAt on job.get shows when the durable running transition was recorded. tags,
-modelReported, failureClass, and contract appear when applicable. tags is the
-submitted tag map, allowing a caller to see why a tag filter matched.
+startedAt on job.get shows when the durable running transition was recorded.
+tags, modelReported, effortReported, failureClass, and contract appear when
+applicable. modelReported is the latest model the backend reported;
+effortReported is included when the backend reports effort. Neither is filled
+from the task request. tags is the submitted tag map, allowing a caller to see
+why a tag filter matched.
 
 itemCount and liveness appear only while this daemon has an active execution
 for that job. lastItemAt appears after that active execution has assembled an
@@ -382,11 +421,10 @@ invalid_task_spec parameter error rather than a list request.
   "workspaceKey": "string",
   "requestId": "string",
   "backend": "string",
-  "inputMode": "fixed",
+  "inputMode": "steerable",
   "steers": [],
-  "state": "completed",
+  "state": "running",
   "cleanup": "clean",
-  "logsPruned": true,
   "createdAt": "2026-08-20T12:00:00Z",
   "queuedAt": "2026-08-20T12:00:00Z",
   "startedAt": "2026-08-20T12:00:01Z",
@@ -402,29 +440,21 @@ invalid_task_spec parameter error rather than a list request.
     "gitMetadata": "read-only",
     "enforcement": "os-sandbox"
   },
-  "finishedAt": "2026-08-20T12:00:05Z",
   "timeout": {
     "effective": 1800000,
     "source": "daemon_default"
   },
+  "deadline": "2026-08-20T12:30:01Z",
+  "remainingMs": 1799500,
+  "resumable": {
+    "eligible": false,
+    "reason": "resume target is running rather than terminal"
+  },
+  "modelRequested": "gpt-5-codex",
+  "effortRequested": "high",
+  "modelReported": "gpt-5-codex",
+  "effortReported": "high",
   "tags": {"key": "value"},
-  "result": {
-    "text": "optional inline result",
-    "resultPath": "/state-root/artifacts/results/job_x.txt",
-    "sha256": "64 lowercase hexadecimal characters",
-    "bytes": 123
-  },
-  "contract": {
-    "schemaSha256": "schema digest",
-    "evaluated": true,
-    "compliant": true,
-    "attempts": 1,
-    "violations": []
-  },
-  "failure": {
-    "class": "backend_error",
-    "reason": "string"
-  },
   "logPaths": {
     "stdout": "string",
     "stdoutTruncated": false,
@@ -435,20 +465,38 @@ invalid_task_spec parameter error rather than a list request.
 ~~~
 
 jobId, workspaceKey, requestId, backend, inputMode, state, cleanup, createdAt,
-queuedAt, timeout, and steers are always present. Older stored jobs without inputMode
-project as `fixed`; steers is an empty array when there are no steering
-receipts. Each steer summary contains messageId, status, mechanism, and time;
-mechanism is empty unless delivery was confirmed. `execution` appears after the job starts and is recorded
-atomically with its starting transition. It contains intent (`inspect` or
+queuedAt, timeout, and steers are always present. Older stored jobs without
+inputMode project as `fixed`; steers is an empty array when there are no
+steering receipts. Each steer summary contains messageId, status, mechanism,
+and time; mechanism is empty unless delivery was confirmed. `execution` appears
+after the job starts and is recorded atomically with its starting transition.
+It contains intent (`inspect` or
 `edit`), the selected source write mode, optional scratch and cache paths,
 network policy, Git metadata access, and enforcement strength. The posture is
 descriptive: `sourceWritable` reports the selected mode, while `enforcement`
 identifies whether the backend uses an OS sandbox, agent permissions, or no
 filesystem boundary. For Codex edit jobs using the `workspaceWrite` sandbox,
 `gitMetadata` is `read-only` because the granted writable roots do not include
-the Git metadata directory. startedAt, finishedAt, tags, result, contract,
-failure, and logPaths appear only when they apply. `logsPruned` is true after
-the daemon removes this job's raw log sidecars.
+the Git metadata directory. `logsPruned` is true after the daemon removes this
+job's raw log sidecars. diagnostics appears when the job has recorded
+operational diagnostics.
+
+startedAt, finishedAt, deadline, remainingMs, tags, result, contract, failure,
+cancellationReason, logPaths, modelRequested, effortRequested, modelReported,
+and effortReported appear only when they apply. resumable is a derived
+projection of the same session and retention rules used when validating resume
+submissions. Its `eligible` value describes local admission only; it is not a
+promise that the provider will accept the resume. deadline and remainingMs are
+present for a running job with a finite effective timeout. deadline is derived
+from startedAt plus timeout.effective; remainingMs is the current time left,
+clamped at zero.
+
+modelRequested and effortRequested preserve only values in the submitted
+TaskSpec, so they may be absent when a configured daemon default was applied.
+`requested is not executed`: these fields record intent, while modelReported
+and effortReported record the latest values observed in provider telemetry.
+modelReported retains its name for compatibility and now means latest
+observation; observed values are never filled from requested values.
 
 result exists only for a completed job with an authoritative result. Its
 resultPath, sha256, and bytes are required; text may be omitted when the result
@@ -458,6 +506,28 @@ hexadecimal digest with no algorithm prefix.
 failure exists only for a failed job. contract exists only when an outputSchema
 was submitted. attempts is one after initial evaluation and two only when the
 single permitted correction was attempted.
+
+When supplied by a provider, failure also includes its providerCode,
+providerMessage (bounded to 512 Unicode code points), stage, and absolute
+retryAfter time. providerCode is bounded to 128 code points. Existing class
+and reason values keep their prior meaning. Current stages are `startup`,
+`turn`, and `finalize`; schema-correction errors remain contract diagnostics
+under the existing correction behavior. A transient failure can leave partial
+workspace edits. Agentbus does not retry automatically; replay is the caller's
+decision.
+
+~~~json
+{
+  "failure": {
+    "class": "usage_limit",
+    "reason": "provider reported a usage limit",
+    "providerCode": "rate_limit_error",
+    "providerMessage": "weekly usage limit reached",
+    "stage": "turn",
+    "retryAfter": "2026-08-20T12:15:00Z"
+  }
+}
+~~~
 
 For each present log path, its paired `stdoutTruncated` or `stderrTruncated`
 boolean is explicitly present as `true` or `false` when the daemon can
@@ -478,7 +548,8 @@ The result reports the durable public state after the cancellation request:
 
 If the job is already terminal, cancellation returns that existing state. A
 race with completion also returns the first terminal state recorded by the
-daemon.
+daemon. Read job.get or `agentbus status --job <id>` for the persisted
+cancellationReason.
 
 ## job.steer
 
@@ -563,13 +634,36 @@ Failure classes are data on failed jobs, not more states:
 | --- | --- |
 | backend_unavailable | The selected backend could not be used. |
 | provider_overloaded | The provider reported capacity pressure. |
+| usage_limit | The provider reported a usage or rate limit. |
 | model_unavailable | The requested model was unavailable. |
 | content_policy | The provider refused the request on content-policy grounds. |
-| authentication | Authentication was rejected. This class is reserved; no current producer assigns it. |
+| authentication | The provider explicitly rejected authentication. |
 | backend_error | A launched backend returned another error. |
 | timeout | The job deadline expired. |
 | interrupted | The backend stopped without a successful terminal result. |
 | internal | Agentbus could not make a more specific classification. |
+| storage | Agentbus could not persist an authoritative result or terminal record. |
+
+The Codex app-server adapter recognizes structured completion `errorInfo` or
+`errorCode` signals for usage/rate limits, authentication, unavailable models,
+content policy, and overload. The Claude stream-json adapter recognizes
+structured error code/type/status signals for these classes, plus explicit
+usage-limit phrases in provider error messages. Its authentication mapping
+requires an authentication code or status 401. Other adapter errors retain
+their existing classification when they do not carry a distinguishable
+provider signal. Cursor ACP preserves its structured JSON-RPC error code and
+message, but does not assign `usage_limit` or `authentication` from generic
+terminal errors. Provider reset and retry-after values are normalized to the
+absolute `retryAfter` timestamp when present.
+
+`cancellationReason` is independent of public state and can be `operator`,
+`deadline`, `daemon_shutdown`, or `provider_interruption`. `operator` is
+recorded for job.cancel, including a queued job; the other values are recorded
+on their corresponding timeout, daemon-shutdown, and provider-interruption
+terminal paths. An operator cancel still wins the existing canceled terminal
+transition; deadlines and provider interruptions retain their existing failed
+classifications and states. Internal steering interrupts are not cancellation
+reasons.
 
 ## Inline schema validation
 

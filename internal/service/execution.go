@@ -59,6 +59,7 @@ type activeExecution struct {
 	itemSidecarDiag        string
 	steerDiagnostics       []string
 	modelReported          string
+	effortReported         string
 	turn                   *activeTurn
 	latestSessionID        string
 	retiredCleanup         protocol.Cleanup
@@ -129,29 +130,34 @@ func (run *activeExecution) setSession(session engine.Session) {
 	run.mu.Unlock()
 }
 
-func (run *activeExecution) noteModelReported(model string) {
+func (run *activeExecution) noteModelReported(model, effort string) {
 	if run == nil {
 		return
 	}
 	model = strings.TrimSpace(model)
-	if model == "" {
+	effort = strings.TrimSpace(effort)
+	if model == "" && effort == "" {
 		return
 	}
 	run.mu.Lock()
-	if run.modelReported == "" {
+	if model != "" {
 		run.modelReported = model
+	}
+	if effort != "" {
+		run.effortReported = effort
 	}
 	run.mu.Unlock()
 }
 
-func (run *activeExecution) reportedModel() string {
+func (run *activeExecution) reportedSelection() (string, string) {
 	if run == nil {
-		return ""
+		return "", ""
 	}
 	run.mu.Lock()
 	model := run.modelReported
+	effort := run.effortReported
 	run.mu.Unlock()
-	return model
+	return model, effort
 }
 
 func (run *activeExecution) cancellationRequested() bool {
@@ -306,8 +312,8 @@ func (run *activeExecution) retireTurn(store *jobstore.Store, outcome turnOutcom
 		}
 		run.controlMu.Unlock()
 		outcome.diagnostics = append(outcome.diagnostics, run.takeSteerDiagnostics()...)
-		if strings.TrimSpace(outcome.modelReported) != "" {
-			if err := store.RecordModelReported(run.jobID, outcome.modelReported); err != nil && !errors.Is(err, jobstore.ErrTerminal) {
+		if strings.TrimSpace(outcome.modelReported) != "" || strings.TrimSpace(outcome.effortReported) != "" {
+			if err := store.RecordObservedSelection(run.jobID, outcome.modelReported, outcome.effortReported); err != nil && !errors.Is(err, jobstore.ErrTerminal) {
 				outcome.diagnostics = append(outcome.diagnostics, "record reported model: "+err.Error())
 			}
 		}
@@ -720,11 +726,19 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassBackendUnavailable, fmt.Errorf("backend %q is unavailable", record.Backend), nil)
 		return
 	}
+	requestedModel := record.Model
+	requestedEffort := record.Effort
+	if defaults := s.backendDefaults[record.Backend]; defaults.Model != "" && requestedModel == "" {
+		requestedModel = defaults.Model
+	}
+	if defaults := s.backendDefaults[record.Backend]; defaults.Effort != "" && requestedEffort == "" {
+		requestedEffort = defaults.Effort
+	}
 	opts := engine.SessionOpts{
 		CWD:     record.CWD,
 		Write:   record.Write,
-		Model:   record.Model,
-		Effort:  record.Effort,
+		Model:   requestedModel,
+		Effort:  requestedEffort,
 		Timeout: timeout,
 	}
 	var (
@@ -897,7 +911,7 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		}
 		diagnostics = appendItemSidecarDiagnostics(diagnostics, itemWriter)
 		outcome := run.retireTurn(store, turnOutcome{err: err, cleanup: cleanup, diagnostics: diagnostics})
-		s.finishTurnError(store, record, jobCtx, outcome.err, outcome.cleanup, outcome.diagnostics)
+		s.finishTurnError(store, record, jobCtx, outcome.err, outcome.cleanup, outcome.diagnostics, outcome.backendSessionID)
 		return
 	}
 
@@ -910,23 +924,23 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 
 	if errors.Is(outcome.err, context.DeadlineExceeded) || outcome.timedOut {
 		outcome.diagnostics = appendItemSidecarDiagnostics(outcome.diagnostics, itemWriter)
-		s.recordExecutionFailureWithSessionID(store, record, outcome.cleanup, protocol.FailureClassTimeout, context.DeadlineExceeded, outcome.diagnostics, outcome.backendSessionID)
+		s.recordExecutionFailureWithDetails(store, record, outcome.cleanup, protocol.FailureClassTimeout, context.DeadlineExceeded, outcome.diagnostics, outcome.backendSessionID, "turn")
 		return
 	}
 	if errors.Is(outcome.err, context.Canceled) || outcome.interrupted {
 		_, _, claimErr := run.claimStatus()
 		if claimErr != nil {
 			outcome.diagnostics = appendItemSidecarDiagnostics(outcome.diagnostics, itemWriter)
-			s.recordExecutionFailureWithSessionID(store, record, outcome.cleanup, protocol.FailureClassInternal, claimErr, outcome.diagnostics, outcome.backendSessionID)
+			s.recordExecutionFailureWithDetails(store, record, outcome.cleanup, protocol.FailureClassInternal, claimErr, outcome.diagnostics, outcome.backendSessionID, "turn")
 			return
 		}
 		outcome.diagnostics = appendItemSidecarDiagnostics(outcome.diagnostics, itemWriter)
-		s.recordExecutionFailureWithSessionID(store, record, outcome.cleanup, protocol.FailureClassInterrupted, outcome.err, outcome.diagnostics, outcome.backendSessionID)
+		s.recordExecutionFailureWithDetails(store, record, outcome.cleanup, protocol.FailureClassInterrupted, outcome.err, outcome.diagnostics, outcome.backendSessionID, "turn")
 		return
 	}
 	if outcome.err != nil {
 		outcome.diagnostics = appendItemSidecarDiagnostics(outcome.diagnostics, itemWriter)
-		s.recordExecutionFailureWithSessionID(store, record, outcome.cleanup, classifyExecutionFailure(outcome.err), outcome.err, outcome.diagnostics, outcome.backendSessionID)
+		s.recordExecutionFailureWithDetails(store, record, outcome.cleanup, classifyExecutionFailure(outcome.err), outcome.err, outcome.diagnostics, outcome.backendSessionID, "turn")
 		return
 	}
 	text, backendSessionID, contract, cleanup, diagnostics := s.evaluateOutputSchema(store, record, run, session, jobCtx, timeout, spec, logPaths, items, outcome.text, outcome.backendSessionID, outcome.cleanup, outcome.diagnostics)
@@ -1168,16 +1182,16 @@ func (s *Server) finishStartError(store *jobstore.Store, record jobstore.Record,
 	s.recordExecutionFailure(store, record, protocol.CleanupClean, classifyStartFailure(err), err, nil)
 }
 
-func (s *Server) finishTurnError(store *jobstore.Store, record jobstore.Record, ctx context.Context, err error, cleanup protocol.Cleanup, diagnostics []string) {
+func (s *Server) finishTurnError(store *jobstore.Store, record jobstore.Record, ctx context.Context, err error, cleanup protocol.Cleanup, diagnostics []string, backendSessionID string) {
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		s.recordExecutionFailure(store, record, cleanup, protocol.FailureClassTimeout, context.DeadlineExceeded, diagnostics)
+		s.recordExecutionFailureWithDetails(store, record, cleanup, protocol.FailureClassTimeout, context.DeadlineExceeded, diagnostics, backendSessionID, "turn")
 		return
 	}
 	if errors.Is(ctx.Err(), context.Canceled) {
-		s.recordExecutionFailure(store, record, cleanup, protocol.FailureClassInterrupted, ctx.Err(), diagnostics)
+		s.recordExecutionFailureWithDetails(store, record, cleanup, protocol.FailureClassInterrupted, ctx.Err(), diagnostics, backendSessionID, "turn")
 		return
 	}
-	s.recordExecutionFailure(store, record, cleanup, classifyExecutionFailure(err), err, diagnostics)
+	s.recordExecutionFailureWithDetails(store, record, cleanup, classifyExecutionFailure(err), err, diagnostics, backendSessionID, "turn")
 }
 
 func (s *Server) finishContextStop(store *jobstore.Store, record jobstore.Record, err error, cleanup protocol.Cleanup, diagnostics []string) {
@@ -1189,13 +1203,40 @@ func (s *Server) finishContextStop(store *jobstore.Store, record jobstore.Record
 }
 
 func classifyStartFailure(err error) protocol.FailureClass {
+	if class, ok := providerFailureClass(err); ok {
+		return class
+	}
 	if errors.Is(err, engine.ErrProviderOverloaded) {
 		return protocol.FailureClassProviderOverloaded
 	}
 	return protocol.FailureClassBackendUnavailable
 }
 
+func providerFailureClass(err error) (protocol.FailureClass, bool) {
+	var providerFailure *engine.ProviderFailureError
+	if !errors.As(err, &providerFailure) || providerFailure == nil {
+		return "", false
+	}
+	switch strings.ToLower(strings.TrimSpace(providerFailure.Evidence.Class)) {
+	case "usage_limit":
+		return protocol.FailureClassUsageLimit, true
+	case "authentication":
+		return protocol.FailureClassAuthentication, true
+	case "provider_overloaded":
+		return protocol.FailureClassProviderOverloaded, true
+	case "model_unavailable":
+		return protocol.FailureClassModelUnavailable, true
+	case "content_policy":
+		return protocol.FailureClassContentPolicy, true
+	default:
+		return "", false
+	}
+}
+
 func classifyExecutionFailure(err error) protocol.FailureClass {
+	if class, ok := providerFailureClass(err); ok {
+		return class
+	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return protocol.FailureClassTimeout
 	}
@@ -1212,6 +1253,7 @@ type turnOutcome struct {
 	text             string
 	backendSessionID string
 	modelReported    string
+	effortReported   string
 	err              error
 	timedOut         bool
 	interrupted      bool
@@ -1281,10 +1323,14 @@ func absorbTurnEvent(run *activeExecution, outcome *turnOutcome, assistant *stri
 	switch event.Type {
 	case engine.EventModelReported:
 		model := strings.TrimSpace(event.ModelReported)
-		if outcome.modelReported == "" {
+		if model != "" {
 			outcome.modelReported = model
 		}
-		run.noteModelReported(model)
+		effort := strings.TrimSpace(event.EffortReported)
+		if effort != "" {
+			outcome.effortReported = effort
+		}
+		run.noteModelReported(model, effort)
 	case engine.EventAgentText:
 		assistant.WriteString(rawText)
 	case engine.EventResultMessage:
@@ -1356,7 +1402,9 @@ func (s *Server) recordExecutionCompletion(store *jobstore.Store, record jobstor
 	if err != nil {
 		// Result persistence is mandatory for an authoritative completion. Keep
 		// the provider session and partial transcript available as a failed job.
-		s.recordExecutionFailureWithSessionID(store, record, cleanup, protocol.FailureClassStorage, fmt.Errorf("persist final result artifact: %w", err), diagnostics, backendSessionID)
+		const prefix = "persist final result artifact: "
+		cause := errors.New(prefix + boundedFailureSuffix(err.Error(), engine.FailureReasonMaxRunes-len([]rune(prefix))))
+		s.recordExecutionFailureWithDetails(store, record, cleanup, protocol.FailureClassStorage, cause, diagnostics, backendSessionID, "finalize")
 		return
 	}
 	resultText := info.Text
@@ -1381,12 +1429,24 @@ func (s *Server) recordExecutionCompletion(store *jobstore.Store, record jobstor
 }
 
 func (s *Server) recordExecutionFailure(store *jobstore.Store, record jobstore.Record, cleanup protocol.Cleanup, class protocol.FailureClass, cause error, diagnostics []string) {
-	s.recordExecutionFailureWithSessionID(store, record, cleanup, class, cause, diagnostics, "")
+	s.recordExecutionFailureWithDetails(store, record, cleanup, class, cause, diagnostics, "", "startup")
 }
 
-func (s *Server) recordExecutionFailureWithSessionID(store *jobstore.Store, record jobstore.Record, cleanup protocol.Cleanup, class protocol.FailureClass, cause error, diagnostics []string, backendSessionID string) {
+func (s *Server) recordExecutionFailureWithDetails(store *jobstore.Store, record jobstore.Record, cleanup protocol.Cleanup, class protocol.FailureClass, cause error, diagnostics []string, backendSessionID, stage string) {
 	if !class.Valid() {
 		class = protocol.FailureClassInternal
+	}
+	var evidence *engine.ProviderFailureEvidence
+	var providerFailure *engine.ProviderFailureError
+	if errors.As(cause, &providerFailure) && providerFailure != nil {
+		copy := providerFailure.Evidence
+		copy.Code = boundProviderValue(copy.Code, 128)
+		copy.Message = boundProviderValue(copy.Message, 512)
+		if copy.RetryAfter != nil {
+			retryAfter := copy.RetryAfter.UTC()
+			copy.RetryAfter = &retryAfter
+		}
+		evidence = &copy
 	}
 	s.markTerminal(store, record.JobID, jobstore.TerminalUpdate{
 		State:            protocol.PublicStateFailed,
@@ -1394,9 +1454,51 @@ func (s *Server) recordExecutionFailureWithSessionID(store *jobstore.Store, reco
 		BackendSessionID: backendSessionID,
 		FailureClass:     class,
 		FailureReason:    executionFailureReason(cause),
-		Diagnostics:      appendRecordDiagnostics(record.Diagnostics, diagnostics),
-		FinishedAt:       time.Now().UTC(),
+		FailureProviderCode: func() string {
+			if evidence == nil {
+				return ""
+			}
+			return evidence.Code
+		}(),
+		FailureProviderMessage: func() string {
+			if evidence == nil {
+				return ""
+			}
+			return evidence.Message
+		}(),
+		FailureStage: stage,
+		FailureRetryAfter: func() *time.Time {
+			if evidence == nil {
+				return nil
+			}
+			return evidence.RetryAfter
+		}(),
+		CancellationReason: cancellationReasonFor(class, cause),
+		Diagnostics:        appendRecordDiagnostics(record.Diagnostics, diagnostics),
+		FinishedAt:         time.Now().UTC(),
 	})
+}
+
+func cancellationReasonFor(class protocol.FailureClass, cause error) protocol.CancellationReason {
+	if class == protocol.FailureClassTimeout || errors.Is(cause, context.DeadlineExceeded) {
+		return protocol.CancellationReasonDeadline
+	}
+	if errors.Is(cause, engine.ErrTurnInterrupted) {
+		return protocol.CancellationReasonProviderInterruption
+	}
+	if errors.Is(cause, context.Canceled) {
+		return protocol.CancellationReasonDaemonShutdown
+	}
+	return ""
+}
+
+func boundProviderValue(value string, maxRunes int) string {
+	value = strings.TrimSpace(value)
+	runes := []rune(value)
+	if len(runes) > maxRunes {
+		return string(runes[:maxRunes-3]) + "..."
+	}
+	return value
 }
 
 func (s *Server) markTerminal(store *jobstore.Store, jobID string, terminal jobstore.TerminalUpdate) {
@@ -1526,6 +1628,14 @@ func executionFailureReason(err error) string {
 	}
 	runes := []rune(value)
 	return string(runes[:maxRunes-3]) + "..."
+}
+
+func boundedFailureSuffix(value string, maxRunes int) string {
+	runes := []rune(strings.TrimSpace(value))
+	if len(runes) <= maxRunes {
+		return string(runes)
+	}
+	return "..." + string(runes[len(runes)-(maxRunes-3):])
 }
 
 func spillAuthoritativeResult(record jobstore.Record, raw []byte) (engine.ResultInfo, error) {

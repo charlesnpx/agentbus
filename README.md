@@ -24,6 +24,7 @@ state-root break for this release, are in
 ~~~text
 agentbus version [--json]
 agentbus --help
+agentbus backends [--json]
 agentbus serve [--foreground] [--max-jobs <n>] [--max-jobs-per-backend <n>] [--max-queued <n>] [--prune-interval 24h]
 agentbus status [--job <id>] [--tag <key=value>] [--state <state>] [--workspace-key <key>] [--limit <n>] [--before <cursor> | --all] [--json]
 agentbus transcript --job <id> [--follow] [--kind <kind>] [--since <timestamp>] [--since-ordinal <n>] [--last <n>] [--limit <n>] [--json]
@@ -139,6 +140,47 @@ or no filesystem boundary.
 `configure-codex-sandbox` adds Agentbus's state and cache roots to
 `$CODEX_HOME/config.toml` (or `~/.codex/config.toml`), preserving existing TOML
 comments and formatting. Repeat `--writable-root` to add another absolute root.
+
+`agentbus backends` calls the read-only `backend.inspect` method. It reports
+each configured backend's resolved executable path, version, and configured
+default model/effort. JSON entries use `backend`, `executablePath`, `version`,
+`defaultModel`, `defaultEffort`, and `error` when applicable. Each version
+probe is one bounded `--version` call per
+executable path and modification time for the daemon's lifetime; a failed
+backend is reported in its own entry. It does not query accounts, billing, or
+model catalogues. Use `--json` for the protocol response shape.
+
+The daemon accepts intentional per-backend defaults through
+`AGENTBUS_CODEX_DEFAULT_MODEL`, `AGENTBUS_CODEX_DEFAULT_EFFORT`,
+`AGENTBUS_CLAUDE_DEFAULT_MODEL`, `AGENTBUS_CLAUDE_DEFAULT_EFFORT`,
+`AGENTBUS_CURSOR_DEFAULT_MODEL`, and `AGENTBUS_CURSOR_DEFAULT_EFFORT`. An
+explicit TaskSpec model or effort takes precedence. `modelRequested` and
+`effortRequested` in job.get record only values submitted in the TaskSpec, so
+they are omitted when the daemon supplied a default. `modelReported` and
+`effortReported` contain the latest values the provider reported; they are not
+filled from the request. **Requested is not executed**: provider telemetry is
+the evidence of what was observed, and it may be absent.
+
+Detailed job.get responses and `agentbus status --job <id>` expose `deadline`
+and `remainingMs` for running jobs with a finite timeout, plus
+`resumable: {eligible, reason}` derived from the existing session and retention
+rules. **Eligible is not guaranteed**: the provider may still reject a resume.
+`cancellationReason` records `operator`, `deadline`, `daemon_shutdown`, or
+`provider_interruption` independently of the existing terminal state.
+
+Failed job records keep their existing `failure.class` and `failure.reason` and
+may add `providerCode`, bounded `providerMessage`, `stage`, and absolute
+`retryAfter`. Current stages are `startup`, `turn`, and `finalize`. The failure
+classes include `usage_limit` and `authentication`; Claude stream-json and
+Codex app-server provide these only when their parsed provider error contains
+a distinguishable signal. Cursor ACP preserves structured JSON-RPC error code
+and message, but does not classify generic errors as usage or authentication
+failures. Existing `provider_overloaded`, `model_unavailable`, and
+`content_policy` classes remain. A transient failure may leave partial
+workspace edits, so replay is the caller's decision and Agentbus does not
+retry automatically. The `storage` class identifies failed result or terminal
+record persistence. See [docs/protocol.md](docs/protocol.md) for field shapes,
+provider signals, and the full method contract.
 
 ## Packages
 

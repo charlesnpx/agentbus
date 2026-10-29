@@ -14,6 +14,7 @@ import (
 // Config is the version-3 service configuration. agentbusserve owns only the
 // foreground-process/readiness bridge; service owns daemon behavior.
 type Config = service.Config
+type BackendDefaults = service.BackendDefaults
 
 var ErrShutdownDeadlineExceeded = service.ErrShutdownDeadlineExceeded
 
