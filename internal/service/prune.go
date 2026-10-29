@@ -175,7 +175,7 @@ func (s *Server) pruneArtifactRecords(store *jobstore.Store, root string, record
 				Reason: "open owned log directory: " + logsErr.Error(),
 			})
 		}
-		if record.Backend == "codex" && record.Write {
+		if record.Backend == "codex" && (record.Write || recordUsesVerify(record)) {
 			s.pruneJobCodexArtifacts(root, record, dryRun, &result)
 		}
 	}

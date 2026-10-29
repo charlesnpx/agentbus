@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/internal/jobstore"
@@ -467,12 +468,52 @@ func TestVerifyLocalIPCCreationFollowsFrozenCopy(t *testing.T) {
 func TestPruneReclaimsLeftoverVerifySourceCopy(t *testing.T) {
 	server := newTestServer(t, t.TempDir(), Config{})
 	cwd := t.TempDir()
+	canonicalCWD, err := engine.CanonicalWorkspace(cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := protocol.TaskSpec{Backend: "codex", CWD: canonicalCWD, Prompt: "prune verify source", Verify: true}
+	taskSpec, err := json.Marshal(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspaceKey := engine.WorkspaceKey(canonicalCWD)
+	const requestID = "prune_verify_source"
+	record, _, err := store.SubmitTx(jobstore.RequestKey{WorkspaceKey: workspaceKey, RequestID: requestID}, taskSpec, func(id string) (jobstore.Record, error) {
+		return jobstore.Record{
+			JobID:        id,
+			WorkspaceKey: workspaceKey,
+			RequestID:    requestID,
+			Backend:      spec.Backend,
+			CWD:          canonicalCWD,
+			Write:        false,
+			Cleanup:      protocol.CleanupClean,
+		}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	finished := time.Now().UTC().Add(-2 * time.Hour)
+	record, err = store.MarkTerminal(record.JobID, jobstore.TerminalUpdate{
+		State:      protocol.PublicStateCompleted,
+		Cleanup:    protocol.CleanupClean,
+		FinishedAt: finished,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Write || record.RetainSession || record.Cleanup != protocol.CleanupClean || record.State != protocol.PublicStateCompleted || record.FinishedAt == nil {
+		t.Fatalf("Verify prune record = %+v, want completed clean Verify with Write=false and no retained session", record)
+	}
 	layout, err := engine.LayoutForWorkspace(server.stateRoot, cwd)
 	if err != nil {
 		t.Fatal(err)
 	}
-	const jobID = "job_prune_verify_src"
-	home, err := createManagedCodexHome(layout, jobID)
+	home, err := createManagedCodexHome(layout, record.JobID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -488,8 +529,19 @@ func TestPruneReclaimsLeftoverVerifySourceCopy(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var result protocol.ArtifactsPruneResult
-	server.pruneJobCodexArtifacts(server.stateRoot, jobstore.Record{JobID: jobID, CWD: layout.Workspace}, false, &result)
+	dryRun := false
+	outcome := server.handleArtifactsPrune(mustJSON(t, protocol.ArtifactsPruneParams{
+		DryRun:              &dryRun,
+		SuccessfulOlderThan: "1h",
+		FailedOlderThan:     "1h",
+	}))
+	if outcome.err != nil {
+		t.Fatalf("public prune request error: %+v", outcome.err)
+	}
+	result, ok := outcome.result.(protocol.ArtifactsPruneResult)
+	if !ok {
+		t.Fatalf("public prune result type = %T", outcome.result)
+	}
 	found := false
 	for _, item := range result.Removed {
 		if item.Kind == "src" {
