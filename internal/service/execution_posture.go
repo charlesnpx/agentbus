@@ -31,7 +31,7 @@ func resolveModuleCache() string {
 	return strings.TrimSpace(string(output))
 }
 
-func executionPosture(backend string, write bool, scratch string, caches map[string]string) protocol.ExecutionPosture {
+func executionPosture(backend string, write, localIPC, codexSandboxed bool, scratch string, caches map[string]string) protocol.ExecutionPosture {
 	intent := "inspect"
 	if write {
 		intent = "edit"
@@ -42,15 +42,28 @@ func executionPosture(backend string, write bool, scratch string, caches map[str
 		SourceWritable: write,
 		Scratch:        scratch,
 		Caches:         caches,
+		Shell:          "unenforced",
 		Network:        "unenforced",
+		LocalIPC:       "unenforced",
 		GitMetadata:    "unenforced",
 		Enforcement:    "none",
 	}
 	switch backend {
 	case "codex":
-		posture.Enforcement = "os-sandbox"
-		posture.Network = "denied"
-		posture.GitMetadata = "read-only"
+		if codexSandboxed {
+			posture.Enforcement = "os-sandbox"
+			posture.Shell = "sandboxed"
+			posture.Network = "denied"
+			posture.LocalIPC = "denied"
+			if localIPC {
+				posture.LocalIPC = "private-dir"
+			}
+			posture.GitMetadata = "read-only"
+		} else {
+			posture.Network = "unenforced"
+			posture.LocalIPC = "unenforced"
+			posture.GitMetadata = "writable"
+		}
 	case "cursor":
 		posture.Enforcement = "agent-permissions"
 		if write {
@@ -61,6 +74,8 @@ func executionPosture(backend string, write bool, scratch string, caches map[str
 	case "claude":
 		if write {
 			posture.GitMetadata = "writable"
+		} else {
+			posture.Shell = "restricted"
 		}
 	}
 	return posture

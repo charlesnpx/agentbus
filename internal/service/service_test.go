@@ -833,14 +833,14 @@ func TestJobSubmitRejectsUnknownInputMode(t *testing.T) {
 	}
 }
 
-func TestOmittedInputModePreservesBaseTaskSpecHash(t *testing.T) {
+func TestOmittedInputModeAndLocalIPCPreserveBaseTaskSpecHash(t *testing.T) {
 	raw := json.RawMessage(`{"workspaceKey":"workspace-omitted-mode","requestId":"request-omitted-mode","taskSpec":{"backend":"codex","cwd":"/workspace","prompt":"do work","write":true}}`)
 	input, err := parseJobSubmitInput(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
 	got := sha256.Sum256(input.canonicalTaskSpec)
-	// Golden from the base TaskSpec wire shape, which had no inputMode field.
+	// Golden from the base TaskSpec wire shape, which had neither optional field.
 	const want = "7a22b85c1404f61b27ea2df61765d20cef408966134b4a5d547f164f6f9d3d97"
 	if gotHex := hex.EncodeToString(got[:]); gotHex != want {
 		t.Fatalf("omitted inputMode request hash = %s, want base golden %s; taskSpec=%s", gotHex, want, input.canonicalTaskSpec)

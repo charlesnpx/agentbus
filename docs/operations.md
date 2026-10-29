@@ -87,6 +87,14 @@ root outside the submitted workspace, and Agentbus does not weaken those
 profiles to add one. Codex may still receive the resolved host `GOMODCACHE` for
 reads.
 
+Codex write jobs requesting `localIPC` use a short, daemon-created private
+directory under the operating-system temp directory as `TMPDIR`. The Codex
+profile grants that directory filesystem writes and Unix socket binding; the
+other cache variables remain under managed scratch. Agentbus removes the
+private temp directory when the job reaches a terminal state and during restart
+recovery. If its resolved path exceeds 80 bytes, the job fails before launch
+with `backend_unavailable`.
+
 Codex jobs use the daemon's effective Go module cache for reads. Agentbus
 resolves `GOMODCACHE` once at daemon startup, using the daemon environment first
 and otherwise `go env GOMODCACHE` with a two-second timeout. If neither gives a
@@ -189,15 +197,22 @@ includes inline result text when the record has it.
 
 The full record includes an `execution` object after the job starts. It records
 `intent` (`inspect` or `edit`), `sourceWritable`, `scratch`, a cache-path map,
-`network`, `gitMetadata`, and `enforcement`. These are descriptive values, not
-a capability negotiation. `sourceWritable` reports the selected inspect/edit
-mode; `enforcement` says whether the backend provides an OS sandbox, agent
-permissions, or no filesystem boundary. Codex uses OS sandbox enforcement and
-denies job network access. Cursor uses agent-mode permissions, which do not
-sandbox filesystem or network access at the OS level. Claude has no filesystem
-or network sandbox; read-only tool permissions do not establish filesystem
-containment. The execution object is a start-time snapshot. This unit has no
-`verify` intent.
+`shell`, `localIPC`, `network`, `gitMetadata`, and `enforcement`. These are
+descriptive values, not a capability negotiation. `sourceWritable` reports the
+selected inspect/edit mode; `enforcement` says whether the backend provides an
+OS sandbox, agent permissions, or no filesystem boundary. Codex uses OS sandbox
+enforcement and denies job network access. Agentbus checks that the Codex
+sandbox can start before launching app-server; failure is `backend_unavailable`
+and does not weaken the sandbox. Trusted full-access Codex writes have no shell
+or IPC confinement. `localIPC` is `denied` by default, `private-dir` for a Codex
+edit with the local IPC profile, and `unenforced` for trusted full-access Codex
+writes and Claude/Cursor.
+That profile allows Unix sockets under the private per-job temp directory and
+TCP loopback; the job shares loopback with the host. Cursor uses agent-mode permissions,
+which do not sandbox filesystem or network access at the OS level. Claude has
+no filesystem or network sandbox; its read-only shell tool list is restricted,
+while Claude write and Cursor shell execution are unenforced by Agentbus. The
+execution object is a start-time snapshot. This unit has no `verify` intent.
 
 agentbus result --job <id> reads the same full record. For a completed job it
 writes the authoritative result to standard output. It writes failure detail or

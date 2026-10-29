@@ -301,7 +301,7 @@ func TestStatusHumanProjectionIncludesOperatorFieldsAndNeverResultText(t *testin
 	record.Contract = &protocol.ContractResult{Evaluated: true, Compliant: false}
 	record.LogPaths = &protocol.LogPathsWire{Stdout: "/logs/out", Stderr: "/logs/err"}
 	record.Execution = &protocol.ExecutionPosture{
-		Intent: "inspect", Network: "denied", GitMetadata: "read-only", Enforcement: "os-sandbox",
+		Intent: "inspect", Shell: "sandboxed", Network: "denied", LocalIPC: "denied", GitMetadata: "read-only", Enforcement: "os-sandbox",
 	}
 	record.Steers = []protocol.SteerSummaryWire{{
 		MessageID: "message-1", Status: protocol.SteerStatusDelivered,
@@ -325,7 +325,7 @@ func TestStatusHumanProjectionIncludesOperatorFieldsAndNeverResultText(t *testin
 		"failure.class=backend_error failure.reason=provider stopped",
 		"contract.evaluated=true contract.compliant=false",
 		"logPaths.stdout=/logs/out logPaths.stderr=/logs/err",
-		`execution={"intent":"inspect","sourceWritable":false,"network":"denied","gitMetadata":"read-only","enforcement":"os-sandbox"}`,
+		`execution={"intent":"inspect","sourceWritable":false,"shell":"sandboxed","network":"denied","localIPC":"denied","gitMetadata":"read-only","enforcement":"os-sandbox"}`,
 		"steer.messageId=message-1 status=delivered mechanism=native time=2026-01-02T03:07:05Z",
 	} {
 		if !strings.Contains(stdout, want) {

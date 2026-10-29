@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/charlesnpx/agentbus/engine"
@@ -19,6 +20,8 @@ import (
 const jobStoreFilename = "jobs.db"
 
 var errQueueFull = errors.New("agentbus submission queue is full")
+
+var localIPCGOOS = runtime.GOOS
 
 type jobSubmitInput struct {
 	key               jobstore.RequestKey
@@ -209,7 +212,7 @@ func parseJobSubmitInput(raw json.RawMessage) (jobSubmitInput, error) {
 	}
 	for name := range input.taskSpec {
 		switch name {
-		case "backend", "cwd", "write", "prompt", "inputMode", "resumeJobId", "retainSession", "model", "effort", "outputSchema", "tags", "timeoutMs":
+		case "backend", "cwd", "write", "prompt", "inputMode", "localIPC", "resumeJobId", "retainSession", "model", "effort", "outputSchema", "tags", "timeoutMs":
 		default:
 			return jobSubmitInput{}, fmt.Errorf("json: unknown field %q", name)
 		}
@@ -227,13 +230,16 @@ func decodeTaskSpec(raw json.RawMessage) (protocol.TaskSpec, error) {
 }
 
 func validateNewTaskSpec(spec protocol.TaskSpec, raw map[string]json.RawMessage) error {
+	if err := validateLocalIPCSpec(spec, localIPCGOOS); err != nil {
+		return err
+	}
 	for _, required := range []string{"backend", "cwd", "write", "prompt"} {
 		value, present := raw[required]
 		if !present || string(value) == "null" {
 			return fmt.Errorf("taskSpec missing required field %s", required)
 		}
 	}
-	for _, optional := range []string{"inputMode", "resumeJobId", "retainSession", "model", "effort", "outputSchema", "tags", "timeoutMs"} {
+	for _, optional := range []string{"inputMode", "localIPC", "resumeJobId", "retainSession", "model", "effort", "outputSchema", "tags", "timeoutMs"} {
 		value, present := raw[optional]
 		if present && string(value) == "null" {
 			return fmt.Errorf("taskSpec.%s cannot be null", optional)
@@ -258,6 +264,24 @@ func validateNewTaskSpec(spec protocol.TaskSpec, raw map[string]json.RawMessage)
 		// error matters here.
 		if _, err := schema.Validate("null", spec.OutputSchema); err != nil {
 			return fmt.Errorf("outputSchema: %w", err)
+		}
+	}
+	return nil
+}
+
+func validateLocalIPCSpec(spec protocol.TaskSpec, goos string) error {
+	if !spec.LocalIPC {
+		return nil
+	}
+	if !spec.Write {
+		return errors.New("taskSpec.localIPC requires write: true")
+	}
+	switch spec.Backend {
+	case "claude", "cursor":
+		return fmt.Errorf("taskSpec.localIPC is not supported by backend %q", spec.Backend)
+	case "codex":
+		if goos == "linux" {
+			return errors.New("taskSpec.localIPC is unsupported on Linux: Codex's Linux sandbox cannot grant Unix sockets (TCP loopback only)")
 		}
 	}
 	return nil
