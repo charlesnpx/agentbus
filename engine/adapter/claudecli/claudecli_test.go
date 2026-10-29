@@ -135,8 +135,8 @@ func TestClaudeInitializeOrderingAndTimeoutFailure(t *testing.T) {
 			t.Fatal(err)
 		}
 		got := collectEventsWithTimeout(t, events, 2*time.Second)
-		if !containsEvent(got, engine.EventResultMessage, "done") {
-			t.Fatalf("events = %#v, want result after interrupt control request", got)
+		if containsEventType(got, engine.EventResultMessage) {
+			t.Fatalf("events = %#v, explicit interrupt must not emit a result", got)
 		}
 	})
 
@@ -273,8 +273,8 @@ func TestClaudeSteerInterruptContinueKeepsOneLogicalTurn(t *testing.T) {
 			if !ok || len(request) != 1 {
 				t.Fatalf("interrupt request = %#v, want only subtype", interrupt["request"])
 			}
-			peer.respondControlSuccess(interrupt, map[string]any{})
 			peer.emitResult("interrupted", true, "discarded interrupted result")
+			peer.respondControlSuccess(interrupt, map[string]any{})
 			peer.expectUser(followup)
 		}
 		peer.emitResult("success", false, "resumed final")
@@ -317,6 +317,215 @@ func TestClaudeSteerInterruptContinueKeepsOneLogicalTurn(t *testing.T) {
 	}
 	if _, err := steerer.Steer(context.Background(), engine.SteerMessage{ID: "late", Text: "too late"}); !errors.Is(err, engine.ErrSteerNotActive) {
 		t.Fatalf("post-turn Steer error = %v, want ErrSteerNotActive", err)
+	}
+}
+
+func TestClaudeSteerSettledOutcomeWinsAfterStreamDone(t *testing.T) {
+	stream := &claudeStream{done: make(chan struct{})}
+	close(stream.done)
+	for _, name := range []string{"acknowledgement", "delivery"} {
+		t.Run(name, func(t *testing.T) {
+			outcome := make(chan error, 1)
+			outcome <- nil
+			err, settled := stream.outcomeAfterDone(outcome)
+			if !settled || err != nil {
+				t.Fatalf("outcomeAfterDone = (%v, %t), want recorded success", err, settled)
+			}
+		})
+	}
+	if err, settled := stream.outcomeAfterDone(make(chan error, 1)); settled || !errors.Is(err, engine.ErrSteerNotActive) {
+		t.Fatalf("unsettled outcomeAfterDone = (%v, %t), want ErrSteerNotActive", err, settled)
+	}
+}
+
+func TestClaudeSteerHandlesResultBeforeInterruptAcknowledgement(t *testing.T) {
+	t.Run("interrupted result is withheld when acknowledgement fails", func(t *testing.T) {
+		ready := make(chan struct{})
+		interruptSeen := make(chan struct{})
+		runner := newFakeClaudeRunner(t, func(t *testing.T, proc *fakeClaudeProcess, _ command.ExecSpec) {
+			peer := newClaudePeer(t, proc)
+			peer.handshake()
+			peer.expectUser("initial prompt")
+			close(ready)
+			interrupt := peer.expectControlRequest("interrupt")
+			close(interruptSeen)
+			peer.emitResult("interrupted", true, "internal interruption")
+			peer.write(map[string]any{
+				"type": "control_response",
+				"response": map[string]any{
+					"subtype":    "error",
+					"request_id": firstString(interrupt, "request_id"),
+					"error":      map[string]any{"message": "interrupt rejected"},
+				},
+			})
+			peer.expectNoClientFrame(2 * time.Second)
+		})
+		session := startFakeClaudeSession(t, engine.SessionOpts{})
+		events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "initial prompt"}, runner)
+		if err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-ready:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for initial Claude user message")
+		}
+		steerer := requireClaudeSteerer(t, session)
+		steerDone := make(chan error, 1)
+		go func() {
+			_, err := steerer.Steer(context.Background(), engine.SteerMessage{ID: "held-error", Text: "follow up"})
+			steerDone <- err
+		}()
+		select {
+		case <-interruptSeen:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for interrupt request")
+		}
+		select {
+		case err := <-steerDone:
+			if err == nil || !strings.Contains(err.Error(), "interrupt rejected") {
+				t.Fatalf("Steer error = %v, want the interrupt acknowledgement failure", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("Steer did not finish after rejected interrupt acknowledgement")
+		}
+		got := collectEventsWithTimeout(t, events, 2*time.Second)
+		if containsEvent(got, engine.EventTerminalError, "internal interruption") || containsEventType(got, engine.EventResultMessage) {
+			t.Fatalf("events = %#v, internal interruption must not be exposed", got)
+		}
+		if !containsEvent(got, engine.EventTerminalError, "interrupt rejected") {
+			t.Fatalf("events = %#v, want the interrupt acknowledgement failure", got)
+		}
+	})
+
+	t.Run("normal success remains the logical result", func(t *testing.T) {
+		ready := make(chan struct{})
+		interruptSeen := make(chan struct{})
+		runner := newFakeClaudeRunner(t, func(t *testing.T, proc *fakeClaudeProcess, _ command.ExecSpec) {
+			peer := newClaudePeer(t, proc)
+			peer.handshake()
+			peer.expectUser("initial prompt")
+			close(ready)
+			peer.expectControlRequest("interrupt")
+			close(interruptSeen)
+			peer.emitResult("success", false, "original completion")
+			peer.expectNoClientFrame(2 * time.Second)
+		})
+		session := startFakeClaudeSession(t, engine.SessionOpts{})
+		events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "initial prompt"}, runner)
+		if err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-ready:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for initial Claude user message")
+		}
+		steerer := requireClaudeSteerer(t, session)
+		steerDone := make(chan error, 1)
+		go func() {
+			_, err := steerer.Steer(context.Background(), engine.SteerMessage{ID: "normal-result", Text: "must not be sent"})
+			steerDone <- err
+		}()
+		select {
+		case <-interruptSeen:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for interrupt request")
+		}
+		select {
+		case err := <-steerDone:
+			if err == nil || !strings.Contains(err.Error(), "not acknowledged") {
+				t.Fatalf("Steer error = %v, want not-delivered outcome", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("Steer did not settle after the original result")
+		}
+		got := collectEventsWithTimeout(t, events, 2*time.Second)
+		if resultText(got) != "original completion" || len(eventsOfType(got, engine.EventResultMessage)) != 1 {
+			t.Fatalf("events = %#v, want the original result only", got)
+		}
+		if containsEventType(got, engine.EventTerminalError) {
+			t.Fatalf("events = %#v, original success must not become a terminal error", got)
+		}
+	})
+}
+
+func TestClaudeExplicitInterruptAbandonsPendingSteer(t *testing.T) {
+	ready := make(chan struct{})
+	steerInterruptSeen := make(chan struct{})
+	nativeInterruptSeen := make(chan struct{})
+	runner := newFakeClaudeRunner(t, func(t *testing.T, proc *fakeClaudeProcess, _ command.ExecSpec) {
+		peer := newClaudePeer(t, proc)
+		peer.handshake()
+		peer.expectUser("initial prompt")
+		close(ready)
+		steerInterrupt := peer.expectControlRequest("interrupt")
+		close(steerInterruptSeen)
+		peer.expectControlRequest("interrupt")
+		close(nativeInterruptSeen)
+		peer.respondControlSuccess(steerInterrupt, map[string]any{})
+		peer.emitResult("interrupted", true, "interrupted segment")
+		peer.expectNoClientFrame(2 * time.Second)
+	})
+	session := startFakeClaudeSession(t, engine.SessionOpts{})
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "initial prompt"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for initial Claude user message")
+	}
+	steerDone := make(chan error, 1)
+	steerer := requireClaudeSteerer(t, session)
+	go func() {
+		_, err := steerer.Steer(context.Background(), engine.SteerMessage{ID: "pending", Text: "must be dropped"})
+		steerDone <- err
+	}()
+	select {
+	case <-steerInterruptSeen:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for steer interrupt request")
+	}
+	native, ok := session.(interface {
+		NativeInterrupt(context.Context) (bool, error)
+	})
+	if !ok {
+		t.Fatal("session does not support NativeInterrupt")
+	}
+	nativeDone := make(chan error, 1)
+	go func() {
+		settled, err := native.NativeInterrupt(context.Background())
+		if err == nil && !settled {
+			err = errors.New("native interrupt returned unsettled")
+		}
+		nativeDone <- err
+	}()
+	select {
+	case <-nativeInterruptSeen:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for explicit interrupt request")
+	}
+	select {
+	case err := <-steerDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Steer error = %v, want cancellation", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("pending Steer did not settle after explicit interrupt")
+	}
+	select {
+	case err := <-nativeDone:
+		if err != nil {
+			t.Fatalf("NativeInterrupt: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("NativeInterrupt did not settle after turn retirement")
+	}
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	if containsEventType(got, engine.EventResultMessage) {
+		t.Fatalf("events = %#v, explicit cancellation must not emit a result", got)
 	}
 }
 

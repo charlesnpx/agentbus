@@ -36,6 +36,7 @@ type pendingSteer struct {
 	ctx       context.Context
 	ack       chan error
 	delivered chan error
+	result    map[string]any
 
 	acknowledged bool
 	abandoned    bool
@@ -50,6 +51,7 @@ type claudeStream struct {
 	lastProgress time.Time
 	mu           sync.Mutex
 	steer        *pendingSteer
+	canceled     bool
 	completed    bool
 	finished     bool
 	runErr       error
@@ -174,7 +176,13 @@ func (d *streamJSONDriver) Steer(ctx context.Context, conn *duplex.Conn, msg eng
 			return engine.SteerDelivery{}, err
 		}
 	case <-stream.done:
-		return engine.SteerDelivery{}, stream.finishedError()
+		if err, settled := stream.outcomeAfterDone(pending.ack); settled {
+			if err != nil {
+				return engine.SteerDelivery{}, err
+			}
+		} else {
+			return engine.SteerDelivery{}, err
+		}
 	case <-ackCtx.Done():
 		err := fmt.Errorf("claude interrupt was not acknowledged: %w", ackCtx.Err())
 		stream.abandonSteer(pending, err)
@@ -188,7 +196,14 @@ func (d *streamJSONDriver) Steer(ctx context.Context, conn *duplex.Conn, msg eng
 		}
 		return engine.SteerDelivery{Mechanism: engine.SteerMechanismInterruptContinue, Confirmed: true}, nil
 	case <-stream.done:
-		return engine.SteerDelivery{}, stream.finishedError()
+		if err, settled := stream.outcomeAfterDone(pending.delivered); settled {
+			if err != nil {
+				return engine.SteerDelivery{}, err
+			}
+			return engine.SteerDelivery{Mechanism: engine.SteerMechanismInterruptContinue, Confirmed: true}, nil
+		} else {
+			return engine.SteerDelivery{}, err
+		}
 	case <-ctx.Done():
 		err := ctx.Err()
 		stream.abandonSteer(pending, err)
@@ -224,6 +239,9 @@ func (d *streamJSONDriver) Interrupt(ctx context.Context, conn *duplex.Conn) err
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
+	}
+	if stream := d.activeStream(conn); stream != nil {
+		stream.markCanceled()
 	}
 	return conn.WriteJSON(map[string]any{
 		"type":       "control_request",
@@ -384,6 +402,27 @@ func (s *claudeStream) finishedError() error {
 	return engine.ErrSteerNotActive
 }
 
+func (s *claudeStream) outcomeAfterDone(outcome <-chan error) (error, bool) {
+	select {
+	case err := <-outcome:
+		return err, true
+	default:
+		return s.finishedError(), false
+	}
+}
+
+func (s *claudeStream) markCanceled() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.canceled = true
+	if pending := s.steer; pending != nil {
+		pending.abandoned = true
+		pending.failure = context.Canceled
+		notifySteer(pending.ack, context.Canceled)
+		notifySteer(pending.delivered, context.Canceled)
+	}
+}
+
 func notifySteer(ch chan error, err error) {
 	select {
 	case ch <- err:
@@ -391,32 +430,61 @@ func notifySteer(ch chan error, err error) {
 	}
 }
 
-func (s *claudeStream) handleSteerControlResponse(obj map[string]any) bool {
+func (s *claudeStream) handleSteerControlResponse(ctx context.Context, obj map[string]any) (bool, bool, error) {
 	if strings.ToLower(firstString(obj, "type")) != "control_response" {
-		return false
+		return false, false, nil
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	pending := s.steer
 	if pending == nil || !isControlResponseTo(obj, pending.requestID) {
-		return false
+		s.mu.Unlock()
+		return false, false, nil
 	}
 	if err := controlResponseError(obj); err != nil {
+		outcomeErr := err
+		if pending.abandoned && pending.failure != nil {
+			outcomeErr = pending.failure
+		}
+		heldResult := pending.result
 		s.steer = nil
-		notifySteer(pending.ack, err)
-		notifySteer(pending.delivered, err)
-		return true
+		if heldResult != nil {
+			s.completed = true
+		}
+		notifySteer(pending.ack, outcomeErr)
+		notifySteer(pending.delivered, outcomeErr)
+		s.mu.Unlock()
+		if heldResult == nil {
+			return true, false, nil
+		}
+		return true, true, outcomeErr
 	}
 	pending.acknowledged = true
 	if !pending.abandoned {
 		notifySteer(pending.ack, nil)
 	}
-	return true
+	heldResult := pending.result
+	pending.result = nil
+	s.mu.Unlock()
+	if heldResult == nil {
+		return true, false, nil
+	}
+	terminal, err := s.handleResult(ctx, heldResult)
+	return true, terminal, err
 }
 
 func (s *claudeStream) handleResult(ctx context.Context, obj map[string]any) (bool, error) {
 	s.mu.Lock()
 	pending := s.steer
+	if s.canceled {
+		s.steer = nil
+		s.completed = true
+		if pending != nil {
+			notifySteer(pending.ack, context.Canceled)
+			notifySteer(pending.delivered, context.Canceled)
+		}
+		s.mu.Unlock()
+		return false, context.Canceled
+	}
 	if pending == nil {
 		s.completed = true
 		s.mu.Unlock()
@@ -436,6 +504,11 @@ func (s *claudeStream) handleResult(ctx context.Context, obj map[string]any) (bo
 		return false, err
 	}
 	if !pending.acknowledged {
+		if !isClaudeSuccessResult(obj) {
+			pending.result = obj
+			s.mu.Unlock()
+			return false, nil
+		}
 		s.steer = nil
 		s.completed = true
 		err := errors.New("claude interrupt control request was not acknowledged")
@@ -472,6 +545,10 @@ func (s *claudeStream) handleResult(ctx context.Context, obj map[string]any) (bo
 	s.mu.Unlock()
 	notifySteer(pending.delivered, nil)
 	return false, nil
+}
+
+func isClaudeSuccessResult(obj map[string]any) bool {
+	return firstString(obj, "subtype") == "success" && !boolValue(obj["is_error"]) && !boolValue(obj["isError"])
 }
 
 func (s *claudeStream) nextFrame(ctx context.Context) (duplex.Frame, error) {
@@ -524,8 +601,8 @@ func (s *claudeStream) handleFrame(ctx context.Context, frame duplex.Frame, sess
 		_, err := s.handleControlRequest(ctx, obj)
 		return false, err
 	case "control_response":
-		s.handleSteerControlResponse(obj)
-		return false, nil
+		_, terminal, err := s.handleSteerControlResponse(ctx, obj)
+		return terminal, err
 	case "user":
 		s.emitToolResults(obj)
 		return false, nil
