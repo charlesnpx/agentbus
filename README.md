@@ -23,14 +23,55 @@ state-root break for this release, are in
 
 ~~~text
 agentbus version [--json]
+agentbus --help
 agentbus serve [--foreground]
-agentbus status [--job <id>] [--tag <key=value>] [--state <state>] [--workspace-key <key>] [--json]
-agentbus transcript --job <id> [--kind <kind>] [--since <timestamp>] [--since-ordinal <n>] [--last <n>] [--limit <n>] [--json]
-agentbus result --job <id> [--json]
+agentbus status [--job <id>] [--tag <key=value>] [--state <state>] [--workspace-key <key>] [--limit <n>] [--before <cursor> | --all] [--json]
+agentbus transcript --job <id> [--follow] [--kind <kind>] [--since <timestamp>] [--since-ordinal <n>] [--last <n>] [--limit <n>] [--json]
+agentbus result --job <id> [--wait [--wait-timeout <duration>]] [--json]
 agentbus cancel --job <id> [--json]
 agentbus steer --job <id> --request-id <messageId> --message-file <path|-> [--json]
 agentbus configure-codex-sandbox [--writable-root <absolute-path>]... [--json]
 ~~~
+
+Help exits successfully without starting or contacting the daemon. Use
+`agentbus -h`, `agentbus help`, or `agentbus status --help` for usage.
+
+Status without `--job` prints the 50 newest matching jobs. JSON output includes
+`truncated: true` and `nextCursor` when another page exists; text output prints
+the continuation cursor on stderr. Continue with that cursor, or request full
+history explicitly:
+
+~~~sh
+agentbus status --limit 50 --json
+agentbus status --limit 50 --before '<nextCursor>' --json
+agentbus status --all
+~~~
+
+`job.list` keeps its existing unbounded behavior for client callers that omit
+`limit`; the CLI sends a limit by default. `--all` explicitly omits that limit.
+
+`result --wait` observes the job with `job.get` until it becomes terminal or
+the observation timeout expires. The default timeout is 30m. Expiry prints the
+current record and exits 16; it does not cancel the job. Durations need explicit
+units: `2400` is ambiguous, so use `2400s` or `40m`.
+
+~~~sh
+agentbus result --job "$JOB_ID" --wait --wait-timeout 30m
+agentbus result --job "$JOB_ID" --wait --wait-timeout 2400s --json
+~~~
+
+`transcript --follow` pages by ordinal until the job is terminal and its
+transcript pages are drained. `--json` prints one JSON object per item followed
+by a summary object containing `gap`. Ctrl-C stops observation without
+cancelling the job.
+
+~~~sh
+agentbus transcript --job "$JOB_ID" --follow --kind message
+agentbus transcript --job "$JOB_ID" --follow --json
+~~~
+
+Singleton flags cannot be repeated (`--job a --job b` is a usage error).
+Repeatable filters such as `--tag` and `--state` keep accepting multiple values.
 
 Job submission uses the typed job.submit protocol method. There is no CLI submit
 command.
