@@ -80,6 +80,296 @@ func TestAppServerInitializeHandshakePrecedesTurnAndFailureIsTerminal(t *testing
 	})
 }
 
+func TestAppServerNativeSteerUsesTurnSteerAndKeepsOneLogicalTurn(t *testing.T) {
+	turnStarted := make(chan struct{})
+	runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+		peer := newAppServerPeer(t, proc)
+		peer.handshake()
+		thread := peer.expectRequest("thread/start")
+		peer.respond(thread, threadResult("thread-1"))
+		turn := peer.expectRequest("turn/start")
+		peer.respond(turn, turnResult("turn-1"))
+		close(turnStarted)
+		for _, text := range []string{"first follow-up", "second follow-up"} {
+			steer := peer.expectRequest("turn/steer")
+			assertCodexSteerRequest(t, steer, "thread-1", "turn-1", text)
+			peer.respond(steer, map[string]any{"turnId": "turn-1"})
+		}
+		peer.notify("item/agentMessage/delta", map[string]any{"threadId": "thread-1", "turnId": "turn-1", "itemId": "message-1", "delta": "final after steering"})
+		completed := completedParams("thread-1", "turn-1", "completed", "")
+		completed["last_agent_message"] = "final after steering"
+		peer.notify("turn/completed", completed)
+	})
+
+	session := startFakeCodexSession(t, engine.SessionOpts{})
+	steerer, ok := session.(engine.Steerer)
+	if !ok {
+		t.Fatal("Codex session does not implement engine.Steerer")
+	}
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForSignal(t, turnStarted, "turn/start response")
+	for _, message := range []engine.SteerMessage{
+		{ID: "message-1", Text: "first follow-up"},
+		{ID: "message-2", Text: "second follow-up"},
+	} {
+		delivery, err := steerer.Steer(context.Background(), message)
+		if err != nil {
+			t.Fatalf("Steer(%q): %v", message.Text, err)
+		}
+		if delivery.Mechanism != engine.SteerMechanismNative || !delivery.Confirmed {
+			t.Fatalf("Steer(%q) delivery = %#v, want confirmed native acknowledgement", message.Text, delivery)
+		}
+	}
+
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	if resultText(got) != "final after steering" {
+		t.Fatalf("final result = %q, want only the post-steer result", resultText(got))
+	}
+	results, finals := 0, 0
+	for _, event := range got {
+		if event.Type == engine.EventResultMessage {
+			results++
+		}
+		if event.Type == engine.EventTurnFinal {
+			finals++
+		}
+	}
+	if results != 1 || finals != 1 {
+		t.Fatalf("result events = %d, TurnFinal events = %d; want one each", results, finals)
+	}
+	if _, err := steerer.Steer(context.Background(), engine.SteerMessage{ID: "late", Text: "too late"}); !errors.Is(err, engine.ErrSteerNotActive) {
+		t.Fatalf("post-turn Steer error = %v, want ErrSteerNotActive", err)
+	}
+}
+
+func TestAppServerSteerWithoutAcknowledgementIsUnconfirmed(t *testing.T) {
+	turnStarted := make(chan struct{})
+	steerWritten := make(chan struct{})
+	finishProvider := make(chan struct{})
+	runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+		peer := newAppServerPeer(t, proc)
+		peer.handshake()
+		thread := peer.expectRequest("thread/start")
+		peer.respond(thread, threadResult("thread-1"))
+		turn := peer.expectRequest("turn/start")
+		peer.respond(turn, turnResult("turn-1"))
+		close(turnStarted)
+		steer := peer.expectRequest("turn/steer")
+		assertCodexSteerRequest(t, steer, "thread-1", "turn-1", "follow-up")
+		close(steerWritten)
+		<-finishProvider
+		completed := completedParams("thread-1", "turn-1", "completed", "")
+		completed["last_agent_message"] = "completed normally"
+		peer.notify("turn/completed", completed)
+	})
+
+	session := startFakeCodexSession(t, engine.SessionOpts{})
+	steerer := session.(engine.Steerer)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForSignal(t, turnStarted, "turn/start response")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	steerResult := make(chan struct {
+		delivery engine.SteerDelivery
+		err      error
+	}, 1)
+	go func() {
+		delivery, err := steerer.Steer(ctx, engine.SteerMessage{ID: "message-1", Text: "follow-up"})
+		steerResult <- struct {
+			delivery engine.SteerDelivery
+			err      error
+		}{delivery: delivery, err: err}
+	}()
+	select {
+	case <-steerWritten:
+	case <-time.After(2 * time.Second):
+		t.Fatal("provider did not receive turn/steer")
+	}
+	cancel()
+	select {
+	case result := <-steerResult:
+		if result.err != nil || result.delivery.Mechanism != engine.SteerMechanismNative || result.delivery.Confirmed {
+			t.Fatalf("missing-ack result = (%#v, %v), want unconfirmed native delivery without error", result.delivery, result.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Steer did not return after its context ended")
+	}
+	close(finishProvider)
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	if resultText(got) != "completed normally" {
+		t.Fatalf("turn result = %q, want normal completion after unconfirmed steer", resultText(got))
+	}
+}
+
+func TestAppServerSteerProviderErrorsAndCancellation(t *testing.T) {
+	t.Run("inactive turn and id mismatch map to ErrSteerNotActive", func(t *testing.T) {
+		for _, message := range []string{"turn is no longer active", "expectedTurnId mismatch"} {
+			t.Run(message, func(t *testing.T) {
+				turnStarted := make(chan struct{})
+				runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+					peer := newAppServerPeer(t, proc)
+					peer.handshake()
+					thread := peer.expectRequest("thread/start")
+					peer.respond(thread, threadResult("thread-1"))
+					turn := peer.expectRequest("turn/start")
+					peer.respond(turn, turnResult("turn-1"))
+					close(turnStarted)
+					steer := peer.expectRequest("turn/steer")
+					assertCodexSteerRequest(t, steer, "thread-1", "turn-1", "follow-up")
+					peer.respondError(steer, message)
+					peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
+				})
+				session := startFakeCodexSession(t, engine.SessionOpts{})
+				events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+				if err != nil {
+					t.Fatal(err)
+				}
+				waitForSignal(t, turnStarted, "turn/start response")
+				steerer := session.(engine.Steerer)
+				if _, err := steerer.Steer(context.Background(), engine.SteerMessage{ID: "message-1", Text: "follow-up"}); !errors.Is(err, engine.ErrSteerNotActive) {
+					t.Fatalf("Steer error = %v, want ErrSteerNotActive", err)
+				}
+				_ = collectEventsWithTimeout(t, events, 2*time.Second)
+			})
+		}
+	})
+
+	t.Run("job cancellation interrupts a pending native steer", func(t *testing.T) {
+		turnStarted := make(chan struct{})
+		steerWritten := make(chan struct{})
+		interruptWritten := make(chan struct{})
+		finishInterrupt := make(chan struct{})
+		runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+			peer := newAppServerPeer(t, proc)
+			peer.handshake()
+			thread := peer.expectRequest("thread/start")
+			peer.respond(thread, threadResult("thread-1"))
+			turn := peer.expectRequest("turn/start")
+			peer.respond(turn, turnResult("turn-1"))
+			close(turnStarted)
+			steer := peer.expectRequest("turn/steer")
+			assertCodexSteerRequest(t, steer, "thread-1", "turn-1", "follow-up")
+			close(steerWritten)
+			interrupt := peer.expectRequest("turn/interrupt")
+			assertParam(t, interrupt, "threadId", "thread-1")
+			assertParam(t, interrupt, "turnId", "turn-1")
+			close(interruptWritten)
+			<-finishInterrupt
+			peer.respond(interrupt, map[string]any{"turnId": "turn-1"})
+			peer.notify("turn/completed", completedParams("thread-1", "turn-1", "interrupted", ""))
+		})
+
+		session := startFakeCodexSession(t, engine.SessionOpts{})
+		steerer := session.(engine.Steerer)
+		turnCtx, cancelTurn := context.WithCancel(context.Background())
+		turner := session.(interface {
+			TurnWithRunner(context.Context, engine.TurnInput, command.Runner) (<-chan engine.Event, error)
+		})
+		events, err := turner.TurnWithRunner(turnCtx, engine.TurnInput{Prompt: "hello"}, runner)
+		if err != nil {
+			cancelTurn()
+			t.Fatal(err)
+		}
+		waitForSignal(t, turnStarted, "turn/start response")
+		steerResult := make(chan struct {
+			delivery engine.SteerDelivery
+			err      error
+		}, 1)
+		go func() {
+			delivery, err := steerer.Steer(context.Background(), engine.SteerMessage{ID: "message-1", Text: "follow-up"})
+			steerResult <- struct {
+				delivery engine.SteerDelivery
+				err      error
+			}{delivery: delivery, err: err}
+		}()
+		select {
+		case <-steerWritten:
+		case <-time.After(2 * time.Second):
+			cancelTurn()
+			t.Fatal("provider did not receive turn/steer")
+		}
+		interruptResult := make(chan error, 1)
+		go func() { interruptResult <- session.Interrupt(context.Background()) }()
+		select {
+		case <-interruptWritten:
+		case <-time.After(2 * time.Second):
+			cancelTurn()
+			t.Fatal("provider did not receive turn/interrupt")
+		}
+		cancelTurn()
+		close(finishInterrupt)
+		select {
+		case err := <-interruptResult:
+			if err != nil {
+				t.Fatalf("Interrupt: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("Interrupt did not settle after provider completion")
+		}
+		select {
+		case result := <-steerResult:
+			if result.err != nil || result.delivery.Mechanism != engine.SteerMechanismNative || result.delivery.Confirmed {
+				t.Fatalf("canceled pending steer = (%#v, %v), want unconfirmed native delivery without error", result.delivery, result.err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("pending Steer did not finish after turn cancellation")
+		}
+		got := collectEventsWithTimeout(t, events, 2*time.Second)
+		finals, results := 0, 0
+		for _, event := range got {
+			if event.Type == engine.EventTurnFinal {
+				finals++
+				if event.TurnFinal == nil || !event.TurnFinal.Canceled {
+					t.Fatalf("TurnFinal = %#v, want canceled job observation", event.TurnFinal)
+				}
+			}
+			if event.Type == engine.EventResultMessage {
+				results++
+			}
+		}
+		if finals != 1 || results != 0 {
+			t.Fatalf("TurnFinal count = %d, result count = %d; want one canceled final and no result", finals, results)
+		}
+	})
+}
+
+func assertCodexSteerRequest(t *testing.T, frame map[string]any, threadID, turnID, text string) {
+	t.Helper()
+	if len(frame) != 3 {
+		t.Fatalf("turn/steer frame = %#v, want only JSON-RPC id, method, params", frame)
+	}
+	params, ok := frame["params"].(map[string]any)
+	if !ok || len(params) != 3 {
+		t.Fatalf("turn/steer params = %#v, want threadId, expectedTurnId, input only", frame["params"])
+	}
+	if params["threadId"] != threadID || params["expectedTurnId"] != turnID {
+		t.Fatalf("turn/steer routing params = %#v, want threadId=%q expectedTurnId=%q", params, threadID, turnID)
+	}
+	input, ok := params["input"].([]any)
+	if !ok || len(input) != 1 {
+		t.Fatalf("turn/steer input = %#v, want one text input", params["input"])
+	}
+	textInput, ok := input[0].(map[string]any)
+	if !ok || len(textInput) != 2 || textInput["type"] != "text" || textInput["text"] != text {
+		t.Fatalf("turn/steer input item = %#v, want {type:text, text:%q}", input[0], text)
+	}
+}
+
+func waitForSignal(t *testing.T, signal <-chan struct{}, description string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for %s", description)
+	}
+}
+
 func TestAppServerOversizedTerminalFrameFailsWithTransportClass(t *testing.T) {
 	t.Setenv("AGENTBUS_BACKEND_JSON_LINE_BYTES", "512")
 	runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {

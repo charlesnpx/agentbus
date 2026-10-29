@@ -36,6 +36,13 @@ type activeAppServerTurn struct {
 	turnID             string
 	turnStartSent      bool
 	interruptRequested bool
+	turnIDReady        chan struct{}
+	turnDone           chan struct{}
+	turnIDReadyClosed  bool
+	turnDoneClosed     bool
+	completed          bool
+	finished           bool
+	steerResponses     map[string]chan map[string]any
 }
 
 func newAppServerDriver(binary string, writePolicy WritePolicy) *appServerDriver {
@@ -83,12 +90,15 @@ func (d *appServerDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resume
 	// item/completed notification. Flush on every return after turn/start begins,
 	// including transport errors and cancellation paths that bypass completion.
 	defer observer.flushPendingToolItems()
-	active := &activeAppServerTurn{threadID: threadID}
+	active := newActiveAppServerTurn(threadID)
 	// Register before issuing turn/start. writeTurnStart keeps this turn's lock
 	// through the successful write and marks it sent before an Interrupt can
 	// inspect it, so there is no post-write, pre-registration gap.
 	d.setActive(conn, active)
-	defer d.clearActive(conn, active)
+	defer func() {
+		active.finish()
+		d.clearActive(conn, active)
+	}()
 	turnResult, err := rpc.request(ctx, "turn/start", turnStartParams(threadID, opts, input, d.writePolicy), observer, active.writeTurnStart(conn))
 	if err != nil {
 		return threadID, err
@@ -98,7 +108,7 @@ func (d *appServerDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resume
 		return threadID, errors.New("codex app-server turn/start response missing turn id")
 	}
 
-	pendingThreadID, interruptPending := active.setTurnID(turnID)
+	pendingThreadID, interruptPending := active.setTurnID(turnID, observer.completion != nil)
 	// A completion observed before the turn/start response means the turn is
 	// already over, so a latched interrupt is deliberately not sent: the frame
 	// could not affect anything, and a write to an exiting provider would fail
@@ -124,13 +134,102 @@ func (d *appServerDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resume
 			continue
 		}
 		if isResponse(frame.Object) {
+			active.routeSteerResponse(frame.Object)
 			continue
+		}
+		method := firstString(frame.Object, "method", "type")
+		if method == "turn/completed" || method == "task_complete" {
+			active.markCompleted()
 		}
 		if observer.handle(frame) {
 			return finishTurnCompletion(threadID, active, observer)
 		}
 		rpc.handleNotification(frame)
 	}
+}
+
+func (d *appServerDriver) Steer(ctx context.Context, conn *duplex.Conn, message engine.SteerMessage) (engine.SteerDelivery, error) {
+	delivery := engine.SteerDelivery{Mechanism: engine.SteerMechanismNative}
+	active := d.activeTurn(conn)
+	if active == nil {
+		return engine.SteerDelivery{}, engine.ErrSteerNotActive
+	}
+	select {
+	case <-ctx.Done():
+		return delivery, nil
+	default:
+	}
+
+	threadID, turnID, err := active.awaitTurnID(ctx)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return delivery, nil
+		}
+		return engine.SteerDelivery{}, err
+	}
+	requestID := d.nextRequestID()
+	response, err := active.writeSteer(ctx, conn, requestID, threadID, turnID, message.Text)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return delivery, nil
+		}
+		return engine.SteerDelivery{}, err
+	}
+	defer active.removeSteerResponse(requestID, response)
+
+	for {
+		select {
+		case frame := <-response:
+			if ctx.Err() != nil {
+				return delivery, nil
+			}
+			if err := codexSteerResponseError(frame); err != nil {
+				return engine.SteerDelivery{}, err
+			}
+			delivery.Confirmed = true
+			return delivery, nil
+		case <-active.turnDone:
+			// Prefer an acknowledgement already read before the terminal frame.
+			select {
+			case frame := <-response:
+				if ctx.Err() != nil {
+					return delivery, nil
+				}
+				if err := codexSteerResponseError(frame); err != nil {
+					return engine.SteerDelivery{}, err
+				}
+				delivery.Confirmed = true
+				return delivery, nil
+			default:
+				return delivery, nil
+			}
+		case <-ctx.Done():
+			return delivery, nil
+		}
+	}
+}
+
+func codexSteerResponseError(frame map[string]any) error {
+	result, err := responseResult(frame)
+	if err != nil {
+		if codexSteerErrorMeansNotActive(err.Error()) {
+			return fmt.Errorf("codex app-server turn/steer: %w: %v", engine.ErrSteerNotActive, err)
+		}
+		return fmt.Errorf("codex app-server turn/steer: %w", err)
+	}
+	if _, ok := result.(map[string]any); !ok || extractTurnID(result) == "" {
+		return errors.New("codex app-server turn/steer response missing turn id")
+	}
+	return nil
+}
+
+func codexSteerErrorMeansNotActive(message string) bool {
+	message = strings.ToLower(message)
+	if strings.Contains(message, "no longer active") || strings.Contains(message, "no active turn") || strings.Contains(message, "turn is not active") || strings.Contains(message, "turn not active") {
+		return true
+	}
+	hasTurnID := strings.Contains(message, "turn id") || strings.Contains(message, "turnid")
+	return hasTurnID && (strings.Contains(message, "mismatch") || strings.Contains(message, "does not match") || strings.Contains(message, "doesn't match"))
 }
 
 func (d *appServerDriver) Interrupt(ctx context.Context, conn *duplex.Conn) error {
@@ -164,6 +263,113 @@ func (d *appServerDriver) sendInterrupt(conn *duplex.Conn, threadID, turnID stri
 	})
 }
 
+func newActiveAppServerTurn(threadID string) *activeAppServerTurn {
+	return &activeAppServerTurn{
+		threadID:       threadID,
+		turnIDReady:    make(chan struct{}),
+		turnDone:       make(chan struct{}),
+		steerResponses: make(map[string]chan map[string]any),
+	}
+}
+
+func (t *activeAppServerTurn) awaitTurnID(ctx context.Context) (threadID, turnID string, err error) {
+	select {
+	case <-t.turnIDReady:
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		if t.turnID == "" || t.completed || t.finished {
+			return "", "", engine.ErrSteerNotActive
+		}
+		return t.threadID, t.turnID, nil
+	case <-t.turnDone:
+		return "", "", engine.ErrSteerNotActive
+	case <-ctx.Done():
+		return "", "", ctx.Err()
+	}
+}
+
+func (t *activeAppServerTurn) writeSteer(ctx context.Context, conn *duplex.Conn, requestID, threadID, turnID, text string) (chan map[string]any, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if t.interruptRequested {
+		return nil, context.Canceled
+	}
+	if t.completed || t.finished || t.turnID == "" || t.turnID != turnID {
+		return nil, engine.ErrSteerNotActive
+	}
+	response := make(chan map[string]any, 1)
+	t.steerResponses[requestID] = response
+	request := map[string]any{
+		"id":     requestID,
+		"method": "turn/steer",
+		"params": map[string]any{
+			"threadId":       threadID,
+			"expectedTurnId": turnID,
+			"input": []any{
+				map[string]any{"type": "text", "text": text},
+			},
+		},
+	}
+	if err := conn.WriteJSON(request); err != nil {
+		delete(t.steerResponses, requestID)
+		return nil, fmt.Errorf("codex app-server turn/steer write: %w", err)
+	}
+	return response, nil
+}
+
+func (t *activeAppServerTurn) routeSteerResponse(frame map[string]any) {
+	requestID := requestIDKey(frame["id"])
+	t.mu.Lock()
+	response := t.steerResponses[requestID]
+	if response != nil {
+		delete(t.steerResponses, requestID)
+	}
+	t.mu.Unlock()
+	if response != nil {
+		response <- frame
+	}
+}
+
+func (t *activeAppServerTurn) removeSteerResponse(requestID string, response chan map[string]any) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.steerResponses[requestID] == response {
+		delete(t.steerResponses, requestID)
+	}
+}
+
+func (t *activeAppServerTurn) markCompleted() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.completed = true
+	t.closeTurnDoneLocked()
+}
+
+func (t *activeAppServerTurn) finish() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.finished = true
+	t.closeTurnIDReadyLocked()
+	t.closeTurnDoneLocked()
+}
+
+func (t *activeAppServerTurn) closeTurnIDReadyLocked() {
+	if !t.turnIDReadyClosed {
+		close(t.turnIDReady)
+		t.turnIDReadyClosed = true
+	}
+}
+
+func (t *activeAppServerTurn) closeTurnDoneLocked() {
+	if !t.turnDoneClosed {
+		close(t.turnDone)
+		t.turnDoneClosed = true
+	}
+}
+
 func (t *activeAppServerTurn) requestInterrupt() (threadID, turnID string, ready bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -189,10 +395,15 @@ func (t *activeAppServerTurn) writeTurnStart(conn *duplex.Conn) func(map[string]
 	}
 }
 
-func (t *activeAppServerTurn) setTurnID(turnID string) (threadID string, interruptPending bool) {
+func (t *activeAppServerTurn) setTurnID(turnID string, completed bool) (threadID string, interruptPending bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.turnID = turnID
+	if completed {
+		t.completed = true
+		t.closeTurnDoneLocked()
+	}
+	t.closeTurnIDReadyLocked()
 	return t.threadID, t.interruptRequested
 }
 
