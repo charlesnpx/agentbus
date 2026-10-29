@@ -31,9 +31,11 @@ func resolveModuleCache() string {
 	return strings.TrimSpace(string(output))
 }
 
-func executionPosture(backend string, write, localIPC, codexSandboxed bool, scratch string, caches map[string]string) protocol.ExecutionPosture {
+func executionPosture(backend string, write, verify, localIPC, codexSandboxed bool, scratch string, caches map[string]string) protocol.ExecutionPosture {
 	intent := "inspect"
-	if write {
+	if verify {
+		intent = "verify"
+	} else if write {
 		intent = "edit"
 	}
 
@@ -59,6 +61,9 @@ func executionPosture(backend string, write, localIPC, codexSandboxed bool, scra
 				posture.LocalIPC = "private-dir"
 			}
 			posture.GitMetadata = "read-only"
+			if verify {
+				posture.GitMetadata = "none"
+			}
 		} else {
 			posture.Network = "unenforced"
 			posture.LocalIPC = "unenforced"

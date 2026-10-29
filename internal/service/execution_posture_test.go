@@ -16,6 +16,7 @@ func TestExecutionPostureByBackend(t *testing.T) {
 		name      string
 		backend   string
 		write     bool
+		verify    bool
 		localIPC  bool
 		sandboxed bool
 		want      protocol.ExecutionPosture
@@ -26,6 +27,16 @@ func TestExecutionPostureByBackend(t *testing.T) {
 			sandboxed: true,
 			want: protocol.ExecutionPosture{
 				Intent: "inspect", Shell: "sandboxed", Network: "denied", LocalIPC: "denied", GitMetadata: "read-only", Enforcement: "os-sandbox",
+			},
+		},
+		{
+			name:      "codex verify",
+			backend:   "codex",
+			verify:    true,
+			sandboxed: true,
+			want: protocol.ExecutionPosture{
+				Intent: "verify", Scratch: "job-cache", Caches: writeCaches,
+				Shell: "sandboxed", Network: "denied", LocalIPC: "denied", GitMetadata: "none", Enforcement: "os-sandbox",
 			},
 		},
 		{
@@ -95,14 +106,14 @@ func TestExecutionPostureByBackend(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			var scratch string
 			var caches map[string]string
-			if test.write {
+			if test.write || test.verify {
 				scratch = "job-cache"
 				caches = writeCaches
 				if test.localIPC {
 					caches = localIPCCaches
 				}
 			}
-			got := executionPosture(test.backend, test.write, test.localIPC, test.sandboxed, scratch, caches)
+			got := executionPosture(test.backend, test.write, test.verify, test.localIPC, test.sandboxed, scratch, caches)
 			if !reflect.DeepEqual(got, test.want) {
 				t.Fatalf("executionPosture(%q, %t) = %#v, want %#v", test.backend, test.write, got, test.want)
 			}

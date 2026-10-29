@@ -727,10 +727,15 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		return
 	}
 	codexSandboxed := true
-	if policy, ok := run.backend.(interface {
+	policy, hasSandboxPolicy := run.backend.(interface {
 		CodexSandboxRequired(write, localIPC bool) bool
-	}); ok {
-		codexSandboxed = policy.CodexSandboxRequired(record.Write, spec.LocalIPC)
+	})
+	if spec.Verify && !hasSandboxPolicy {
+		s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassBackendUnavailable, errors.New("verify requires Codex OS sandbox support"), nil)
+		return
+	}
+	if hasSandboxPolicy {
+		codexSandboxed = policy.CodexSandboxRequired(record.Write, spec.LocalIPC) || spec.Verify
 		if codexSandboxed {
 			if err := s.ensureCodexSandbox(jobCtx, run.backend); err != nil {
 				if jobCtx.Err() != nil {
@@ -755,15 +760,18 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		CWD:      record.CWD,
 		Write:    record.Write,
 		LocalIPC: spec.LocalIPC,
+		Verify:   spec.Verify,
 		Model:    requestedModel,
 		Effort:   requestedEffort,
 		Timeout:  timeout,
 	}
 	var (
-		layout  engine.WorkspaceLayout
-		managed *managedCodexHome
-		cache   jobCachePaths
-		caches  map[string]string
+		layout         engine.WorkspaceLayout
+		managed        *managedCodexHome
+		cache          jobCachePaths
+		caches         map[string]string
+		frozenCopyPath string
+		frozenSource   *protocol.FrozenSource
 	)
 	if record.Backend == "codex" {
 		layout, err = engine.LayoutForWorkspace(s.stateRoot, record.CWD)
@@ -810,7 +818,7 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 			return
 		}
 	}
-	if record.Write {
+	if record.Write || spec.Verify {
 		cache, managed, err = prepareJobCache(layout, record.JobID, managed)
 		if managed != nil {
 			s.rememberManagedCodexHome(record.JobID, managed)
@@ -830,6 +838,20 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 			}
 			opts.LocalIPCRoot = ipcRoot
 			s.rememberManagedLocalIPCRoot(record.JobID, ipcRoot)
+		}
+		if spec.Verify {
+			frozenCopyPath = filepath.Join(cache.root, "src")
+			identity, copyErr := createFrozenCopyContext(jobCtx, record.CWD, frozenCopyPath)
+			if copyErr != nil {
+				if jobCtx.Err() != nil {
+					s.finishStartError(store, record, jobCtx, jobCtx.Err())
+					return
+				}
+				s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("prepare frozen verification copy: %w", copyErr), nil)
+				return
+			}
+			frozenSource = &identity
+			opts.CWD = frozenCopyPath
 		}
 		opts.WriteEnvOverlay = map[string]string{
 			"GOCACHE":              cache.goBuild,
@@ -858,10 +880,14 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		caches = nil
 	}
 	scratch := ""
-	if record.Write {
+	if record.Write || spec.Verify {
 		scratch = cache.root
 	}
-	posture := executionPosture(record.Backend, record.Write, spec.LocalIPC, codexSandboxed, scratch, caches)
+	posture := executionPosture(record.Backend, record.Write, spec.Verify, spec.LocalIPC, codexSandboxed, scratch, caches)
+	if spec.Verify {
+		posture.FrozenCopy = frozenCopyPath
+		posture.FrozenSource = frozenSource
+	}
 	if run.cancellationRequested() {
 		s.discardManagedCodexHome(record.JobID)
 		return
@@ -989,13 +1015,16 @@ func taskSpecFromRecord(record jobstore.Record) (protocol.TaskSpec, error) {
 	if spec.InputMode != "" && spec.InputMode != protocol.InputModeFixed && spec.InputMode != protocol.InputModeSteerable {
 		return spec, fmt.Errorf("durable task spec has invalid inputMode %q", spec.InputMode)
 	}
+	if err := validateVerifyTaskSpec(spec); err != nil {
+		return spec, fmt.Errorf("durable task spec has invalid verify: %w", err)
+	}
 	if err := validateLocalIPCSpec(spec, localIPCGOOS); err != nil {
 		return spec, fmt.Errorf("durable task spec has invalid localIPC: %w", err)
 	}
 	if record.InputMode != "" && record.InputMode != protocol.EffectiveInputMode(spec.InputMode) {
 		return spec, errors.New("durable task spec inputMode disagrees with job record")
 	}
-	if spec.Backend != record.Backend || spec.CWD == "" || spec.Prompt == "" {
+	if spec.Backend != record.Backend || spec.CWD == "" || spec.Prompt == "" || spec.Write != record.Write {
 		return spec, errors.New("durable task spec disagrees with job record")
 	}
 	return spec, nil
