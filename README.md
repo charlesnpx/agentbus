@@ -95,8 +95,21 @@ deadline, permission envelope, model, effort, and schema. Delivery may be
 native or interrupt-and-continue depending on the adapter. Delivery uncertainty
 is reported without automatic redelivery; a steerable task does not guarantee
 that a provider follows the instruction or rolls back tools already started.
+Codex uses native app-server `turn/steer`; confirmation means its correlated
+JSON-RPC success response arrived before the steer context ended. No response
+before that deadline is reported as unconfirmed.
 `agentbus steer` exits 17 for a rejected receipt and 18 when delivery is unknown.
+Claude Code uses `interrupt_continue` on its existing stream-json connection:
+it waits for the interrupt acknowledgement, drains the interrupted result, and
+writes the follow-up user message before reporting confirmed delivery. This is
+not same-turn injection; confirmed delivery does not mean Claude followed the
+instruction.
 The wire details and receipt reasons are in [docs/protocol.md](docs/protocol.md).
+
+Cursor steering uses ACP interrupt-and-continue on the same session. Its
+`Confirmed` receipt means the follow-up prompt was written after the cancelled
+prompt drained; ACP provides no separate acceptance acknowledgement before the
+new prompt's response.
 
 Set AGENTBUS_STATE_ROOT to select daemon state. Otherwise Agentbus uses
 $XDG_STATE_HOME/agentbus or ~/.local/state/agentbus.

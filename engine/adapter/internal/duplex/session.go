@@ -38,6 +38,15 @@ var (
 // EmitFunc emits one engine event from a driver.
 type EmitFunc func(engine.Event)
 
+const resultSegmentBoundaryEvent = "duplex.ResultSegmentBoundary"
+
+// ResultSegmentBoundary returns a driver control event that clears the
+// fallback text used for an empty result. turnEmitter consumes it without
+// exposing it to callers.
+func ResultSegmentBoundary() engine.Event {
+	return engine.Event{Type: resultSegmentBoundaryEvent}
+}
+
 // Driver owns provider-specific turn semantics over a live duplex connection.
 type Driver interface {
 	ExecSpec(resumeID string, opts engine.SessionOpts, input engine.TurnInput) (command.ExecSpec, error)
@@ -757,6 +766,10 @@ func hasExecutionFailure(err error) bool {
 func turnEmitter(events chan<- engine.Event) EmitFunc {
 	var lastAgentMessage string
 	return func(ev engine.Event) {
+		if ev.Type == resultSegmentBoundaryEvent {
+			lastAgentMessage = ""
+			return
+		}
 		if ev.Type == engine.EventAgentText && ev.Text != "" {
 			lastAgentMessage = ev.Text
 		}
