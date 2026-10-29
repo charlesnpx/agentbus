@@ -145,6 +145,79 @@ func TestAppServerNativeSteerUsesTurnSteerAndKeepsOneLogicalTurn(t *testing.T) {
 	}
 }
 
+func TestAppServerSteerWaitsForTurnIDDuringInitialize(t *testing.T) {
+	initializeReceived := make(chan struct{})
+	releaseInitialize := make(chan struct{})
+	steerReceived := make(chan struct{})
+	var releaseInitializeOnce sync.Once
+	release := func() { releaseInitializeOnce.Do(func() { close(releaseInitialize) }) }
+	defer release()
+
+	runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+		peer := newAppServerPeer(t, proc)
+		init := peer.expectRequest("initialize")
+		close(initializeReceived)
+		<-releaseInitialize
+		peer.respond(init, initializeResult())
+		peer.expectNotification("initialized")
+		thread := peer.expectRequest("thread/start")
+		peer.respond(thread, threadResult("thread-1"))
+		turn := peer.expectRequest("turn/start")
+		peer.respond(turn, turnResult("turn-1"))
+		steer := peer.expectRequest("turn/steer")
+		close(steerReceived)
+		assertCodexSteerRequest(t, steer, "thread-1", "turn-1", "early follow-up")
+		peer.respond(steer, map[string]any{"turnId": "turn-1"})
+		peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", "finished"))
+	})
+
+	session := startFakeCodexSession(t, engine.SessionOpts{})
+	steerer := session.(engine.Steerer)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForSignal(t, initializeReceived, "held initialize request")
+
+	steerContext := newSignaledDoneContext(context.Background(), 2)
+	steerResult := make(chan struct {
+		delivery engine.SteerDelivery
+		err      error
+	}, 1)
+	go func() {
+		delivery, err := session.(engine.Steerer).Steer(steerContext, engine.SteerMessage{ID: "message-1", Text: "early follow-up"})
+		steerResult <- struct {
+			delivery engine.SteerDelivery
+			err      error
+		}{delivery: delivery, err: err}
+	}()
+	select {
+	case result := <-steerResult:
+		t.Fatalf("Steer returned before the initialize response was released: (%#v, %v)", result.delivery, result.err)
+	case <-steerContext.doneObserved:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Steer did not begin waiting for the provider turn ID")
+	}
+
+	// RunTurn remains at initialize until this explicit release. The second
+	// Done call establishes that Steer has reached its turn-ID wait while that
+	// provider handshake is still held.
+	release()
+	waitForSignal(t, steerReceived, "turn/steer with the provider turn ID")
+	select {
+	case result := <-steerResult:
+		if result.err != nil || result.delivery.Mechanism != engine.SteerMechanismNative || !result.delivery.Confirmed {
+			t.Fatalf("early Steer result = (%#v, %v), want confirmed native delivery", result.delivery, result.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Steer did not return after the provider acknowledged it")
+	}
+	_ = collectEventsWithTimeout(t, events, 2*time.Second)
+	if _, err := steerer.Steer(context.Background(), engine.SteerMessage{ID: "late", Text: "too late"}); !errors.Is(err, engine.ErrSteerNotActive) {
+		t.Fatalf("post-turn Steer error = %v, want ErrSteerNotActive", err)
+	}
+}
+
 func TestAppServerSteerWithoutAcknowledgementIsUnconfirmed(t *testing.T) {
 	turnStarted := make(chan struct{})
 	steerWritten := make(chan struct{})
@@ -359,6 +432,24 @@ func assertCodexSteerRequest(t *testing.T, frame map[string]any, threadID, turnI
 	if !ok || len(textInput) != 2 || textInput["type"] != "text" || textInput["text"] != text {
 		t.Fatalf("turn/steer input item = %#v, want {type:text, text:%q}", input[0], text)
 	}
+}
+
+type signaledDoneContext struct {
+	context.Context
+	count        atomic.Int32
+	signalAt     int32
+	doneObserved chan struct{}
+}
+
+func newSignaledDoneContext(parent context.Context, signalAt int32) *signaledDoneContext {
+	return &signaledDoneContext{Context: parent, signalAt: signalAt, doneObserved: make(chan struct{})}
+}
+
+func (c *signaledDoneContext) Done() <-chan struct{} {
+	if c.count.Add(1) == c.signalAt {
+		close(c.doneObserved)
+	}
+	return c.Context.Done()
 }
 
 func waitForSignal(t *testing.T, signal <-chan struct{}, description string) {

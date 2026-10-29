@@ -63,6 +63,15 @@ func (d *appServerDriver) ExecSpec(_ string, opts engine.SessionOpts, _ engine.T
 
 func (d *appServerDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resumeID string, opts engine.SessionOpts, input engine.TurnInput, emit duplex.EmitFunc) (string, error) {
 	rpc := d.newRPC(conn, emit)
+	// Session.Turn exposes the logical turn before this provider handshake.
+	// Register now so an early steer waits for the app-server's turn ID.
+	active := newActiveAppServerTurn(resumeID)
+	d.setActive(conn, active)
+	defer func() {
+		active.finish()
+		d.clearActive(conn, active)
+	}()
+
 	if err := rpc.handshake(ctx); err != nil {
 		return "", fmt.Errorf("codex app-server initialize: %w", err)
 	}
@@ -90,15 +99,7 @@ func (d *appServerDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resume
 	// item/completed notification. Flush on every return after turn/start begins,
 	// including transport errors and cancellation paths that bypass completion.
 	defer observer.flushPendingToolItems()
-	active := newActiveAppServerTurn(threadID)
-	// Register before issuing turn/start. writeTurnStart keeps this turn's lock
-	// through the successful write and marks it sent before an Interrupt can
-	// inspect it, so there is no post-write, pre-registration gap.
-	d.setActive(conn, active)
-	defer func() {
-		active.finish()
-		d.clearActive(conn, active)
-	}()
+	active.setThreadID(threadID)
 	turnResult, err := rpc.request(ctx, "turn/start", turnStartParams(threadID, opts, input, d.writePolicy), observer, active.writeTurnStart(conn))
 	if err != nil {
 		return threadID, err
@@ -270,6 +271,12 @@ func newActiveAppServerTurn(threadID string) *activeAppServerTurn {
 		turnDone:       make(chan struct{}),
 		steerResponses: make(map[string]chan map[string]any),
 	}
+}
+
+func (t *activeAppServerTurn) setThreadID(threadID string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.threadID = threadID
 }
 
 func (t *activeAppServerTurn) awaitTurnID(ctx context.Context) (threadID, turnID string, err error) {
