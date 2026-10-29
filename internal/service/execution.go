@@ -27,6 +27,9 @@ import (
 type activeExecution struct {
 	jobID   string
 	backend engine.Backend
+	// slotAcquiredAt starts the execution timeout and is fixed when the
+	// scheduler reserves a concurrency slot.
+	slotAcquiredAt time.Time
 
 	// launchMu linearizes a cancellation request with the two calls that may
 	// cross a process-launch boundary. A request that acquires it first keeps a
@@ -190,6 +193,10 @@ func (run *activeExecution) startSession(ctx context.Context, opts engine.Sessio
 	if run.cancellationRequested() {
 		run.launchMu.Unlock()
 		return nil, context.Canceled, true
+	}
+	if err := ctx.Err(); err != nil {
+		run.launchMu.Unlock()
+		return nil, err, false
 	}
 	var (
 		session engine.Session
@@ -478,6 +485,8 @@ func (s *Server) beginExecutions(parent context.Context) {
 	if s.executions == nil {
 		s.executions = make(map[string]*activeExecution)
 	}
+	s.queuedJobs = nil
+	s.runningByBackend = make(map[string]int)
 	s.executionMu.Unlock()
 }
 
@@ -492,16 +501,49 @@ func (s *Server) stopExecutions() {
 	cancel := s.executionCancel
 	s.executionCtx = nil
 	s.executionCancel = nil
+	queued := len(s.queuedJobs)
+	s.queuedJobs = nil
 	s.executionMu.Unlock()
+	if queued > 0 {
+		s.activeJobs.Add(-int64(queued))
+	}
 	if cancel != nil {
 		cancel()
 	}
 	s.executionWG.Wait()
 }
 
-// enqueueQueuedJob starts exactly one newly admitted queued record while the
-// daemon is serving. A recovered queued record is intentionally never passed
-// here.
+type queuedJob struct {
+	record  jobstore.Record
+	backend engine.Backend
+}
+
+// queueWouldExceed reports whether a new submission would wait beyond the
+// configured queue bound. A submission that can claim an immediately free
+// slot is not a queue entry, even when the waiting queue is full.
+func (s *Server) queueWouldExceed(backend string) bool {
+	s.executionMu.Lock()
+	defer s.executionMu.Unlock()
+	if s.executionCtx == nil || s.executionCtx.Err() != nil {
+		return false
+	}
+	if len(s.queuedJobs) < s.maxQueued {
+		return false
+	}
+	if len(s.executions) >= s.maxJobs || s.runningByBackend[backend] >= s.maxJobsPerBackend {
+		return true
+	}
+	for _, queued := range s.queuedJobs {
+		if queued.record.Backend == backend {
+			return true
+		}
+	}
+	return false
+}
+
+// enqueueQueuedJob records one newly admitted queued job and fills every
+// currently available slot without allowing a saturated backend to block a
+// later eligible backend. Recovered jobs are intentionally never passed here.
 func (s *Server) enqueueQueuedJob(record jobstore.Record, backend engine.Backend) {
 	if s == nil || record.State != protocol.PublicStateQueued || record.JobID == "" {
 		return
@@ -511,27 +553,85 @@ func (s *Server) enqueueQueuedJob(record jobstore.Record, backend engine.Backend
 		s.executionMu.Unlock()
 		return
 	}
+	store, err := s.ensureJobStore()
+	if err != nil {
+		s.executionMu.Unlock()
+		return
+	}
+	current, err := store.Get(record.JobID)
+	if err != nil || current.State != protocol.PublicStateQueued || current.Starting {
+		s.executionMu.Unlock()
+		return
+	}
+	record = current
+	for _, queued := range s.queuedJobs {
+		if queued.record.JobID == record.JobID {
+			s.executionMu.Unlock()
+			return
+		}
+	}
 	if _, exists := s.executions[record.JobID]; exists {
 		s.executionMu.Unlock()
 		return
 	}
-	run := newActiveExecution(record.JobID, backend)
-	s.executions[record.JobID] = run
+	s.queuedJobs = append(s.queuedJobs, queuedJob{record: record, backend: backend})
+	s.activeJobs.Add(1)
+	s.dispatchQueuedLocked()
+	s.executionMu.Unlock()
+}
+
+// dispatchQueuedLocked starts as many eligible jobs as the daemon-owned
+// global and per-backend limits permit. The first eligible item wins; an
+// earlier item for a saturated backend does not block a different backend.
+// The caller holds executionMu.
+func (s *Server) dispatchQueuedLocked() {
+	for s.executionCtx != nil && s.executionCtx.Err() == nil && len(s.executions) < s.maxJobs {
+		selected := -1
+		for index, queued := range s.queuedJobs {
+			if s.runningByBackend[queued.record.Backend] < s.maxJobsPerBackend {
+				selected = index
+				break
+			}
+		}
+		if selected < 0 {
+			return
+		}
+		queued := s.queuedJobs[selected]
+		copy(s.queuedJobs[selected:], s.queuedJobs[selected+1:])
+		s.queuedJobs[len(s.queuedJobs)-1] = queuedJob{}
+		s.queuedJobs = s.queuedJobs[:len(s.queuedJobs)-1]
+		s.startQueuedJobLocked(queued)
+	}
+}
+
+// startQueuedJobLocked reserves a slot before the goroutine can cross the
+// durable starting transition. The caller holds executionMu.
+func (s *Server) startQueuedJobLocked(queued queuedJob) {
+	if _, exists := s.executions[queued.record.JobID]; exists {
+		return
+	}
+	run := newActiveExecution(queued.record.JobID, queued.backend)
+	run.slotAcquiredAt = time.Now().UTC()
+	s.executions[queued.record.JobID] = run
+	s.runningByBackend[queued.record.Backend]++
 	parent := s.executionCtx
 	s.executionWG.Add(1)
-	s.activeJobs.Add(1)
-	s.executionMu.Unlock()
 
 	go func() {
 		defer s.executionWG.Done()
-		defer s.activeJobs.Add(-1)
 		defer s.touchActivity()
-		s.runJob(parent, record, run)
+		s.runJob(parent, queued.record, run)
 		s.executionMu.Lock()
-		if s.executions[record.JobID] == run {
-			delete(s.executions, record.JobID)
+		if s.executions[queued.record.JobID] == run {
+			delete(s.executions, queued.record.JobID)
 		}
+		s.runningByBackend[queued.record.Backend]--
+		if s.runningByBackend[queued.record.Backend] <= 0 {
+			delete(s.runningByBackend, queued.record.Backend)
+		}
+		s.dispatchQueuedLocked()
 		s.executionMu.Unlock()
+		s.activeJobs.Add(-1)
 	}()
 }
 
@@ -564,19 +664,34 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 	// effective timeout has exactly one source of truth.
 	timeout := time.Duration(resolution.Effective) * time.Millisecond
 
-	jobCtx, cancel := context.WithCancel(parent)
+	var jobCtx context.Context
+	var cancel context.CancelFunc
 	if timeout > 0 {
-		jobCtx, cancel = context.WithTimeout(parent, timeout)
+		acquiredAt := run.slotAcquiredAt
+		if acquiredAt.IsZero() {
+			acquiredAt = time.Now().UTC()
+		}
+		jobCtx, cancel = context.WithDeadline(parent, acquiredAt.Add(timeout))
+	} else {
+		jobCtx, cancel = context.WithCancel(parent)
 	}
 	run.setCancel(cancel)
 	defer cancel()
 	if run.cancellationRequested() {
 		return
 	}
+	if err := jobCtx.Err(); err != nil {
+		s.finishStartError(store, record, jobCtx, err)
+		return
+	}
 
 	resumeTarget, err := resumeTargetForExecution(store, spec)
 	if err != nil {
 		s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("resolve resume target: %w", err), nil)
+		return
+	}
+	if err := jobCtx.Err(); err != nil {
+		s.finishStartError(store, record, jobCtx, err)
 		return
 	}
 

@@ -24,7 +24,7 @@ state-root break for this release, are in
 ~~~text
 agentbus version [--json]
 agentbus --help
-agentbus serve [--foreground]
+agentbus serve [--foreground] [--max-jobs <n>] [--max-jobs-per-backend <n>] [--max-queued <n>]
 agentbus status [--job <id>] [--tag <key=value>] [--state <state>] [--workspace-key <key>] [--limit <n>] [--before <cursor> | --all] [--json]
 agentbus transcript --job <id> [--follow] [--kind <kind>] [--since <timestamp>] [--since-ordinal <n>] [--last <n>] [--limit <n>] [--json]
 agentbus result --job <id> [--wait [--wait-timeout <duration>]] [--json]
@@ -75,6 +75,15 @@ Repeatable filters such as `--tag` and `--state` keep accepting multiple values.
 
 Job submission uses the typed job.submit protocol method. There is no CLI submit
 command.
+
+The daemon runs at most 4 jobs at once and 2 per backend by default, and keeps
+up to 64 additional jobs waiting. These are starting values, not measured
+optima. Set positive integer limits with `agentbus serve`; zero is rejected.
+The values apply when a daemon starts and do not change an already serving daemon.
+When the waiting queue is full, a new job.submit is rejected with
+`queue_full` (CLI exit code 19). A matching deduplicated request does not use
+another queue entry. Job execution timeouts begin when a job gets a slot;
+`queuedAt` and `startedAt` show its wait and execution start.
 
 TaskSpec `inputMode` is `fixed` when omitted. Set it to `steerable` only when
 the running task may receive follow-up instructions. `agentbus steer` submits

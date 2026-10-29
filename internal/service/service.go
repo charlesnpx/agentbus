@@ -26,9 +26,12 @@ const (
 	// ProtocolVersion is the only protocol version served by this daemon.
 	ProtocolVersion = protocol.Version
 
-	defaultIdleTimeout    = 30 * time.Minute
-	defaultShutdown       = 30 * time.Second
-	oversizedWriteTimeout = time.Second
+	defaultIdleTimeout       = 30 * time.Minute
+	defaultShutdown          = 30 * time.Second
+	defaultMaxJobs           = 4
+	defaultMaxJobsPerBackend = 2
+	defaultMaxQueued         = 64
+	oversizedWriteTimeout    = time.Second
 )
 
 var (
@@ -89,6 +92,9 @@ type Config struct {
 	IdleTimeout       time.Duration
 	IdleCheckInterval time.Duration
 	ShutdownTimeout   time.Duration
+	MaxJobs           int
+	MaxJobsPerBackend int
+	MaxQueued         int
 	ReadyHook         func(ServeReadyInfo) error
 }
 
@@ -153,11 +159,17 @@ type Server struct {
 	processGroupGrace  time.Duration
 	turnDrainGrace     time.Duration
 
-	executionMu     sync.Mutex
-	executionCtx    context.Context
-	executionCancel context.CancelFunc
-	executions      map[string]*activeExecution
-	executionWG     sync.WaitGroup
+	executionMu       sync.Mutex
+	executionCtx      context.Context
+	executionCancel   context.CancelFunc
+	executions        map[string]*activeExecution
+	executionWG       sync.WaitGroup
+	submissionMu      sync.Mutex
+	queuedJobs        []queuedJob
+	runningByBackend  map[string]int
+	maxJobs           int
+	maxJobsPerBackend int
+	maxQueued         int
 
 	idleTimeout       time.Duration
 	idleCheckInterval time.Duration
@@ -190,6 +202,18 @@ type Server struct {
 // New creates a daemon server and ensures that its state root and token file
 // exist. An existing token always wins over Config.Token.
 func New(cfg Config) (*Server, error) {
+	if cfg.MaxJobs < 0 || cfg.MaxJobsPerBackend < 0 || cfg.MaxQueued < 0 {
+		return nil, errors.New("max-jobs, max-jobs-per-backend, and max-queued must be positive")
+	}
+	if cfg.MaxJobs == 0 {
+		cfg.MaxJobs = defaultMaxJobs
+	}
+	if cfg.MaxJobsPerBackend == 0 {
+		cfg.MaxJobsPerBackend = defaultMaxJobsPerBackend
+	}
+	if cfg.MaxQueued == 0 {
+		cfg.MaxQueued = defaultMaxQueued
+	}
 	root, err := ensureStateRoot(cfg.StateRoot)
 	if err != nil {
 		return nil, err
@@ -237,6 +261,10 @@ func New(cfg Config) (*Server, error) {
 		processGroups:     engine.NativeProcessGroupSignaler{},
 		processGroupGrace: engine.DefaultCancelGrace,
 		turnDrainGrace:    engine.DefaultCancelGrace,
+		maxJobs:           cfg.MaxJobs,
+		maxJobsPerBackend: cfg.MaxJobsPerBackend,
+		maxQueued:         cfg.MaxQueued,
+		runningByBackend:  make(map[string]int),
 		idleTimeout:       idleTimeout,
 		idleCheckInterval: idleCheckInterval,
 		shutdownTimeout:   normalizeShutdownTimeout(cfg.ShutdownTimeout),
