@@ -21,7 +21,9 @@ import (
 )
 
 const (
-	storeFormatVersion = "1"
+	storeFormatVersion      = "1"
+	diagnosticEntryMaxRunes = 512
+	diagnosticEntryMaxCount = 64
 	// defaultOpenTimeout bounds how long Open waits for the database file lock.
 	// bbolt with nil options blocks indefinitely on the flock, which would let a
 	// replacement daemon hang silently while a draining predecessor still holds
@@ -123,20 +125,22 @@ type Record struct {
 	// BackendSessionID is assigned only from a backend's turn-final
 	// observation. An omitted value means the job never produced a resumable
 	// backend session; it is not an unknown-session marker.
-	BackendSessionID string          `json:"backendSessionId,omitempty"`
-	RetainSession    bool            `json:"retainSession,omitempty"`
-	Model            string          `json:"model,omitempty"`
-	ModelReported    string          `json:"modelReported,omitempty"`
-	CWD              string          `json:"cwd,omitempty"`
-	Write            bool            `json:"write"`
-	Effort           string          `json:"effort,omitempty"`
-	TaskSpec         json.RawMessage `json:"taskSpec,omitempty"`
+	BackendSessionID string                     `json:"backendSessionId,omitempty"`
+	RetainSession    bool                       `json:"retainSession,omitempty"`
+	Model            string                     `json:"model,omitempty"`
+	ModelReported    string                     `json:"modelReported,omitempty"`
+	CWD              string                     `json:"cwd,omitempty"`
+	Write            bool                       `json:"write"`
+	Execution        *protocol.ExecutionPosture `json:"execution,omitempty"`
+	Effort           string                     `json:"effort,omitempty"`
+	TaskSpec         json.RawMessage            `json:"taskSpec,omitempty"`
 	// Steers contains text-free delivery metadata separate from immutable TaskSpec.
 	Steers        []protocol.SteerRecord  `json:"steers,omitempty"`
 	State         protocol.PublicState    `json:"state"`
 	Starting      bool                    `json:"starting,omitempty"`
 	ProcessClaim  *ProcessClaim           `json:"processClaim,omitempty"`
 	Cleanup       protocol.Cleanup        `json:"cleanup"`
+	LogsPruned    bool                    `json:"logsPruned,omitempty"`
 	CreatedAt     time.Time               `json:"createdAt"`
 	UpdatedAt     time.Time               `json:"updatedAt"`
 	StartedAt     *time.Time              `json:"startedAt,omitempty"`
@@ -529,9 +533,92 @@ func (store *Store) List() ([]Record, error) {
 	return records, nil
 }
 
+// ListPage returns up to limit records after afterID in job-ID order. more is
+// true when another page exists; nextAfter is the last returned job ID.
+func (store *Store) ListPage(limit int, afterID string) (records []Record, nextAfter string, more bool, err error) {
+	if limit <= 0 {
+		return nil, "", false, fmt.Errorf("%w: page limit must be positive", ErrInvalid)
+	}
+	records = make([]Record, 0, limit)
+	err = store.view(func(tx *bolt.Tx) error {
+		jobs := tx.Bucket(bucketJobs)
+		if jobs == nil {
+			return fmt.Errorf("%w: missing jobs bucket", ErrCorrupt)
+		}
+		cursor := jobs.Cursor()
+		var key, value []byte
+		if afterID == "" {
+			key, value = cursor.First()
+		} else {
+			key, value = cursor.Seek([]byte(afterID))
+			if string(key) == afterID {
+				key, value = cursor.Next()
+			}
+		}
+		for key != nil && len(records) < limit {
+			if value == nil {
+				return fmt.Errorf("%w: nested jobs bucket %q", ErrCorrupt, key)
+			}
+			record, err := decodeRecord(value, string(key))
+			if err != nil {
+				return err
+			}
+			records = append(records, record)
+			nextAfter = record.JobID
+			key, value = cursor.Next()
+		}
+		more = key != nil
+		return nil
+	})
+	if err != nil {
+		return nil, "", false, err
+	}
+	return records, nextAfter, more, nil
+}
+
+// MarkLogsPruned marks that the job's diagnostic log sidecars are pruned. It
+// is persisted before unlinking so a later sweep can retry after interruption.
+// It leaves UpdatedAt unchanged because pruning is artifact lifecycle metadata,
+// not a new job state transition.
+func (store *Store) MarkLogsPruned(id string) (Record, error) {
+	if err := validateJobID(id); err != nil {
+		return Record{}, fmt.Errorf("%w: %v", ErrInvalid, err)
+	}
+	var result Record
+	err := store.update(func(tx *bolt.Tx) error {
+		jobs := tx.Bucket(bucketJobs)
+		if jobs == nil {
+			return fmt.Errorf("%w: missing jobs bucket", ErrCorrupt)
+		}
+		current, err := getRecord(jobs, id)
+		if err != nil {
+			return err
+		}
+		if !current.State.IsTerminal() || current.Cleanup != protocol.CleanupClean {
+			return fmt.Errorf("%w: only clean terminal jobs can have logs marked pruned", ErrInvalid)
+		}
+		if !current.LogsPruned {
+			current.LogsPruned = true
+			if err := putRecord(jobs, current); err != nil {
+				return err
+			}
+		}
+		result = current
+		return nil
+	})
+	return result, err
+}
+
 // MarkStarting commits the private no-relaunch marker before a caller spawns
 // a backend process. Only queued jobs may make this transition.
 func (store *Store) MarkStarting(id string) (Record, error) {
+	return store.MarkStartingWithExecution(id, nil)
+}
+
+// MarkStartingWithExecution commits the starting marker and its effective
+// execution posture atomically before a caller spawns a backend process.
+// Only queued jobs may make this transition.
+func (store *Store) MarkStartingWithExecution(id string, execution *protocol.ExecutionPosture) (Record, error) {
 	if err := validateJobID(id); err != nil {
 		return Record{}, fmt.Errorf("%w: %v", ErrInvalid, err)
 	}
@@ -562,6 +649,7 @@ func (store *Store) MarkStarting(id string) (Record, error) {
 		next.Starting = true
 		next.StartedAt = &now
 		next.UpdatedAt = now
+		next.Execution = execution
 		normalizeRecord(&next)
 		if err := validateRecord(next); err != nil {
 			return err
@@ -707,6 +795,52 @@ func (store *Store) RecordModelReported(id, model string) error {
 		}
 		return nil
 	})
+}
+
+// AppendDiagnostic records one bounded operational diagnostic without
+// changing the job's execution state.
+func (store *Store) AppendDiagnostic(id, diagnostic string) (Record, error) {
+	if err := validateJobID(id); err != nil {
+		return Record{}, fmt.Errorf("%w: %v", ErrInvalid, err)
+	}
+	diagnostic = strings.TrimSpace(diagnostic)
+	if diagnostic == "" {
+		return Record{}, fmt.Errorf("%w: diagnostic is required", ErrInvalid)
+	}
+	runes := []rune(diagnostic)
+	if len(runes) > diagnosticEntryMaxRunes {
+		diagnostic = string(runes[:diagnosticEntryMaxRunes-3]) + "..."
+	}
+	var result Record
+	err := store.update(func(tx *bolt.Tx) error {
+		jobs := tx.Bucket(bucketJobs)
+		if jobs == nil {
+			return fmt.Errorf("%w: missing jobs bucket", ErrCorrupt)
+		}
+		current, err := getRecord(jobs, id)
+		if err != nil {
+			return err
+		}
+		if current.State.IsTerminal() {
+			return ErrTerminal
+		}
+		next := current
+		next.Diagnostics = append(append([]string(nil), current.Diagnostics...), diagnostic)
+		if len(next.Diagnostics) > diagnosticEntryMaxCount {
+			next.Diagnostics = append([]string(nil), next.Diagnostics[len(next.Diagnostics)-diagnosticEntryMaxCount:]...)
+		}
+		next.UpdatedAt = time.Now().UTC()
+		normalizeRecord(&next)
+		if err := validateRecord(next); err != nil {
+			return err
+		}
+		if err := putRecord(jobs, next); err != nil {
+			return err
+		}
+		result = next
+		return nil
+	})
+	return result, err
 }
 
 // RecordSteer appends one text-free steering record. Existing message IDs are
@@ -1034,6 +1168,9 @@ func validateRecord(record Record) error {
 	}
 	if !record.Cleanup.Valid() {
 		return fmt.Errorf("%w: invalid cleanup %q", ErrInvalid, record.Cleanup)
+	}
+	if record.LogsPruned && (!record.State.IsTerminal() || record.Cleanup != protocol.CleanupClean) {
+		return fmt.Errorf("%w: pruned logs require a clean terminal job", ErrInvalid)
 	}
 	if record.CreatedAt.IsZero() || record.UpdatedAt.IsZero() {
 		return fmt.Errorf("%w: createdAt and updatedAt are required", ErrInvalid)
