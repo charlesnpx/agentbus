@@ -309,6 +309,45 @@ func TestJobListFiltersCombineWithAND(t *testing.T) {
 	}
 }
 
+func TestJobListCursorPagesNewestFirstAndKeepsOmittedLimitUnbounded(t *testing.T) {
+	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "fake"}}})
+	for _, requestID := range []string{"page-a", "page-b", "page-c"} {
+		params := submissionParams("workspace-pages", requestID, "fake", t.TempDir(), requestID)
+		if result := submitResultForTest(t, submitForTest(t, server, params)); result.JobID == "" {
+			t.Fatal("submission has no job id")
+		}
+	}
+
+	unbounded := server.handleJobList(mustJSON(t, protocol.JobListParams{}))
+	if unbounded.err != nil {
+		t.Fatalf("unbounded job.list error = %#v", unbounded.err)
+	}
+	unboundedResult := unbounded.result.(protocol.JobListResult)
+	if len(unboundedResult.Jobs) != 3 || unboundedResult.Truncated || unboundedResult.NextCursor != "" {
+		t.Fatalf("omitted-limit result=%#v, want all jobs without truncation", unboundedResult)
+	}
+
+	firstOutcome := server.handleJobList(mustJSON(t, protocol.JobListParams{Limit: 2}))
+	if firstOutcome.err != nil {
+		t.Fatalf("first page error = %#v", firstOutcome.err)
+	}
+	first := firstOutcome.result.(protocol.JobListResult)
+	if len(first.Jobs) != 2 || !first.Truncated || first.NextCursor == "" {
+		t.Fatalf("first page=%#v, want two summaries and a continuation", first)
+	}
+	if first.Jobs[0].CreatedAt.Before(first.Jobs[1].CreatedAt) {
+		t.Fatalf("first page is not newest first: %#v", first.Jobs)
+	}
+	secondOutcome := server.handleJobList(mustJSON(t, protocol.JobListParams{Limit: 2, Cursor: first.NextCursor}))
+	if secondOutcome.err != nil {
+		t.Fatalf("second page error = %#v", secondOutcome.err)
+	}
+	second := secondOutcome.result.(protocol.JobListResult)
+	if len(second.Jobs) != 1 || second.Truncated || second.NextCursor != "" || second.Jobs[0].JobID == first.Jobs[0].JobID || second.Jobs[0].JobID == first.Jobs[1].JobID {
+		t.Fatalf("second page=%#v, want final non-overlapping summary", second)
+	}
+}
+
 func TestJobListProjectsActiveActivityAndLiveness(t *testing.T) {
 	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "fake"}}})
 	params := submissionParams("activity-workspace", "activity-request", "fake", t.TempDir(), "activity")
