@@ -29,6 +29,7 @@ agentbus status [--job <id>] [--tag <key=value>] [--state <state>] [--workspace-
 agentbus transcript --job <id> [--follow] [--kind <kind>] [--since <timestamp>] [--since-ordinal <n>] [--last <n>] [--limit <n>] [--json]
 agentbus result --job <id> [--wait [--wait-timeout <duration>]] [--json]
 agentbus cancel --job <id> [--json]
+agentbus steer --job <id> --request-id <messageId> --message-file <path|-> [--json]
 agentbus configure-codex-sandbox [--writable-root <absolute-path>]... [--json]
 ~~~
 
@@ -83,6 +84,17 @@ When the waiting queue is full, a new job.submit is rejected with
 `queue_full` (CLI exit code 19). A matching deduplicated request does not use
 another queue entry. Job execution timeouts begin when a job gets a slot;
 `queuedAt` and `startedAt` show its wait and execution start.
+
+TaskSpec `inputMode` is `fixed` when omitted. Set it to `steerable` only when
+the running task may receive follow-up instructions. `agentbus steer` submits
+one caller-identified message from a file or stdin; `status --job` shows the
+mode and text-free steer receipts. A steerable job retains one public job ID,
+deadline, permission envelope, model, effort, and schema. Delivery may be
+native or interrupt-and-continue depending on the adapter. Delivery uncertainty
+is reported without automatic redelivery; a steerable task does not guarantee
+that a provider follows the instruction or rolls back tools already started.
+`agentbus steer` exits 17 for a rejected receipt and 18 when delivery is unknown.
+The wire details and receipt reasons are in [docs/protocol.md](docs/protocol.md).
 
 Set AGENTBUS_STATE_ROOT to select daemon state. Otherwise Agentbus uses
 $XDG_STATE_HOME/agentbus or ~/.local/state/agentbus.

@@ -288,6 +288,10 @@ func TestStatusHumanProjectionIncludesOperatorFieldsAndNeverResultText(t *testin
 	record.Failure = &protocol.JobFailureWire{Class: protocol.FailureClassBackendError, Reason: "provider stopped"}
 	record.Contract = &protocol.ContractResult{Evaluated: true, Compliant: false}
 	record.LogPaths = &protocol.LogPathsWire{Stdout: "/logs/out", Stderr: "/logs/err"}
+	record.Steers = []protocol.SteerSummaryWire{{
+		MessageID: "message-1", Status: protocol.SteerStatusDelivered,
+		Mechanism: "native", Time: finished.Add(time.Minute),
+	}}
 	a := testApp(t)
 	a.clientConnect = fakeConnector(&fakeProtocolClient{records: map[string]agentclient.JobGetResult{"job-1": record}})
 
@@ -301,11 +305,12 @@ func TestStatusHumanProjectionIncludesOperatorFieldsAndNeverResultText(t *testin
 		"startedAt=2026-01-02T03:05:05Z",
 		"finishedAt=2026-01-02T03:06:05Z",
 		"timeout.effective=1800000 timeout.source=client",
-		"model=gpt-5 tags=a=first,z=last",
+		"inputMode=fixed model=gpt-5 tags=a=first,z=last",
 		"result.bytes=18 result.sha256=sha256:aaaaaaaaaaaa",
 		"failure.class=backend_error failure.reason=provider stopped",
 		"contract.evaluated=true contract.compliant=false",
 		"logPaths.stdout=/logs/out logPaths.stderr=/logs/err",
+		"steer.messageId=message-1 status=delivered mechanism=native time=2026-01-02T03:07:05Z",
 	} {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("status output missing %q:\n%s", want, stdout)
@@ -313,6 +318,40 @@ func TestStatusHumanProjectionIncludesOperatorFieldsAndNeverResultText(t *testin
 	}
 	if strings.Contains(stdout, "secret result text") || strings.Contains(stdout, "/state/results/job-1") {
 		t.Fatalf("status exposed result text or path: %q", stdout)
+	}
+}
+
+func TestSteerCommandReceiptAndExitCodes(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		status protocol.SteerStatus
+		want   int
+	}{
+		{name: "admitted", status: protocol.SteerStatusAdmitted, want: 0},
+		{name: "delivered", status: protocol.SteerStatusDelivered, want: 0},
+		{name: "rejected", status: protocol.SteerStatusRejected, want: 17},
+		{name: "unknown", status: protocol.SteerStatusUnknown, want: 18},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := &fakeProtocolClient{steer: agentclient.JobSteerResult{
+				JobID: "job-1", MessageID: "message-1", Status: test.status,
+				Reason: protocol.SteerReasonDeliveryUnconfirmed,
+			}}
+			a := testApp(t)
+			a.clientConnect = fakeConnector(client)
+			var stdout, stderr bytes.Buffer
+			code := a.run(context.Background(), []string{
+				"steer", "--job", "job-1", "--request-id", "message-1", "--message-file", "-", "--json",
+			}, strings.NewReader("follow-up"), &stdout, &stderr)
+			if code != test.want || stderr.Len() != 0 {
+				t.Fatalf("steer exit=%d stderr=%q, want exit=%d", code, stderr.String(), test.want)
+			}
+			var receipt agentclient.JobSteerResult
+			decodeJSON(t, stdout.String(), &receipt)
+			if receipt.Status != test.status || client.steerParams.JobID != "job-1" || client.steerParams.MessageID != "message-1" || client.steerParams.Text != "follow-up" {
+				t.Fatalf("steer receipt=%#v params=%#v", receipt, client.steerParams)
+			}
+		})
 	}
 }
 
@@ -848,6 +887,8 @@ type fakeProtocolClient struct {
 	transcriptParams []agentclient.JobTranscriptParams
 	transcriptFunc   func(agentclient.JobTranscriptParams, int) (agentclient.JobTranscriptResult, error)
 	cancels          map[string]agentclient.JobCancelResult
+	steer            agentclient.JobSteerResult
+	steerParams      agentclient.JobSteerParams
 	cancelParams     []agentclient.JobCancelParams
 	err              error
 }
@@ -899,6 +940,14 @@ func (c *fakeProtocolClient) JobCancel(_ context.Context, params agentclient.Job
 		return agentclient.JobCancelResult{}, &protocol.RPCError{Object: *protocol.NewError(protocol.ErrorUnknownJob, "not found", protocol.ErrorData{JobID: params.JobID})}
 	}
 	return result, nil
+}
+
+func (c *fakeProtocolClient) Steer(_ context.Context, params agentclient.JobSteerParams) (agentclient.JobSteerResult, error) {
+	if c.err != nil {
+		return agentclient.JobSteerResult{}, c.err
+	}
+	c.steerParams = params
+	return c.steer, nil
 }
 
 func (c *fakeProtocolClient) Close() error { return nil }
