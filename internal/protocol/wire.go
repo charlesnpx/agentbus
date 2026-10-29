@@ -85,15 +85,14 @@ type FailureClass string
 const (
 	FailureClassBackendUnavailable FailureClass = "backend_unavailable"
 	FailureClassProviderOverloaded FailureClass = "provider_overloaded"
+	FailureClassUsageLimit         FailureClass = "usage_limit"
 	FailureClassModelUnavailable   FailureClass = "model_unavailable"
 	FailureClassContentPolicy      FailureClass = "content_policy"
-	// FailureClassAuthentication records authentication failures. No producer
-	// classifies failures this way yet.
-	FailureClassAuthentication FailureClass = "authentication"
-	FailureClassBackendError   FailureClass = "backend_error"
-	FailureClassTimeout        FailureClass = "timeout"
-	FailureClassInterrupted    FailureClass = "interrupted"
-	FailureClassInternal       FailureClass = "internal"
+	FailureClassAuthentication     FailureClass = "authentication"
+	FailureClassBackendError       FailureClass = "backend_error"
+	FailureClassTimeout            FailureClass = "timeout"
+	FailureClassInterrupted        FailureClass = "interrupted"
+	FailureClassInternal           FailureClass = "internal"
 )
 
 // Valid reports whether class is one of the protocol v3 failure categories.
@@ -101,6 +100,7 @@ func (class FailureClass) Valid() bool {
 	switch class {
 	case FailureClassBackendUnavailable,
 		FailureClassProviderOverloaded,
+		FailureClassUsageLimit,
 		FailureClassModelUnavailable,
 		FailureClassContentPolicy,
 		FailureClassAuthentication,
@@ -267,22 +267,29 @@ type HelloResult struct {
 
 // JobRecordWire is the detailed response to job.get when JobID is provided.
 type JobRecordWire struct {
-	JobID         string                    `json:"jobId"`
-	WorkspaceKey  string                    `json:"workspaceKey"`
-	RequestID     string                    `json:"requestId"`
-	Backend       string                    `json:"backend"`
-	State         PublicState               `json:"state"`
-	Tags          map[string]string         `json:"tags,omitempty"`
-	CreatedAt     time.Time                 `json:"createdAt"`
-	StartedAt     *time.Time                `json:"startedAt,omitempty"`
-	FinishedAt    *time.Time                `json:"finishedAt,omitempty"`
-	Timeout       *engine.TimeoutResolution `json:"timeout,omitempty"`
-	Result        *ResultInfoWire           `json:"result,omitempty"`
-	Contract      *ContractResult           `json:"contract,omitempty"`
-	Failure       *JobFailureWire           `json:"failure,omitempty"`
-	Cleanup       Cleanup                   `json:"cleanup"`
-	LogPaths      *LogPathsWire             `json:"logPaths,omitempty"`
-	ModelReported string                    `json:"modelReported,omitempty"`
+	JobID              string                    `json:"jobId"`
+	WorkspaceKey       string                    `json:"workspaceKey"`
+	RequestID          string                    `json:"requestId"`
+	Backend            string                    `json:"backend"`
+	State              PublicState               `json:"state"`
+	Tags               map[string]string         `json:"tags,omitempty"`
+	CreatedAt          time.Time                 `json:"createdAt"`
+	StartedAt          *time.Time                `json:"startedAt,omitempty"`
+	FinishedAt         *time.Time                `json:"finishedAt,omitempty"`
+	Timeout            *engine.TimeoutResolution `json:"timeout,omitempty"`
+	Deadline           *time.Time                `json:"deadline,omitempty"`
+	RemainingMs        *int64                    `json:"remainingMs,omitempty"`
+	Resumable          *ResumableProjection      `json:"resumable,omitempty"`
+	ModelRequested     *string                   `json:"modelRequested,omitempty"`
+	EffortRequested    *string                   `json:"effortRequested,omitempty"`
+	Result             *ResultInfoWire           `json:"result,omitempty"`
+	Contract           *ContractResult           `json:"contract,omitempty"`
+	Failure            *JobFailureWire           `json:"failure,omitempty"`
+	Cleanup            Cleanup                   `json:"cleanup"`
+	LogPaths           *LogPathsWire             `json:"logPaths,omitempty"`
+	ModelReported      string                    `json:"modelReported,omitempty"`
+	EffortReported     string                    `json:"effortReported,omitempty"`
+	CancellationReason CancellationReason        `json:"cancellationReason,omitempty"`
 }
 
 // JobSummaryWire is the compact item returned when job.list lists jobs. It
@@ -303,8 +310,10 @@ type JobSummaryWire struct {
 	CreatedAt time.Time `json:"createdAt"`
 	// UpdatedAt reports when the job was last updated.
 	UpdatedAt time.Time `json:"updatedAt"`
-	// ModelReported is the model reported by the backend, when available.
+	// ModelReported is the latest model value reported by the backend, when available.
 	ModelReported string `json:"modelReported,omitempty"`
+	// EffortReported is the latest effort value reported by the backend, when available.
+	EffortReported string `json:"effortReported,omitempty"`
 	// FailureClass is the compact failure category for a failed job, when set.
 	FailureClass FailureClass `json:"failureClass,omitempty"`
 	// Contract is the compact output-schema verdict, when evaluation occurred.
@@ -322,8 +331,60 @@ type JobSummaryWire struct {
 
 // JobFailureWire records the public failure category and reason for a job.
 type JobFailureWire struct {
-	Class  FailureClass `json:"class"`
-	Reason string       `json:"reason"`
+	Class           FailureClass `json:"class"`
+	Reason          string       `json:"reason"`
+	ProviderCode    string       `json:"providerCode,omitempty"`
+	ProviderMessage string       `json:"providerMessage,omitempty"`
+	Stage           string       `json:"stage,omitempty"`
+	RetryAfter      *time.Time   `json:"retryAfter,omitempty"`
+}
+
+// CancellationReason records why cancellation, timeout, or interruption ended
+// a job. It is independent of the terminal public state.
+type CancellationReason string
+
+const (
+	CancellationReasonOperator             CancellationReason = "operator"
+	CancellationReasonDeadline             CancellationReason = "deadline"
+	CancellationReasonDaemonShutdown       CancellationReason = "daemon_shutdown"
+	CancellationReasonProviderInterruption CancellationReason = "provider_interruption"
+)
+
+// Valid reports whether reason is one of the protocol cancellation causes.
+func (reason CancellationReason) Valid() bool {
+	switch reason {
+	case CancellationReasonOperator, CancellationReasonDeadline, CancellationReasonDaemonShutdown, CancellationReasonProviderInterruption:
+		return true
+	default:
+		return false
+	}
+}
+
+// ResumableProjection explains whether the durable record satisfies the local
+// admission rules for creating a resumed job.
+type ResumableProjection struct {
+	Eligible bool   `json:"eligible"`
+	Reason   string `json:"reason"`
+}
+
+// BackendInspectParams selects no options; inspection is a narrow read-only
+// view of configured local executables.
+type BackendInspectParams struct{}
+
+// BackendInspectionWire is one backend's executable inspection. Error is
+// isolated to this entry so one failing executable cannot hide the others.
+type BackendInspectionWire struct {
+	Backend        string `json:"backend"`
+	ExecutablePath string `json:"executablePath,omitempty"`
+	Version        string `json:"version,omitempty"`
+	DefaultModel   string `json:"defaultModel,omitempty"`
+	DefaultEffort  string `json:"defaultEffort,omitempty"`
+	Error          string `json:"error,omitempty"`
+}
+
+// BackendInspectResult is the response to backend.inspect.
+type BackendInspectResult struct {
+	Backends []BackendInspectionWire `json:"backends"`
 }
 
 // ResultInfoWire describes the authoritative spilled final result.

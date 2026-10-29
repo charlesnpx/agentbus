@@ -256,22 +256,31 @@ func (s *Server) resumeTargetFromLookup(spec protocol.TaskSpec, lookup jobstore.
 // home was retained. Failed, canceled, and unknown terminal jobs retain their
 // homes as before; a completed job must have declared session retention.
 func validateResumeTarget(spec protocol.TaskSpec, target jobstore.Record) error {
-	if target.JobID != spec.ResumeJobID {
-		return errors.New("resume lookup returned a different job")
-	}
-	if target.Backend != spec.Backend {
-		return fmt.Errorf("resume target backend %q does not match taskSpec.backend %q", target.Backend, spec.Backend)
-	}
-	if !target.SessionHomeRetained() {
-		return errors.New("completed jobs are not resumable unless submitted with session retention; submit a new job")
-	}
-	if !target.State.IsTerminal() {
-		return fmt.Errorf("resume target is %s rather than terminal", target.State)
-	}
-	if strings.TrimSpace(target.BackendSessionID) == "" {
-		return errors.New("resume target has no recorded backend session")
+	if reason := resumeTargetIneligibilityReason(spec, target); reason != "" {
+		return errors.New(reason)
 	}
 	return nil
+}
+
+// resumeTargetIneligibilityReason is shared by admission and job.get's
+// resumability projection so both use the same durable session rules.
+func resumeTargetIneligibilityReason(spec protocol.TaskSpec, target jobstore.Record) string {
+	if target.JobID != spec.ResumeJobID {
+		return "resume lookup returned a different job"
+	}
+	if spec.Backend != "" && target.Backend != spec.Backend {
+		return fmt.Sprintf("resume target backend %q does not match taskSpec.backend %q", target.Backend, spec.Backend)
+	}
+	if !target.SessionHomeRetained() {
+		return "completed jobs are not resumable unless submitted with session retention; submit a new job"
+	}
+	if !target.State.IsTerminal() {
+		return fmt.Sprintf("resume target is %s rather than terminal", target.State)
+	}
+	if strings.TrimSpace(target.BackendSessionID) == "" {
+		return "resume target has no recorded backend session"
+	}
+	return ""
 }
 
 // taskSpecOptionalString supplies Record's summary fields. Presence remains

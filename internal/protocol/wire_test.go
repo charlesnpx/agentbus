@@ -299,8 +299,11 @@ func TestJobRecordWireFieldAllowList(t *testing.T) {
 	want := map[string]struct{}{
 		"JobID": {}, "WorkspaceKey": {}, "RequestID": {}, "Backend": {},
 		"State": {}, "Tags": {}, "CreatedAt": {}, "StartedAt": {},
-		"FinishedAt": {}, "Timeout": {}, "Result": {}, "Contract": {},
-		"Failure": {}, "Cleanup": {}, "LogPaths": {}, "ModelReported": {},
+		"FinishedAt": {}, "Timeout": {}, "Deadline": {}, "RemainingMs": {},
+		"Resumable": {}, "ModelRequested": {}, "EffortRequested": {},
+		"Result": {}, "Contract": {}, "Failure": {}, "Cleanup": {},
+		"LogPaths": {}, "ModelReported": {}, "EffortReported": {},
+		"CancellationReason": {},
 	}
 
 	recordType := reflect.TypeOf(JobRecordWire{})
@@ -316,7 +319,8 @@ func TestJobRecordWireFieldAllowList(t *testing.T) {
 func TestJobSummaryWireFieldAllowList(t *testing.T) {
 	want := map[string]struct{}{
 		"JobID": {}, "Backend": {}, "State": {}, "Cleanup": {}, "CreatedAt": {},
-		"UpdatedAt": {}, "ModelReported": {}, "FailureClass": {}, "Contract": {},
+		"UpdatedAt": {}, "ModelReported": {}, "EffortReported": {},
+		"FailureClass": {}, "Contract": {},
 		"Tags": {}, "ItemCount": {}, "LastItemAt": {}, "LastActivityAt": {}, "Liveness": {},
 	}
 

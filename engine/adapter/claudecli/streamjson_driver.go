@@ -278,7 +278,7 @@ func (s *claudeStream) handleFrame(ctx context.Context, frame duplex.Frame, sess
 		}
 	case "error":
 		if text := textFrom(obj); text != "" {
-			s.emitEvent(engine.Event{Type: engine.EventTerminalError, Text: text, Metadata: obj})
+			s.emitEvent(claudeTerminalError(text, obj))
 		}
 	default:
 		if text := textFrom(obj); text != "" {
@@ -318,8 +318,10 @@ func (s *claudeStream) handleControlRequest(ctx context.Context, obj map[string]
 }
 
 func (s *claudeStream) emitModelReported(obj map[string]any) {
-	if model := strings.TrimSpace(firstString(obj, "model")); model != "" {
-		s.emitEvent(engine.Event{Type: engine.EventModelReported, ModelReported: model, Metadata: obj})
+	model := strings.TrimSpace(firstString(obj, "model"))
+	effort := strings.TrimSpace(firstString(obj, "effort", "reasoning_effort", "reasoningEffort"))
+	if model != "" || effort != "" {
+		s.emitEvent(engine.Event{Type: engine.EventModelReported, ModelReported: model, EffortReported: effort, Metadata: obj})
 	}
 }
 
@@ -449,7 +451,169 @@ func (s *claudeStream) emitResult(obj map[string]any) {
 		return
 	}
 	text := resultErrorText(obj, strings.TrimSpace(subtype))
-	s.emitEvent(engine.Event{Type: engine.EventTerminalError, Text: text, Metadata: obj})
+	s.emitEvent(claudeTerminalError(text, obj))
+}
+
+func claudeTerminalError(text string, metadata map[string]any) engine.Event {
+	event := engine.Event{Type: engine.EventTerminalError, Text: text, Metadata: metadata}
+	evidence, ok := claudeProviderFailure(metadata, text)
+	if ok {
+		event.Err = &engine.ProviderFailureError{Evidence: evidence, Cause: errors.New(text)}
+	}
+	return event
+}
+
+func claudeProviderFailure(metadata map[string]any, fallbackMessage string) (engine.ProviderFailureEvidence, bool) {
+	objects := []map[string]any{metadata}
+	if nested, ok := firstMap(metadata, "error"); ok {
+		objects = append(objects, nested)
+	}
+	for _, item := range anySlice(metadata["errors"]) {
+		if nested, ok := item.(map[string]any); ok {
+			objects = append(objects, nested)
+		}
+	}
+
+	code := ""
+	message := ""
+	for index, object := range objects {
+		if code == "" {
+			if index == 0 {
+				code = firstString(object, "code", "error_code", "errorCode")
+			} else {
+				code = firstString(object, "code", "type", "error_code", "errorCode")
+			}
+		}
+		if message == "" {
+			message = firstString(object, "message", "detail", "error_description")
+		}
+	}
+	if message == "" {
+		message = strings.TrimSpace(fallbackMessage)
+	}
+
+	kind := classifyClaudeProviderFailure(code, message, objects)
+	retryAfter := claudeRetryAfter(objects)
+	if kind == "" && code == "" && message == "" && retryAfter == nil {
+		return engine.ProviderFailureEvidence{}, false
+	}
+	return engine.ProviderFailureEvidence{
+		Class:      kind,
+		Code:       code,
+		Message:    message,
+		RetryAfter: retryAfter,
+	}, true
+}
+
+func classifyClaudeProviderFailure(code, message string, objects []map[string]any) string {
+	normalized := normalizeClaudeFailureCode(code)
+	switch normalized {
+	case "ratelimit", "ratelimiterror", "usagelimit", "usagelimiterror", "quotaexceeded", "quotaerror":
+		return "usage_limit"
+	case "authentication", "authenticationerror", "unauthorized", "invalidapikey", "invalidtoken":
+		return "authentication"
+	case "serveroverloaded", "overloaded":
+		return "provider_overloaded"
+	case "modelnotfound", "modelunavailable":
+		return "model_unavailable"
+	case "contentpolicyviolation", "contentpolicy", "safetyviolation":
+		return "content_policy"
+	}
+	for _, object := range objects {
+		if status := firstNumber(object, "status", "status_code", "statusCode"); status == 401 || status == 403 {
+			return "authentication"
+		}
+	}
+	text := strings.ToLower(message)
+	if strings.Contains(text, "rate limited") || strings.Contains(text, "rate limit exceeded") || strings.Contains(text, "usage limit") || strings.Contains(text, "quota exceeded") {
+		return "usage_limit"
+	}
+	return ""
+}
+
+func normalizeClaudeFailureCode(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.NewReplacer("_", "", "-", "", " ", "").Replace(value)
+	return value
+}
+
+func claudeRetryAfter(objects []map[string]any) *time.Time {
+	for _, object := range objects {
+		for _, key := range []string{"retry_after", "retryAfter", "reset_at", "resetAt", "retry_after_ms", "retryAfterMs"} {
+			if value, ok := object[key]; ok {
+				if parsed := parseClaudeRetryAfter(key, value); parsed != nil {
+					return parsed
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func parseClaudeRetryAfter(key string, value any) *time.Time {
+	if text, ok := value.(string); ok {
+		text = strings.TrimSpace(text)
+		if parsed, err := time.Parse(time.RFC3339Nano, text); err == nil {
+			parsed = parsed.UTC()
+			return &parsed
+		}
+		if seconds, err := strconv.ParseFloat(text, 64); err == nil {
+			return claudeRetryTime(key, seconds)
+		}
+		return nil
+	}
+	if number := firstNumberFromValue(value); number >= 0 {
+		return claudeRetryTime(key, number)
+	}
+	return nil
+}
+
+func claudeRetryTime(key string, value float64) *time.Time {
+	if value <= 0 {
+		return nil
+	}
+	if strings.HasSuffix(key, "_ms") || strings.HasSuffix(key, "Ms") {
+		value /= 1000
+	} else if strings.HasPrefix(key, "reset") {
+		seconds := int64(value)
+		nanos := int64((value - float64(seconds)) * float64(time.Second))
+		parsed := time.Unix(seconds, nanos).UTC()
+		return &parsed
+	} else {
+		// Relative retry-after values are converted once to an absolute time.
+		parsed := time.Now().UTC().Add(time.Duration(value * float64(time.Second)))
+		return &parsed
+	}
+	parsed := time.Now().UTC().Add(time.Duration(value * float64(time.Second)))
+	return &parsed
+}
+
+func firstNumber(object map[string]any, keys ...string) float64 {
+	for _, key := range keys {
+		if value, ok := object[key]; ok {
+			if number := firstNumberFromValue(value); number >= 0 {
+				return number
+			}
+		}
+	}
+	return -1
+}
+
+func firstNumberFromValue(value any) float64 {
+	switch number := value.(type) {
+	case float64:
+		return number
+	case int:
+		return float64(number)
+	case int64:
+		return float64(number)
+	case json.Number:
+		parsed, err := number.Float64()
+		if err == nil {
+			return parsed
+		}
+	}
+	return -1
 }
 
 func (s *claudeStream) emitEvent(ev engine.Event) {

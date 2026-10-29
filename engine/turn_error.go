@@ -1,6 +1,9 @@
 package engine
 
-import "errors"
+import (
+	"errors"
+	"time"
+)
 
 var (
 	// ErrTurnInterrupted marks a backend-confirmed turn interruption that was
@@ -19,3 +22,39 @@ var (
 	// backend-controlled text.
 	ErrTransportFrameTooLarge = errors.New("backend transport frame exceeded configured limit")
 )
+
+// ProviderFailureEvidence is metadata an adapter obtained from a provider's
+// structured error response. Message is separate from the job failure reason.
+type ProviderFailureEvidence struct {
+	Class      string
+	Code       string
+	Message    string
+	RetryAfter *time.Time
+}
+
+// ProviderFailureError keeps structured provider evidence attached to the
+// original adapter error without changing its text or error identity.
+type ProviderFailureError struct {
+	Evidence ProviderFailureEvidence
+	Cause    error
+}
+
+func (err *ProviderFailureError) Error() string {
+	if err == nil {
+		return "provider failure"
+	}
+	if err.Cause != nil {
+		return err.Cause.Error()
+	}
+	if err.Evidence.Message != "" {
+		return err.Evidence.Message
+	}
+	return "provider failure"
+}
+
+func (err *ProviderFailureError) Unwrap() error {
+	if err == nil {
+		return nil
+	}
+	return err.Cause
+}

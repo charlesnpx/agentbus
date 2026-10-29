@@ -13,6 +13,17 @@ type Backend interface {
 	Resume(ctx context.Context, id string, opts SessionOpts) (Session, error)
 }
 
+// BackendInspection describes the local executable configured for a backend.
+// It does not describe account status or provider model availability.
+type BackendInspection struct {
+	Executable string
+}
+
+// BackendInspectionProvider exposes the executable configured on an adapter.
+type BackendInspectionProvider interface {
+	BackendInspection() BackendInspection
+}
+
 // Session is one resumable backend conversation.
 type Session interface {
 	ID() string
@@ -59,12 +70,13 @@ type TurnInput struct {
 
 // Event is an agentbus streaming event emitted by an adapter.
 type Event struct {
-	Type          string         `json:"type"`
-	Name          string         `json:"name,omitempty"`
-	Text          string         `json:"text"`
-	Truncated     bool           `json:"truncated"`
-	ModelReported string         `json:"modelReported,omitempty"`
-	Metadata      map[string]any `json:"metadata,omitempty"`
+	Type           string         `json:"type"`
+	Name           string         `json:"name,omitempty"`
+	Text           string         `json:"text"`
+	Truncated      bool           `json:"truncated"`
+	ModelReported  string         `json:"modelReported,omitempty"`
+	EffortReported string         `json:"effortReported,omitempty"`
+	Metadata       map[string]any `json:"metadata,omitempty"`
 	// ObservedWorkspaceWriteItem reports one write-bearing item observed by
 	// the backend. It is in-process metadata only: callers persist its count,
 	// never the item, paths, or contents.

@@ -41,6 +41,27 @@ func TestVersionReportsBothVersions(t *testing.T) {
 	}
 }
 
+func TestBackendsCommandUsesBackendInspectionResult(t *testing.T) {
+	a := testApp(t)
+	client := &fakeProtocolClient{backends: agentclient.BackendInspectResult{Backends: []agentclient.BackendInspection{
+		{Backend: "codex", ExecutablePath: "/opt/codex", Version: "codex 1.2.3", DefaultModel: "gpt-5", DefaultEffort: "high"},
+		{Backend: "claude", Error: "--version failed: exit status 1"},
+	}}}
+	a.clientConnect = fakeConnector(client)
+	code, stdout, stderr := runTestCLI(t, a, []string{"backends"})
+	if code != 0 || stderr != "" || !strings.Contains(stdout, `backend=codex executablePath="/opt/codex" version="codex 1.2.3"`) || !strings.Contains(stdout, `backend=claude error="--version failed: exit status 1"`) {
+		t.Fatalf("backends text=(%d,%q,%q)", code, stdout, stderr)
+	}
+	code, stdout, stderr = runTestCLI(t, a, []string{"backends", "--json"})
+	if code != 0 || stderr != "" {
+		t.Fatalf("backends JSON=(%d,%q,%q)", code, stdout, stderr)
+	}
+	var decoded agentclient.BackendInspectResult
+	if err := json.Unmarshal([]byte(stdout), &decoded); err != nil || len(decoded.Backends) != 2 || decoded.Backends[0].DefaultModel != "gpt-5" {
+		t.Fatalf("backends JSON response=%q decoded=%#v err=%v", stdout, decoded, err)
+	}
+}
+
 func TestHelpExitsSuccessfullyWithoutConnecting(t *testing.T) {
 	for _, args := range [][]string{
 		{"--help"}, {"-h"}, {"help"}, {"status", "--help"}, {"result", "-h"},
@@ -301,7 +322,7 @@ func TestStatusHumanProjectionIncludesOperatorFieldsAndNeverResultText(t *testin
 		"startedAt=2026-01-02T03:05:05Z",
 		"finishedAt=2026-01-02T03:06:05Z",
 		"timeout.effective=1800000 timeout.source=client",
-		"model=gpt-5 tags=a=first,z=last",
+		"model.reported=\"gpt-5\" tags=a=first,z=last",
 		"result.bytes=18 result.sha256=sha256:aaaaaaaaaaaa",
 		"failure.class=backend_error failure.reason=provider stopped",
 		"contract.evaluated=true contract.compliant=false",
@@ -823,6 +844,7 @@ func runTestCLI(t *testing.T, a *app, args []string) (int, string, string) {
 }
 
 type fakeProtocolClient struct {
+	backends         agentclient.BackendInspectResult
 	records          map[string]agentclient.JobGetResult
 	jobGetFunc       func(context.Context, agentclient.JobGetParams) (agentclient.JobGetResult, error)
 	list             agentclient.JobListResult
@@ -833,6 +855,13 @@ type fakeProtocolClient struct {
 	cancels          map[string]agentclient.JobCancelResult
 	cancelParams     []agentclient.JobCancelParams
 	err              error
+}
+
+func (c *fakeProtocolClient) BackendInspect(_ context.Context, _ agentclient.BackendInspectParams) (agentclient.BackendInspectResult, error) {
+	if c.err != nil {
+		return agentclient.BackendInspectResult{}, c.err
+	}
+	return c.backends, nil
 }
 
 func (c *fakeProtocolClient) JobGet(ctx context.Context, params agentclient.JobGetParams) (agentclient.JobGetResult, error) {

@@ -972,6 +972,14 @@ func (c *Client) JobCancel(ctx context.Context, params JobCancelParams) (JobCanc
 	return out, err
 }
 
+// BackendInspect returns resolved local executable and version information for
+// each configured backend. Individual backend failures remain in the result.
+func (c *Client) BackendInspect(ctx context.Context, params BackendInspectParams) (BackendInspectResult, error) {
+	var out BackendInspectResult
+	err := c.do(ctx, protocol.MethodBackendInspect, params, &out)
+	return out, err
+}
+
 func mustMarshal(v any) json.RawMessage {
 	b, err := json.Marshal(v)
 	if err != nil {

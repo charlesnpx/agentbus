@@ -121,31 +121,37 @@ type Record struct {
 	// BackendSessionID is assigned only from a backend's turn-final
 	// observation. An omitted value means the job never produced a resumable
 	// backend session; it is not an unknown-session marker.
-	BackendSessionID string                  `json:"backendSessionId,omitempty"`
-	RetainSession    bool                    `json:"retainSession,omitempty"`
-	Model            string                  `json:"model,omitempty"`
-	ModelReported    string                  `json:"modelReported,omitempty"`
-	CWD              string                  `json:"cwd,omitempty"`
-	Write            bool                    `json:"write"`
-	Effort           string                  `json:"effort,omitempty"`
-	TaskSpec         json.RawMessage         `json:"taskSpec,omitempty"`
-	State            protocol.PublicState    `json:"state"`
-	Starting         bool                    `json:"starting,omitempty"`
-	ProcessClaim     *ProcessClaim           `json:"processClaim,omitempty"`
-	Cleanup          protocol.Cleanup        `json:"cleanup"`
-	CreatedAt        time.Time               `json:"createdAt"`
-	UpdatedAt        time.Time               `json:"updatedAt"`
-	StartedAt        *time.Time              `json:"startedAt,omitempty"`
-	FinishedAt       *time.Time              `json:"finishedAt,omitempty"`
-	FailureClass     protocol.FailureClass   `json:"failureClass,omitempty"`
-	FailureReason    string                  `json:"failureReason,omitempty"`
-	Diagnostics      []string                `json:"diagnostics"`
-	Contract         protocol.ContractResult `json:"contract"`
-	ResultText       string                  `json:"resultText,omitempty"`
-	ResultPath       string                  `json:"resultPath,omitempty"`
-	ResultSHA256     string                  `json:"resultSHA256,omitempty"`
-	ResultBytes      int64                   `json:"resultBytes,omitempty"`
-	Artifacts        ArtifactPaths           `json:"artifacts"`
+	BackendSessionID       string                      `json:"backendSessionId,omitempty"`
+	RetainSession          bool                        `json:"retainSession,omitempty"`
+	Model                  string                      `json:"model,omitempty"`
+	ModelReported          string                      `json:"modelReported,omitempty"`
+	EffortReported         string                      `json:"effortReported,omitempty"`
+	CWD                    string                      `json:"cwd,omitempty"`
+	Write                  bool                        `json:"write"`
+	Effort                 string                      `json:"effort,omitempty"`
+	TaskSpec               json.RawMessage             `json:"taskSpec,omitempty"`
+	State                  protocol.PublicState        `json:"state"`
+	Starting               bool                        `json:"starting,omitempty"`
+	ProcessClaim           *ProcessClaim               `json:"processClaim,omitempty"`
+	Cleanup                protocol.Cleanup            `json:"cleanup"`
+	CreatedAt              time.Time                   `json:"createdAt"`
+	UpdatedAt              time.Time                   `json:"updatedAt"`
+	StartedAt              *time.Time                  `json:"startedAt,omitempty"`
+	FinishedAt             *time.Time                  `json:"finishedAt,omitempty"`
+	FailureClass           protocol.FailureClass       `json:"failureClass,omitempty"`
+	FailureReason          string                      `json:"failureReason,omitempty"`
+	FailureProviderCode    string                      `json:"failureProviderCode,omitempty"`
+	FailureProviderMessage string                      `json:"failureProviderMessage,omitempty"`
+	FailureStage           string                      `json:"failureStage,omitempty"`
+	FailureRetryAfter      *time.Time                  `json:"failureRetryAfter,omitempty"`
+	CancellationReason     protocol.CancellationReason `json:"cancellationReason,omitempty"`
+	Diagnostics            []string                    `json:"diagnostics"`
+	Contract               protocol.ContractResult     `json:"contract"`
+	ResultText             string                      `json:"resultText,omitempty"`
+	ResultPath             string                      `json:"resultPath,omitempty"`
+	ResultSHA256           string                      `json:"resultSHA256,omitempty"`
+	ResultBytes            int64                       `json:"resultBytes,omitempty"`
+	Artifacts              ArtifactPaths               `json:"artifacts"`
 }
 
 // SessionHomeRetained reports whether this record's backend session home is
@@ -160,18 +166,23 @@ func (record Record) SessionHomeRetained() bool {
 // records and other terminal states, an empty ID retains one already recorded
 // by a retired turn.
 type TerminalUpdate struct {
-	State            protocol.PublicState
-	Cleanup          protocol.Cleanup
-	BackendSessionID string
-	FailureClass     protocol.FailureClass
-	FailureReason    string
-	Diagnostics      []string
-	Contract         protocol.ContractResult
-	ResultText       string
-	ResultPath       string
-	ResultSHA256     string
-	ResultBytes      int64
-	FinishedAt       time.Time
+	State                  protocol.PublicState
+	Cleanup                protocol.Cleanup
+	BackendSessionID       string
+	FailureClass           protocol.FailureClass
+	FailureReason          string
+	FailureProviderCode    string
+	FailureProviderMessage string
+	FailureStage           string
+	FailureRetryAfter      *time.Time
+	CancellationReason     protocol.CancellationReason
+	Diagnostics            []string
+	Contract               protocol.ContractResult
+	ResultText             string
+	ResultPath             string
+	ResultSHA256           string
+	ResultBytes            int64
+	FinishedAt             time.Time
 }
 
 // RecordLookup reads a record from the same submit transaction that is
@@ -663,16 +674,24 @@ func (store *Store) RecordBackendSessionID(id, sessionID string) (Record, error)
 	return result, err
 }
 
-// RecordModelReported preserves the first non-empty model observation from a
+// RecordModelReported records the latest non-empty model observation from a
 // backend. It is separate from the requested Model: an omitted observation
 // remains omitted rather than being inferred from the request.
 func (store *Store) RecordModelReported(id, model string) error {
+	return store.RecordObservedSelection(id, model, "")
+}
+
+// RecordObservedSelection stores the latest non-empty model and effort values
+// actually reported by a backend. Empty inputs leave the prior observation
+// unchanged.
+func (store *Store) RecordObservedSelection(id, model, effort string) error {
 	if err := validateJobID(id); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalid, err)
 	}
 	model = strings.TrimSpace(model)
-	if model == "" {
-		return fmt.Errorf("%w: reported model is required", ErrInvalid)
+	effort = strings.TrimSpace(effort)
+	if model == "" && effort == "" {
+		return fmt.Errorf("%w: reported model or effort is required", ErrInvalid)
 	}
 
 	return store.update(func(tx *bolt.Tx) error {
@@ -687,12 +706,17 @@ func (store *Store) RecordModelReported(id, model string) error {
 		if current.State.IsTerminal() {
 			return ErrTerminal
 		}
-		if current.ModelReported != "" {
+		if model == "" && effort == "" {
 			return nil
 		}
 
 		next := current
-		next.ModelReported = model
+		if model != "" {
+			next.ModelReported = model
+		}
+		if effort != "" {
+			next.EffortReported = effort
+		}
 		next.UpdatedAt = time.Now().UTC()
 		normalizeRecord(&next)
 		if err := validateRecord(next); err != nil {
@@ -740,6 +764,11 @@ func (store *Store) MarkTerminal(id string, terminal TerminalUpdate) (Record, er
 		}
 		next.FailureClass = terminal.FailureClass
 		next.FailureReason = terminal.FailureReason
+		next.FailureProviderCode = terminal.FailureProviderCode
+		next.FailureProviderMessage = terminal.FailureProviderMessage
+		next.FailureStage = terminal.FailureStage
+		next.FailureRetryAfter = cloneTime(terminal.FailureRetryAfter)
+		next.CancellationReason = terminal.CancellationReason
 		next.Diagnostics = append([]string(nil), terminal.Diagnostics...)
 		next.Contract = terminal.Contract
 		next.ResultText = terminal.ResultText
@@ -897,13 +926,24 @@ func validateRecord(record Record) error {
 		if !record.FailureClass.Valid() {
 			return fmt.Errorf("%w: failed record requires a valid failure class", ErrInvalid)
 		}
-	} else if record.FailureClass != "" || record.FailureReason != "" {
+	} else if record.FailureClass != "" || record.FailureReason != "" || record.FailureProviderCode != "" || record.FailureProviderMessage != "" || record.FailureStage != "" || record.FailureRetryAfter != nil {
 		return fmt.Errorf("%w: failure fields require failed state", ErrInvalid)
+	}
+	if record.CancellationReason != "" && !record.CancellationReason.Valid() {
+		return fmt.Errorf("%w: invalid cancellation reason %q", ErrInvalid, record.CancellationReason)
 	}
 	if record.ResultText != "" && record.State != protocol.PublicStateCompleted {
 		return fmt.Errorf("%w: result text requires completed state", ErrInvalid)
 	}
 	return nil
+}
+
+func cloneTime(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	copy := value.UTC()
+	return &copy
 }
 
 func (claim ProcessClaim) validate() error {

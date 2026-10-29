@@ -74,6 +74,7 @@ func (d *appServerDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resume
 	if id := extractThreadID(threadResult); id != "" {
 		threadID = id
 	}
+	emitCodexSelection(threadResult, rpc.emit)
 	if threadID == "" {
 		return "", errors.New("codex app-server thread response missing thread id")
 	}
@@ -93,6 +94,7 @@ func (d *appServerDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resume
 	if err != nil {
 		return threadID, err
 	}
+	emitCodexSelection(turnResult, rpc.emit)
 	turnID := extractTurnID(turnResult)
 	if turnID == "" {
 		return threadID, errors.New("codex app-server turn/start response missing turn id")
@@ -527,12 +529,73 @@ func (c *appServerRPC) handleNotification(frame duplex.Frame) {
 		return
 	}
 	method := firstString(frame.Object, "method")
+	if isCodexSelectionNotification(method) {
+		emitCodexSelection(paramsMap(frame.Object), c.emit)
+	}
 	if method != "warning" && method != "error" && method != "config/warning" && method != "guardian/warning" {
 		return
 	}
 	if text := textFrom(paramsMap(frame.Object)); text != "" {
 		c.emit(engine.Event{Type: engine.EventWarning, Text: text, Metadata: frame.Object})
 	}
+}
+
+func isCodexSelectionNotification(method string) bool {
+	switch method {
+	case "thread/started", "thread/updated", "thread/model/changed", "thread/settings/changed",
+		"turn/started", "model/changed", "settings/updated", "config/settings/updated":
+		return true
+	default:
+		return false
+	}
+}
+
+func emitCodexSelection(value any, emit duplex.EmitFunc) {
+	if emit == nil {
+		return
+	}
+	model, effort := codexSelectionValues(value)
+	if model == "" && effort == "" {
+		return
+	}
+	emit(engine.Event{Type: engine.EventModelReported, ModelReported: model, EffortReported: effort})
+}
+
+func codexSelectionValues(value any) (string, string) {
+	var model, effort string
+	var visit func(any, int)
+	visit = func(current any, depth int) {
+		if depth > 5 || model != "" && effort != "" {
+			return
+		}
+		object, ok := current.(map[string]any)
+		if !ok {
+			return
+		}
+		if model == "" {
+			model = firstString(object, "model", "modelId", "model_id", "currentModel", "current_model", "modelName", "model_name")
+			if model == "" {
+				if detail, ok := firstMap(object, "model"); ok {
+					model = firstString(detail, "id", "modelId", "model_id", "name")
+				}
+			}
+		}
+		if effort == "" {
+			effort = firstString(object, "effort", "reasoningEffort", "reasoning_effort", "effortLevel", "reasoningLevel", "reasoning_level")
+			if effort == "" {
+				if detail, ok := firstMap(object, "reasoning"); ok {
+					effort = firstString(detail, "effort", "level")
+				}
+			}
+		}
+		for _, key := range []string{"thread", "turn", "settings", "config", "modelSettings", "model_settings", "reasoning"} {
+			if nested, ok := firstMap(object, key); ok {
+				visit(nested, depth+1)
+			}
+		}
+	}
+	visit(value, 0)
+	return strings.TrimSpace(model), strings.TrimSpace(effort)
 }
 
 type turnObserver struct {
@@ -553,10 +616,12 @@ type pendingToolItem struct {
 }
 
 type turnCompletion struct {
-	threadID  string
-	status    string
-	error     string
-	errorInfo string
+	threadID   string
+	status     string
+	error      string
+	errorInfo  string
+	errorCode  string
+	retryAfter *time.Time
 }
 
 func (o *turnObserver) handle(frame duplex.Frame) bool {
@@ -699,6 +764,8 @@ func (o *turnObserver) complete(payload map[string]any) {
 	}
 	errText := ""
 	errInfo := ""
+	errCode := ""
+	var retryAfter *time.Time
 	for _, completion := range []map[string]any{turn, payload} {
 		if completion == nil {
 			continue
@@ -713,15 +780,23 @@ func (o *turnObserver) complete(payload map[string]any) {
 		if errInfo == "" {
 			errInfo = firstString(errObj, "codex_error_info", "codexErrorInfo")
 		}
+		if errCode == "" {
+			errCode = firstString(errObj, "code", "type", "error_code", "errorCode")
+		}
+		if retryAfter == nil {
+			retryAfter = codexRetryAfter(errObj)
+		}
 	}
 	if errText == "" {
 		errText = textFrom(payload)
 	}
 	o.completion = &turnCompletion{
-		threadID:  firstString(payload, "threadId", "thread_id"),
-		status:    status,
-		error:     errText,
-		errorInfo: errInfo,
+		threadID:   firstString(payload, "threadId", "thread_id"),
+		status:     status,
+		error:      errText,
+		errorInfo:  errInfo,
+		errorCode:  errCode,
+		retryAfter: retryAfter,
 	}
 }
 
@@ -784,7 +859,8 @@ func finishTurnCompletion(threadID string, active *activeAppServerTurn, observer
 		observer.emitEvent(engine.Event{Type: engine.EventResultMessage, Text: observer.resultText()})
 		return threadID, nil
 	case "failed", "":
-		msg := strings.TrimSpace(completion.error)
+		providerMessage := strings.TrimSpace(completion.error)
+		msg := providerMessage
 		if completion.status == "" && msg == "" {
 			observer.emitEvent(engine.Event{Type: engine.EventResultMessage, Text: observer.resultText()})
 			return threadID, nil
@@ -792,8 +868,16 @@ func finishTurnCompletion(threadID string, active *activeAppServerTurn, observer
 		if msg == "" {
 			msg = "turn failed"
 		}
-		if isProviderOverloaded(completion.errorInfo, msg) {
-			return threadID, fmt.Errorf("codex app-server provider overload: %s: %w", msg, engine.ErrProviderOverloaded)
+		providerCode := firstNonempty(completion.errorInfo, completion.errorCode)
+		if isProviderOverloaded(providerCode, msg) {
+			cause := fmt.Errorf("codex app-server provider overload: %s: %w", msg, engine.ErrProviderOverloaded)
+			return threadID, &engine.ProviderFailureError{Evidence: engine.ProviderFailureEvidence{
+				Class: "provider_overloaded", Code: providerCode, Message: providerMessage, RetryAfter: completion.retryAfter,
+			}, Cause: cause}
+		}
+		if evidence, ok := codexProviderFailure(completion.errorInfo, completion.errorCode, providerMessage, completion.retryAfter); ok {
+			cause := fmt.Errorf("codex app-server turn failed: %s", msg)
+			return threadID, &engine.ProviderFailureError{Evidence: evidence, Cause: cause}
 		}
 		return threadID, fmt.Errorf("codex app-server turn failed: %s", msg)
 	case "interrupted":
@@ -804,6 +888,77 @@ func finishTurnCompletion(threadID string, active *activeAppServerTurn, observer
 	default:
 		return threadID, fmt.Errorf("codex app-server turn completed with unsupported status %q", completion.status)
 	}
+}
+
+func codexProviderFailure(errorInfo, code, message string, retryAfter *time.Time) (engine.ProviderFailureEvidence, bool) {
+	providerCode := firstNonempty(errorInfo, code)
+	normalized := normalizeProviderErrorInfo(providerCode)
+	class := ""
+	switch normalized {
+	case "ratelimit", "ratelimiterror", "ratelimitexceeded", "usagelimit", "usagelimiterror", "usagelimitreached", "usagelimitexceeded", "quotaexceeded", "quotaerror":
+		class = "usage_limit"
+	case "authentication", "authenticationerror", "unauthorized", "invalidapikey", "invalidtoken":
+		class = "authentication"
+	case "modelnotfound", "modelunavailable":
+		class = "model_unavailable"
+	case "contentpolicy", "contentpolicyviolation", "safetyviolation":
+		class = "content_policy"
+	}
+	message = strings.TrimSpace(message)
+	if class == "" && providerCode == "" && message == "" && retryAfter == nil {
+		return engine.ProviderFailureEvidence{}, false
+	}
+	return engine.ProviderFailureEvidence{Class: class, Code: providerCode, Message: message, RetryAfter: retryAfter}, true
+}
+
+func firstNonempty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func codexRetryAfter(object map[string]any) *time.Time {
+	for _, key := range []string{"retry_after", "retryAfter", "reset_at", "resetAt", "retry_after_ms", "retryAfterMs"} {
+		value, ok := object[key]
+		if !ok {
+			continue
+		}
+		var text string
+		switch raw := value.(type) {
+		case string:
+			text = strings.TrimSpace(raw)
+		case json.Number:
+			text = raw.String()
+		case float64:
+			text = strconv.FormatFloat(raw, 'f', -1, 64)
+		case int64:
+			text = strconv.FormatInt(raw, 10)
+		case int:
+			text = strconv.Itoa(raw)
+		}
+		if parsed, err := time.Parse(time.RFC3339Nano, text); err == nil {
+			parsed = parsed.UTC()
+			return &parsed
+		}
+		seconds, err := strconv.ParseFloat(text, 64)
+		if err != nil || seconds <= 0 {
+			continue
+		}
+		if strings.HasSuffix(key, "_ms") || strings.HasSuffix(key, "Ms") {
+			seconds /= 1000
+		}
+		if strings.HasPrefix(key, "reset") {
+			whole := int64(seconds)
+			parsed := time.Unix(whole, int64((seconds-float64(whole))*float64(time.Second))).UTC()
+			return &parsed
+		}
+		parsed := time.Now().UTC().Add(time.Duration(seconds * float64(time.Second)))
+		return &parsed
+	}
+	return nil
 }
 
 // isProviderOverloaded recognizes a confirmed overload code or a capacity message.
@@ -962,9 +1117,27 @@ func declineAnswers(params map[string]any) map[string]any {
 
 func responseResult(obj map[string]any) (any, error) {
 	if errObj, ok := firstMap(obj, "error"); ok {
-		msg := textFrom(errObj)
+		providerMessage := strings.TrimSpace(textFrom(errObj))
+		msg := providerMessage
 		if msg == "" {
 			msg = "request failed"
+		}
+		code := firstString(errObj, "code", "type", "error_code", "errorCode")
+		if code == "" {
+			if rawCode, exists := errObj["code"]; exists {
+				code = fmt.Sprint(rawCode)
+			}
+		}
+		errorInfo := firstString(errObj, "codex_error_info", "codexErrorInfo")
+		providerCode := firstNonempty(errorInfo, code)
+		retryAfter := codexRetryAfter(errObj)
+		if isProviderOverloaded(providerCode, msg) {
+			return nil, &engine.ProviderFailureError{Evidence: engine.ProviderFailureEvidence{
+				Class: "provider_overloaded", Code: providerCode, Message: providerMessage, RetryAfter: retryAfter,
+			}, Cause: errors.New(msg)}
+		}
+		if evidence, hasProviderEvidence := codexProviderFailure(errorInfo, code, providerMessage, retryAfter); hasProviderEvidence {
+			return nil, &engine.ProviderFailureError{Evidence: evidence, Cause: errors.New(msg)}
 		}
 		return nil, errors.New(msg)
 	}

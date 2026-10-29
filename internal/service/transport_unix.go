@@ -89,7 +89,7 @@ func (c *connection) writeOversizedRequestResponse(response protocol.Response) e
 }
 
 func requiresRequestID(method string) bool {
-	return method == protocol.MethodHello
+	return method == protocol.MethodHello || method == protocol.MethodBackendInspect
 }
 
 func (c *connection) writeResponse(response protocol.Response) error {
@@ -134,6 +134,8 @@ func (s *Server) handle(connection *connection, request protocol.Request) reques
 		return s.handleJobTranscript(request.Params)
 	case protocol.MethodJobCancel:
 		return s.handleJobCancel(request.Params)
+	case protocol.MethodBackendInspect:
+		return s.handleBackendInspect(request.Params)
 	default:
 		return requestOutcome{err: protocol.NewError(protocol.ErrorMethodNotFound, "method not found", protocol.ErrorData{})}
 	}

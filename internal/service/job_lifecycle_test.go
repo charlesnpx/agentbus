@@ -89,6 +89,68 @@ func TestJobGetRequiresIDAndReturnsBareRecord(t *testing.T) {
 	}
 }
 
+func TestJobGetProjectsDeadlineAndResumabilityFromDurableFields(t *testing.T) {
+	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "fake"}}})
+	timeoutMS := int64(120_000)
+	runningParams := submissionParams("projection-workspace", "running-retained", "fake", t.TempDir(), "running retained")
+	runningParams.TaskSpec.RetainSession = true
+	runningParams.TaskSpec.TimeoutMS = &timeoutMS
+	running := submitResultForTest(t, submitForTest(t, server, runningParams))
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkStarting(running.JobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RecordBackendSessionID(running.JobID, "running-session"); err != nil {
+		t.Fatal(err)
+	}
+	runningRecord, err := store.Get(running.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runningWire, err := server.jobRecordWire(runningRecord)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDeadline := runningRecord.StartedAt.Add(time.Duration(timeoutMS) * time.Millisecond)
+	if runningWire.Deadline == nil || !runningWire.Deadline.Equal(wantDeadline) || runningWire.RemainingMs == nil || *runningWire.RemainingMs < 0 || *runningWire.RemainingMs > timeoutMS {
+		t.Fatalf("running deadline projection = deadline %v remaining %v, want %v and [0,%d]ms", runningWire.Deadline, runningWire.RemainingMs, wantDeadline, timeoutMS)
+	}
+	if runningWire.Resumable == nil || runningWire.Resumable.Eligible || runningWire.Resumable.Reason != "resume target is running rather than terminal" {
+		t.Fatalf("running resumability = %#v, want ineligible while running", runningWire.Resumable)
+	}
+
+	completedParams := submissionParams("projection-workspace", "completed-not-retained", "fake", t.TempDir(), "completed not retained")
+	completed := submitResultForTest(t, submitForTest(t, server, completedParams))
+	if _, err := store.MarkStarting(completed.JobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RecordBackendSessionID(completed.JobID, "completed-session"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkTerminal(completed.JobID, jobstore.TerminalUpdate{
+		State: protocol.PublicStateCompleted, Cleanup: protocol.CleanupClean, FinishedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	completedRecord, err := store.Get(completed.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completedWire, err := server.jobRecordWire(completedRecord)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completedWire.Deadline != nil || completedWire.RemainingMs != nil {
+		t.Fatalf("completed deadline projection = %v / %v, want omitted", completedWire.Deadline, completedWire.RemainingMs)
+	}
+	if completedWire.Resumable == nil || completedWire.Resumable.Eligible || completedWire.Resumable.Reason != "completed jobs are not resumable unless submitted with session retention; submit a new job" {
+		t.Fatalf("completed resumability = %#v, want non-retained ineligibility", completedWire.Resumable)
+	}
+}
+
 func TestJobLifecycleProjectsBackendReportedModel(t *testing.T) {
 	const requestedModel = "caller-requested-model"
 	for _, test := range []struct {

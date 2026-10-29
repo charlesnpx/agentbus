@@ -48,6 +48,7 @@ type activeExecution struct {
 	lastActivityAt     time.Time
 	itemSidecarDiag    string
 	modelReported      string
+	effortReported     string
 	turn               *activeTurn
 	latestSessionID    string
 	retiredCleanup     protocol.Cleanup
@@ -79,29 +80,34 @@ func (run *activeExecution) setSession(session engine.Session) {
 	run.mu.Unlock()
 }
 
-func (run *activeExecution) noteModelReported(model string) {
+func (run *activeExecution) noteModelReported(model, effort string) {
 	if run == nil {
 		return
 	}
 	model = strings.TrimSpace(model)
-	if model == "" {
+	effort = strings.TrimSpace(effort)
+	if model == "" && effort == "" {
 		return
 	}
 	run.mu.Lock()
-	if run.modelReported == "" {
+	if model != "" {
 		run.modelReported = model
+	}
+	if effort != "" {
+		run.effortReported = effort
 	}
 	run.mu.Unlock()
 }
 
-func (run *activeExecution) reportedModel() string {
+func (run *activeExecution) reportedSelection() (string, string) {
 	if run == nil {
-		return ""
+		return "", ""
 	}
 	run.mu.Lock()
 	model := run.modelReported
+	effort := run.effortReported
 	run.mu.Unlock()
-	return model
+	return model, effort
 }
 
 func (run *activeExecution) cancellationRequested() bool {
@@ -228,8 +234,8 @@ func (run *activeExecution) retireTurn(store *jobstore.Store, outcome turnOutcom
 		return outcome
 	}
 	turn.once.Do(func() {
-		if strings.TrimSpace(outcome.modelReported) != "" {
-			if err := store.RecordModelReported(run.jobID, outcome.modelReported); err != nil && !errors.Is(err, jobstore.ErrTerminal) {
+		if strings.TrimSpace(outcome.modelReported) != "" || strings.TrimSpace(outcome.effortReported) != "" {
+			if err := store.RecordObservedSelection(run.jobID, outcome.modelReported, outcome.effortReported); err != nil && !errors.Is(err, jobstore.ErrTerminal) {
 				outcome.diagnostics = append(outcome.diagnostics, "record reported model: "+err.Error())
 			}
 		}
@@ -543,11 +549,19 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassBackendUnavailable, fmt.Errorf("backend %q is unavailable", record.Backend), nil)
 		return
 	}
+	requestedModel := record.Model
+	requestedEffort := record.Effort
+	if defaults := s.backendDefaults[record.Backend]; defaults.Model != "" && requestedModel == "" {
+		requestedModel = defaults.Model
+	}
+	if defaults := s.backendDefaults[record.Backend]; defaults.Effort != "" && requestedEffort == "" {
+		requestedEffort = defaults.Effort
+	}
 	opts := engine.SessionOpts{
 		CWD:     record.CWD,
 		Write:   record.Write,
-		Model:   record.Model,
-		Effort:  record.Effort,
+		Model:   requestedModel,
+		Effort:  requestedEffort,
 		Timeout: timeout,
 	}
 	if record.Backend == "codex" {
@@ -656,7 +670,7 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		}
 		diagnostics = appendItemSidecarDiagnostics(diagnostics, itemWriter)
 		outcome := run.retireTurn(store, turnOutcome{err: err, cleanup: cleanup, diagnostics: diagnostics})
-		s.finishTurnError(store, record, jobCtx, outcome.err, outcome.cleanup, outcome.diagnostics)
+		s.finishTurnError(store, record, jobCtx, outcome.err, outcome.cleanup, outcome.diagnostics, outcome.backendSessionID)
 		return
 	}
 
@@ -917,16 +931,16 @@ func (s *Server) finishStartError(store *jobstore.Store, record jobstore.Record,
 	s.recordExecutionFailure(store, record, protocol.CleanupClean, classifyStartFailure(err), err, nil)
 }
 
-func (s *Server) finishTurnError(store *jobstore.Store, record jobstore.Record, ctx context.Context, err error, cleanup protocol.Cleanup, diagnostics []string) {
+func (s *Server) finishTurnError(store *jobstore.Store, record jobstore.Record, ctx context.Context, err error, cleanup protocol.Cleanup, diagnostics []string, backendSessionID string) {
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		s.recordExecutionFailure(store, record, cleanup, protocol.FailureClassTimeout, context.DeadlineExceeded, diagnostics)
+		s.recordExecutionFailureWithSessionID(store, record, cleanup, protocol.FailureClassTimeout, context.DeadlineExceeded, diagnostics, backendSessionID)
 		return
 	}
 	if errors.Is(ctx.Err(), context.Canceled) {
-		s.recordExecutionFailure(store, record, cleanup, protocol.FailureClassInterrupted, ctx.Err(), diagnostics)
+		s.recordExecutionFailureWithSessionID(store, record, cleanup, protocol.FailureClassInterrupted, ctx.Err(), diagnostics, backendSessionID)
 		return
 	}
-	s.recordExecutionFailure(store, record, cleanup, classifyExecutionFailure(err), err, diagnostics)
+	s.recordExecutionFailureWithSessionID(store, record, cleanup, classifyExecutionFailure(err), err, diagnostics, backendSessionID)
 }
 
 func (s *Server) finishContextStop(store *jobstore.Store, record jobstore.Record, err error, cleanup protocol.Cleanup, diagnostics []string) {
@@ -938,13 +952,40 @@ func (s *Server) finishContextStop(store *jobstore.Store, record jobstore.Record
 }
 
 func classifyStartFailure(err error) protocol.FailureClass {
+	if class, ok := providerFailureClass(err); ok {
+		return class
+	}
 	if errors.Is(err, engine.ErrProviderOverloaded) {
 		return protocol.FailureClassProviderOverloaded
 	}
 	return protocol.FailureClassBackendUnavailable
 }
 
+func providerFailureClass(err error) (protocol.FailureClass, bool) {
+	var providerFailure *engine.ProviderFailureError
+	if !errors.As(err, &providerFailure) || providerFailure == nil {
+		return "", false
+	}
+	switch strings.ToLower(strings.TrimSpace(providerFailure.Evidence.Class)) {
+	case "usage_limit":
+		return protocol.FailureClassUsageLimit, true
+	case "authentication":
+		return protocol.FailureClassAuthentication, true
+	case "provider_overloaded":
+		return protocol.FailureClassProviderOverloaded, true
+	case "model_unavailable":
+		return protocol.FailureClassModelUnavailable, true
+	case "content_policy":
+		return protocol.FailureClassContentPolicy, true
+	default:
+		return "", false
+	}
+}
+
 func classifyExecutionFailure(err error) protocol.FailureClass {
+	if class, ok := providerFailureClass(err); ok {
+		return class
+	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return protocol.FailureClassTimeout
 	}
@@ -961,6 +1002,7 @@ type turnOutcome struct {
 	text             string
 	backendSessionID string
 	modelReported    string
+	effortReported   string
 	err              error
 	timedOut         bool
 	interrupted      bool
@@ -1027,10 +1069,14 @@ func absorbTurnEvent(run *activeExecution, outcome *turnOutcome, assistant *stri
 	switch event.Type {
 	case engine.EventModelReported:
 		model := strings.TrimSpace(event.ModelReported)
-		if outcome.modelReported == "" {
+		if model != "" {
 			outcome.modelReported = model
 		}
-		run.noteModelReported(model)
+		effort := strings.TrimSpace(event.EffortReported)
+		if effort != "" {
+			outcome.effortReported = effort
+		}
+		run.noteModelReported(model, effort)
 	case engine.EventAgentText:
 		assistant.WriteString(rawText)
 	case engine.EventResultMessage:
@@ -1101,7 +1147,7 @@ func (s *Server) recordExecutionCompletion(store *jobstore.Store, record jobstor
 	info, err := spillAuthoritativeResult(record, []byte(text))
 	if err != nil {
 		// The spill failure makes this a failed record, which may be resumed.
-		s.recordExecutionFailureWithSessionID(store, record, cleanup, protocol.FailureClassInternal, fmt.Errorf("spill authoritative result: %w", err), diagnostics, backendSessionID)
+		s.recordExecutionFailureWithDetails(store, record, cleanup, protocol.FailureClassInternal, fmt.Errorf("spill authoritative result: %w", err), diagnostics, backendSessionID, "finalize")
 		return
 	}
 	resultText := info.Text
@@ -1125,12 +1171,28 @@ func (s *Server) recordExecutionCompletion(store *jobstore.Store, record jobstor
 }
 
 func (s *Server) recordExecutionFailure(store *jobstore.Store, record jobstore.Record, cleanup protocol.Cleanup, class protocol.FailureClass, cause error, diagnostics []string) {
-	s.recordExecutionFailureWithSessionID(store, record, cleanup, class, cause, diagnostics, "")
+	s.recordExecutionFailureWithDetails(store, record, cleanup, class, cause, diagnostics, "", "startup")
 }
 
 func (s *Server) recordExecutionFailureWithSessionID(store *jobstore.Store, record jobstore.Record, cleanup protocol.Cleanup, class protocol.FailureClass, cause error, diagnostics []string, backendSessionID string) {
+	s.recordExecutionFailureWithDetails(store, record, cleanup, class, cause, diagnostics, backendSessionID, "turn")
+}
+
+func (s *Server) recordExecutionFailureWithDetails(store *jobstore.Store, record jobstore.Record, cleanup protocol.Cleanup, class protocol.FailureClass, cause error, diagnostics []string, backendSessionID, stage string) {
 	if !class.Valid() {
 		class = protocol.FailureClassInternal
+	}
+	var evidence *engine.ProviderFailureEvidence
+	var providerFailure *engine.ProviderFailureError
+	if errors.As(cause, &providerFailure) && providerFailure != nil {
+		copy := providerFailure.Evidence
+		copy.Code = boundProviderValue(copy.Code, 128)
+		copy.Message = boundProviderValue(copy.Message, 512)
+		if copy.RetryAfter != nil {
+			retryAfter := copy.RetryAfter.UTC()
+			copy.RetryAfter = &retryAfter
+		}
+		evidence = &copy
 	}
 	s.markTerminal(store, record.JobID, jobstore.TerminalUpdate{
 		State:            protocol.PublicStateFailed,
@@ -1138,9 +1200,51 @@ func (s *Server) recordExecutionFailureWithSessionID(store *jobstore.Store, reco
 		BackendSessionID: backendSessionID,
 		FailureClass:     class,
 		FailureReason:    executionFailureReason(cause),
-		Diagnostics:      diagnostics,
-		FinishedAt:       time.Now().UTC(),
+		FailureProviderCode: func() string {
+			if evidence == nil {
+				return ""
+			}
+			return evidence.Code
+		}(),
+		FailureProviderMessage: func() string {
+			if evidence == nil {
+				return ""
+			}
+			return evidence.Message
+		}(),
+		FailureStage: stage,
+		FailureRetryAfter: func() *time.Time {
+			if evidence == nil {
+				return nil
+			}
+			return evidence.RetryAfter
+		}(),
+		CancellationReason: cancellationReasonFor(class, cause),
+		Diagnostics:        diagnostics,
+		FinishedAt:         time.Now().UTC(),
 	})
+}
+
+func cancellationReasonFor(class protocol.FailureClass, cause error) protocol.CancellationReason {
+	if class == protocol.FailureClassTimeout || errors.Is(cause, context.DeadlineExceeded) {
+		return protocol.CancellationReasonDeadline
+	}
+	if errors.Is(cause, engine.ErrTurnInterrupted) {
+		return protocol.CancellationReasonProviderInterruption
+	}
+	if errors.Is(cause, context.Canceled) {
+		return protocol.CancellationReasonDaemonShutdown
+	}
+	return ""
+}
+
+func boundProviderValue(value string, maxRunes int) string {
+	value = strings.TrimSpace(value)
+	runes := []rune(value)
+	if len(runes) > maxRunes {
+		return string(runes[:maxRunes-3]) + "..."
+	}
+	return value
 }
 
 func (s *Server) markTerminal(store *jobstore.Store, jobID string, terminal jobstore.TerminalUpdate) {

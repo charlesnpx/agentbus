@@ -657,21 +657,45 @@ func sessionUpdate(params map[string]any) map[string]any {
 func responseResult(object map[string]any) (any, error) {
 	if rawError, ok := object["error"]; ok {
 		message := "request failed"
+		providerMessage := ""
+		providerCode := ""
 		if errObject, ok := rawError.(map[string]any); ok {
 			if value := firstString(errObject, "message"); value != "" {
 				message = value
+				providerMessage = value
+			}
+			if value := firstString(errObject, "code", "error_code", "errorCode"); value != "" {
+				providerCode = value
+			} else if code, exists := errObject["code"]; exists {
+				providerCode = fmt.Sprint(code)
 			}
 			// Cursor puts the category in message ("Invalid params") and the
 			// actionable sentence in data.message. Keep both.
 			if data, ok := firstMap(errObject, "data"); ok {
 				if value := firstString(data, "message"); value != "" {
 					message += ": " + value
+					if providerMessage == "" {
+						providerMessage = value
+					} else {
+						providerMessage += ": " + value
+					}
+				}
+				if providerCode == "" {
+					providerCode = firstString(data, "code", "error_code", "errorCode")
 				}
 			}
 		} else if value := strings.TrimSpace(stringValue(rawError)); value != "" {
 			message = value
+			providerMessage = value
 		}
-		return nil, errors.New(message)
+		cause := errors.New(message)
+		if providerCode != "" || providerMessage != "" {
+			return nil, &engine.ProviderFailureError{
+				Evidence: engine.ProviderFailureEvidence{Code: providerCode, Message: providerMessage},
+				Cause:    cause,
+			}
+		}
+		return nil, cause
 	}
 	result, ok := object["result"]
 	if !ok {

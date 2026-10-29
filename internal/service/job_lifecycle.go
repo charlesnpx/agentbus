@@ -217,11 +217,12 @@ func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
 		diagnostics = append(diagnostics, run.itemSidecarDiagnostics()...)
 	}
 	terminal, err := store.MarkTerminal(record.JobID, jobstore.TerminalUpdate{
-		State:            protocol.PublicStateCanceled,
-		Cleanup:          cleanup,
-		BackendSessionID: backendSessionID,
-		Diagnostics:      diagnostics,
-		FinishedAt:       time.Now().UTC(),
+		State:              protocol.PublicStateCanceled,
+		Cleanup:            cleanup,
+		BackendSessionID:   backendSessionID,
+		CancellationReason: protocol.CancellationReasonOperator,
+		Diagnostics:        diagnostics,
+		FinishedAt:         time.Now().UTC(),
 	})
 	if err != nil {
 		if errors.Is(err, jobstore.ErrTerminal) {
@@ -262,34 +263,45 @@ func (s *Server) jobRecordWire(record jobstore.Record) (protocol.JobRecordWire, 
 	if spec.Tags != nil {
 		tags = *spec.Tags
 	}
+	deadline, remaining := jobDeadlineProjection(record, timeout, time.Now().UTC())
+	modelRequested := cloneRequestedValue(spec.Model)
+	effortRequested := cloneRequestedValue(spec.Effort)
+	modelReported, effortReported := s.projectedSelection(record)
 	return protocol.JobRecordWire{
-		JobID:         record.JobID,
-		WorkspaceKey:  record.WorkspaceKey,
-		RequestID:     record.RequestID,
-		Backend:       record.Backend,
-		State:         projectedState(record),
-		Tags:          tags,
-		CreatedAt:     record.CreatedAt,
-		StartedAt:     record.StartedAt,
-		FinishedAt:    record.FinishedAt,
-		Timeout:       timeout,
-		Result:        projectResult(record),
-		Contract:      projectContract(record, spec),
-		Failure:       projectFailure(record),
-		Cleanup:       record.Cleanup,
-		LogPaths:      projectLogPaths(record),
-		ModelReported: s.projectedModelReported(record),
+		JobID:              record.JobID,
+		WorkspaceKey:       record.WorkspaceKey,
+		RequestID:          record.RequestID,
+		Backend:            record.Backend,
+		State:              projectedState(record),
+		Tags:               tags,
+		CreatedAt:          record.CreatedAt,
+		StartedAt:          record.StartedAt,
+		FinishedAt:         record.FinishedAt,
+		Timeout:            timeout,
+		Deadline:           deadline,
+		RemainingMs:        remaining,
+		Resumable:          s.resumableProjection(record),
+		ModelRequested:     modelRequested,
+		EffortRequested:    effortRequested,
+		Result:             projectResult(record),
+		Contract:           projectContract(record, spec),
+		Failure:            projectFailure(record),
+		Cleanup:            record.Cleanup,
+		LogPaths:           projectLogPaths(record),
+		ModelReported:      modelReported,
+		EffortReported:     effortReported,
+		CancellationReason: record.CancellationReason,
 	}, nil
 }
 
-func (s *Server) projectedModelReported(record jobstore.Record) string {
+func (s *Server) projectedSelection(record jobstore.Record) (string, string) {
 	if record.State.IsTerminal() {
-		return record.ModelReported
+		return record.ModelReported, record.EffortReported
 	}
 	if run := s.activeExecution(record.JobID); run != nil {
-		return run.reportedModel()
+		return run.reportedSelection()
 	}
-	return record.ModelReported
+	return record.ModelReported, record.EffortReported
 }
 
 func (s *Server) jobSummaryWireFromSpec(record jobstore.Record, spec protocol.TaskSpec) protocol.JobSummaryWire {
@@ -297,17 +309,19 @@ func (s *Server) jobSummaryWireFromSpec(record jobstore.Record, spec protocol.Ta
 	if spec.Tags != nil {
 		tags = *spec.Tags
 	}
+	modelReported, effortReported := s.projectedSelection(record)
 	wire := protocol.JobSummaryWire{
-		JobID:         record.JobID,
-		Backend:       record.Backend,
-		State:         projectedState(record),
-		Tags:          tags,
-		Cleanup:       record.Cleanup,
-		CreatedAt:     record.CreatedAt,
-		UpdatedAt:     record.UpdatedAt,
-		ModelReported: s.projectedModelReported(record),
-		FailureClass:  projectFailureClass(record),
-		Contract:      projectContractVerdict(record, spec),
+		JobID:          record.JobID,
+		Backend:        record.Backend,
+		State:          projectedState(record),
+		Tags:           tags,
+		Cleanup:        record.Cleanup,
+		CreatedAt:      record.CreatedAt,
+		UpdatedAt:      record.UpdatedAt,
+		ModelReported:  modelReported,
+		EffortReported: effortReported,
+		FailureClass:   projectFailureClass(record),
+		Contract:       projectContractVerdict(record, spec),
 	}
 	if record.State.IsTerminal() {
 		return wire
@@ -328,6 +342,40 @@ func (s *Server) jobSummaryWireFromSpec(record jobstore.Record, spec protocol.Ta
 	}
 	wire.Liveness = s.exactClaimDiagnostic(record.ProcessClaim).liveness
 	return wire
+}
+
+func cloneRequestedValue(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
+func jobDeadlineProjection(record jobstore.Record, timeout *engine.TimeoutResolution, now time.Time) (*time.Time, *int64) {
+	if projectedState(record) != protocol.PublicStateRunning || record.StartedAt == nil || timeout == nil || timeout.Effective <= 0 {
+		return nil, nil
+	}
+	deadline := record.StartedAt.Add(time.Duration(timeout.Effective) * time.Millisecond).UTC()
+	remaining := deadline.Sub(now).Milliseconds()
+	if remaining < 0 {
+		remaining = 0
+	}
+	return &deadline, &remaining
+}
+
+func (s *Server) resumableProjection(record jobstore.Record) *protocol.ResumableProjection {
+	spec := protocol.TaskSpec{Backend: record.Backend, ResumeJobID: record.JobID}
+	reason := resumeTargetIneligibilityReason(spec, record)
+	if reason == "" && record.Backend == "codex" {
+		if err := s.validateCodexResumeHome(); err != nil {
+			reason = err.Error()
+		}
+	}
+	if reason != "" {
+		return &protocol.ResumableProjection{Eligible: false, Reason: reason}
+	}
+	return &protocol.ResumableProjection{Eligible: true, Reason: "retained backend session is available"}
 }
 
 func taskSpecForProjection(record jobstore.Record) (protocol.TaskSpec, *engine.TimeoutResolution, error) {
@@ -360,7 +408,14 @@ func projectFailure(record jobstore.Record) *protocol.JobFailureWire {
 	if record.State != protocol.PublicStateFailed {
 		return nil
 	}
-	return &protocol.JobFailureWire{Class: record.FailureClass, Reason: record.FailureReason}
+	return &protocol.JobFailureWire{
+		Class:           record.FailureClass,
+		Reason:          record.FailureReason,
+		ProviderCode:    record.FailureProviderCode,
+		ProviderMessage: record.FailureProviderMessage,
+		Stage:           record.FailureStage,
+		RetryAfter:      record.FailureRetryAfter,
+	}
 }
 
 func projectFailureClass(record jobstore.Record) protocol.FailureClass {
