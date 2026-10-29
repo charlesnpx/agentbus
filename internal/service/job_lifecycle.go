@@ -109,11 +109,6 @@ func validateJobListParams(params protocol.JobListParams) error {
 	if params.Limit < 0 {
 		return errors.New("limit must not be negative")
 	}
-	if params.Cursor != "" {
-		if _, err := decodeJobListCursor(params.Cursor); err != nil {
-			return err
-		}
-	}
 	for _, state := range params.States {
 		if !state.Valid() {
 			return fmt.Errorf("states contains invalid public state %q", state)

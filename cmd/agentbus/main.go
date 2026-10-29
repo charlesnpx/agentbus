@@ -619,7 +619,9 @@ func (a *app) followTranscript(ctx context.Context, client protocolClient, jobID
 		})
 		if err != nil {
 			if errors.Is(err, context.Canceled) && ctx.Err() != nil {
-				writeTranscriptFollowSummary(out, latest, jsonOut)
+				if err := writeTranscriptFollowSummary(out, latest, jsonOut); err != nil {
+					return commandError(errOut, err)
+				}
 				return cliExitCodeForRecord(agentclient.JobGetResult{State: latest.State})
 			}
 			return protocolCommandError(errOut, "transcript", err)
@@ -643,7 +645,9 @@ func (a *app) followTranscript(ctx context.Context, client protocolClient, jobID
 		}
 		if !page.State.IsTerminal() && len(page.Items) < pageSize {
 			if !waitForObservation(ctx, delay, 0) {
-				writeTranscriptFollowSummary(out, latest, jsonOut)
+				if err := writeTranscriptFollowSummary(out, latest, jsonOut); err != nil {
+					return commandError(errOut, err)
+				}
 				return cliExitCodeForRecord(agentclient.JobGetResult{State: latest.State})
 			}
 			if delay < 2*time.Second {
@@ -654,7 +658,9 @@ func (a *app) followTranscript(ctx context.Context, client protocolClient, jobID
 			}
 		}
 	}
-	writeTranscriptFollowSummary(out, latest, jsonOut)
+	if err := writeTranscriptFollowSummary(out, latest, jsonOut); err != nil {
+		return commandError(errOut, err)
+	}
 	record, err := client.JobGet(ctx, agentclient.JobGetParams{JobID: jobID})
 	if err != nil {
 		if errors.Is(err, context.Canceled) && ctx.Err() != nil {
@@ -679,20 +685,24 @@ func printTranscriptItem(out io.Writer, item agentclient.TranscriptItem) {
 	fmt.Fprintln(out)
 }
 
-func writeTranscriptFollowSummary(out io.Writer, transcript agentclient.JobTranscriptResult, jsonOut bool) {
+func writeTranscriptFollowSummary(out io.Writer, transcript agentclient.JobTranscriptResult, jsonOut bool) error {
 	if jsonOut {
-		_ = writeJSON(out, transcriptFollowSummary{
+		return writeJSON(out, transcriptFollowSummary{
 			Type: "summary", State: transcript.State, Liveness: transcript.Liveness,
 			ItemCount: transcript.ItemCount, Counts: transcript.Counts, FirstAt: transcript.FirstAt,
 			LastAt: transcript.LastAt, Gap: transcript.Gap,
 		})
-		return
 	}
-	fmt.Fprintf(out, "state=%s itemCount=%d", transcript.State, transcript.ItemCount)
+	if _, err := fmt.Fprintf(out, "state=%s itemCount=%d", transcript.State, transcript.ItemCount); err != nil {
+		return err
+	}
 	if transcript.Liveness != "" {
-		fmt.Fprintf(out, " liveness=%s", transcript.Liveness)
+		if _, err := fmt.Fprintf(out, " liveness=%s", transcript.Liveness); err != nil {
+			return err
+		}
 	}
-	fmt.Fprintf(out, " gap=%t\n", transcript.Gap)
+	_, err := fmt.Fprintf(out, " gap=%t\n", transcript.Gap)
+	return err
 }
 
 func waitForObservation(ctx context.Context, delay time.Duration, remaining time.Duration) bool {
@@ -809,21 +819,14 @@ func (a *app) runResult(ctx context.Context, args []string, out, errOut io.Write
 func (a *app) observeJob(ctx context.Context, client protocolClient, jobID string, timeout time.Duration) (agentclient.JobGetResult, bool, error) {
 	deadline := time.Now().Add(timeout)
 	delay := cliObservationPollInterval
-	var last agentclient.JobGetResult
+	last, err := client.JobGet(ctx, agentclient.JobGetParams{JobID: jobID})
+	if err != nil {
+		return agentclient.JobGetResult{}, false, err
+	}
+	if last.State.IsTerminal() {
+		return last, false, nil
+	}
 	for {
-		requestCtx, cancel := context.WithDeadline(ctx, deadline)
-		record, err := client.JobGet(requestCtx, agentclient.JobGetParams{JobID: jobID})
-		cancel()
-		if err != nil {
-			if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil && time.Until(deadline) <= 0 {
-				return last, true, nil
-			}
-			return agentclient.JobGetResult{}, false, err
-		}
-		last = record
-		if record.State.IsTerminal() {
-			return record, false, nil
-		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
 			return last, true, nil
@@ -832,9 +835,26 @@ func (a *app) observeJob(ctx context.Context, client protocolClient, jobID strin
 			if ctx.Err() != nil {
 				return last, false, ctx.Err()
 			}
+			return last, true, nil
 		}
 		if time.Until(deadline) <= 0 {
 			return last, true, nil
+		}
+		requestCtx, cancel := context.WithDeadline(ctx, deadline)
+		requestDeadline, _ := requestCtx.Deadline()
+		callerDeadline, hasCallerDeadline := ctx.Deadline()
+		observationDeadlineBoundsRequest := requestDeadline.Equal(deadline) && (!hasCallerDeadline || deadline.Before(callerDeadline))
+		record, err := client.JobGet(requestCtx, agentclient.JobGetParams{JobID: jobID})
+		cancel()
+		if err != nil {
+			if ctx.Err() == nil && observationDeadlineBoundsRequest && time.Until(deadline) <= 0 && isDeadlineError(err) {
+				return last, true, nil
+			}
+			return last, false, err
+		}
+		last = record
+		if record.State.IsTerminal() {
+			return record, false, nil
 		}
 		if delay < 2*time.Second {
 			delay *= 2
@@ -843,6 +863,14 @@ func (a *app) observeJob(ctx context.Context, client protocolClient, jobID strin
 			}
 		}
 	}
+}
+
+func isDeadlineError(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var timeoutErr interface{ Timeout() bool }
+	return errors.As(err, &timeoutErr) && timeoutErr.Timeout()
 }
 
 func parseWaitDuration(value string) (time.Duration, error) {

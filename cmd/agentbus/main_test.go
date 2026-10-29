@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -85,6 +86,70 @@ func TestResultWaitExpiryReportsRecordWithoutCanceling(t *testing.T) {
 	}
 }
 
+func TestResultWaitExpiryDuringFirstLookupReportsRecord(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	client := &fakeProtocolClient{jobGetFunc: func(ctx context.Context, params agentclient.JobGetParams) (agentclient.JobGetResult, error) {
+		close(started)
+		guard := time.NewTimer(5 * time.Second)
+		defer guard.Stop()
+		select {
+		case <-ctx.Done():
+			return agentclient.JobGetResult{}, ctx.Err()
+		case <-release:
+			return detailedRecord(protocol.PublicStateRunning), nil
+		case <-guard.C:
+			return agentclient.JobGetResult{}, errors.New("fake JobGet response timed out")
+		}
+	}}
+	a := testApp(t)
+	a.clientConnect = fakeConnector(client)
+	type result struct {
+		code   int
+		stdout string
+		stderr string
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		var stdout, stderr bytes.Buffer
+		code := a.run(context.Background(), []string{"result", "--job", "job-1", "--wait", "--wait-timeout", "1ms", "--json"}, strings.NewReader(""), &stdout, &stderr)
+		resultCh <- result{code: code, stdout: stdout.String(), stderr: stderr.String()}
+	}()
+	startGuard := time.NewTimer(5 * time.Second)
+	select {
+	case <-started:
+	case <-startGuard.C:
+		t.Fatal("timed out waiting for the first JobGet call")
+	}
+	startGuard.Stop()
+	wait := time.NewTimer(20 * time.Millisecond)
+	waitGuard := time.NewTimer(5 * time.Second)
+	select {
+	case <-wait.C:
+	case <-waitGuard.C:
+		t.Fatal("timed out waiting for the observation deadline")
+	}
+	wait.Stop()
+	waitGuard.Stop()
+	close(release)
+	resultGuard := time.NewTimer(5 * time.Second)
+	var got result
+	select {
+	case got = <-resultCh:
+	case <-resultGuard.C:
+		t.Fatal("timed out waiting for the result command")
+	}
+	resultGuard.Stop()
+	if got.code != cliExitObservationTimeout || got.stderr != "" {
+		t.Fatalf("wait expiry=(%d,%q,%q), want observation timeout and first record", got.code, got.stdout, got.stderr)
+	}
+	var record agentclient.JobGetResult
+	decodeJSON(t, got.stdout, &record)
+	if record.JobID != "job-1" || record.State != protocol.PublicStateRunning {
+		t.Fatalf("wait result=%#v, want the observed running record", record)
+	}
+}
+
 func TestTranscriptFollowDrainsFullPageToTerminalAndReportsGap(t *testing.T) {
 	items := make([]agentclient.TranscriptItem, cliTranscriptFollowPageSize+1)
 	for i := range items {
@@ -117,6 +182,20 @@ func TestTranscriptFollowDrainsFullPageToTerminalAndReportsGap(t *testing.T) {
 	if len(client.transcriptParams) != 2 || client.transcriptParams[0].Limit == nil || *client.transcriptParams[0].Limit != cliTranscriptFollowPageSize ||
 		client.transcriptParams[1].SinceOrdinal == nil || *client.transcriptParams[1].SinceOrdinal != cliTranscriptFollowPageSize {
 		t.Fatalf("follow page requests=%#v, want a drained second ordinal page", client.transcriptParams)
+	}
+}
+
+func TestTranscriptFollowSummaryWriteErrorExitsNonzero(t *testing.T) {
+	client := &fakeProtocolClient{
+		records:     map[string]agentclient.JobGetResult{"job-1": detailedRecord(protocol.PublicStateCompleted)},
+		transcripts: map[string]agentclient.JobTranscriptResult{"job-1": {State: protocol.PublicStateCompleted}},
+	}
+	a := testApp(t)
+	a.clientConnect = fakeConnector(client)
+	var stderr bytes.Buffer
+	code := a.run(context.Background(), []string{"transcript", "--job", "job-1", "--follow"}, strings.NewReader(""), failingWriter{}, &stderr)
+	if code != 1 || !strings.Contains(stderr.String(), "write failed") {
+		t.Fatalf("follow summary write=(%d,%q), want output error", code, stderr.String())
 	}
 }
 
@@ -745,8 +824,7 @@ func runTestCLI(t *testing.T, a *app, args []string) (int, string, string) {
 
 type fakeProtocolClient struct {
 	records          map[string]agentclient.JobGetResult
-	jobGetParams     []agentclient.JobGetParams
-	jobGetFunc       func(agentclient.JobGetParams) (agentclient.JobGetResult, error)
+	jobGetFunc       func(context.Context, agentclient.JobGetParams) (agentclient.JobGetResult, error)
 	list             agentclient.JobListResult
 	listParams       []agentclient.JobListParams
 	transcripts      map[string]agentclient.JobTranscriptResult
@@ -757,13 +835,12 @@ type fakeProtocolClient struct {
 	err              error
 }
 
-func (c *fakeProtocolClient) JobGet(_ context.Context, params agentclient.JobGetParams) (agentclient.JobGetResult, error) {
-	c.jobGetParams = append(c.jobGetParams, params)
+func (c *fakeProtocolClient) JobGet(ctx context.Context, params agentclient.JobGetParams) (agentclient.JobGetResult, error) {
 	if c.err != nil {
 		return agentclient.JobGetResult{}, c.err
 	}
 	if c.jobGetFunc != nil {
-		return c.jobGetFunc(params)
+		return c.jobGetFunc(ctx, params)
 	}
 	record, ok := c.records[params.JobID]
 	if !ok {
@@ -808,6 +885,10 @@ func (c *fakeProtocolClient) JobCancel(_ context.Context, params agentclient.Job
 }
 
 func (c *fakeProtocolClient) Close() error { return nil }
+
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("write failed") }
 
 func decodeJSON(t *testing.T, raw string, target any) {
 	t.Helper()
