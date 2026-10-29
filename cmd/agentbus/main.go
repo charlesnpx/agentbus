@@ -37,6 +37,8 @@ const (
 	cliExitShutdownForced       = 13
 	cliExitResultUnavailable    = 15
 	cliExitObservationTimeout   = 16
+	cliExitSteerRejected        = 17
+	cliExitSteerUnknown         = 18
 	cliStatusDefaultLimit       = 50
 	cliTranscriptFollowPageSize = 100
 	shortSHA256HexLength        = 12
@@ -103,7 +105,7 @@ func resolvedCursorBinary() string {
 	return ""
 }
 
-func (a *app) run(ctx context.Context, args []string, _ io.Reader, out, errOut io.Writer) int {
+func (a *app) run(ctx context.Context, args []string, stdin io.Reader, out, errOut io.Writer) int {
 	if len(args) == 0 {
 		printRootHelp(errOut)
 		return 2
@@ -147,6 +149,8 @@ func (a *app) run(ctx context.Context, args []string, _ io.Reader, out, errOut i
 		return a.runResult(ctx, args[1:], out, errOut)
 	case "cancel":
 		return a.runCancel(ctx, args[1:], out, errOut)
+	case "steer":
+		return a.runSteer(ctx, args[1:], stdin, out, errOut)
 	case "configure-codex-sandbox":
 		return runConfigureCodexSandbox(args[1:], out, errOut)
 	default:
@@ -934,6 +938,95 @@ func (a *app) runCancel(ctx context.Context, args []string, out, errOut io.Write
 	return cliExitCodeForRecord(record)
 }
 
+type steeringProtocolClient interface {
+	Steer(context.Context, agentclient.JobSteerParams) (agentclient.JobSteerResult, error)
+}
+
+func (a *app) runSteer(ctx context.Context, args []string, stdin io.Reader, out, errOut io.Writer) int {
+	fs := newCommandFlagSet("steer", errOut)
+	jsonOut := fs.Bool("json", false, "emit the job.steer receipt as JSON")
+	jobID := fs.String("job", "", "job id")
+	messageID := fs.String("request-id", "", "caller-generated steering message id")
+	messageFile := fs.String("message-file", "", "file containing steering text, or - for stdin")
+	if code, ok := parseFlags(fs, args); !ok {
+		return code
+	}
+	if fs.NArg() != 0 {
+		return usageError(errOut, "steer does not accept positional arguments")
+	}
+	if *jobID == "" || *messageID == "" || *messageFile == "" {
+		return usageError(errOut, "steer requires --job <id>, --request-id <messageId>, and --message-file <path|->")
+	}
+	message, err := readSteerMessage(*messageFile, stdin)
+	if err != nil {
+		return commandError(errOut, err)
+	}
+	client, err := a.connectProtocolClient(ctx)
+	if err != nil {
+		return protocolCommandError(errOut, "steer", err)
+	}
+	defer client.Close()
+	steerer, ok := client.(steeringProtocolClient)
+	if !ok {
+		return commandError(errOut, errors.New("connected client does not support job.steer"))
+	}
+	receipt, err := steerer.Steer(ctx, agentclient.JobSteerParams{JobID: *jobID, MessageID: *messageID, Text: message})
+	if err != nil {
+		return protocolCommandError(errOut, "steer", err)
+	}
+	if *jsonOut {
+		if code := writeOrError(out, errOut, receipt); code != 0 {
+			return code
+		}
+	} else {
+		fmt.Fprintf(out, "jobId=%s messageId=%s status=%s", receipt.JobID, receipt.MessageID, receipt.Status)
+		if receipt.Mechanism != "" {
+			fmt.Fprintf(out, " mechanism=%s", receipt.Mechanism)
+		}
+		if receipt.Reason != "" {
+			fmt.Fprintf(out, " reason=%s", receipt.Reason)
+		}
+		fmt.Fprintf(out, " deduplicated=%t\n", receipt.Deduplicated)
+	}
+	switch receipt.Status {
+	case protocol.SteerStatusAdmitted, protocol.SteerStatusDelivered:
+		return 0
+	case protocol.SteerStatusRejected:
+		return cliExitSteerRejected
+	case protocol.SteerStatusUnknown:
+		return cliExitSteerUnknown
+	default:
+		return commandError(errOut, fmt.Errorf("daemon returned invalid steering status %q", receipt.Status))
+	}
+}
+
+func readSteerMessage(path string, stdin io.Reader) (string, error) {
+	var source io.Reader
+	var file *os.File
+	if path == "-" {
+		source = stdin
+	} else {
+		opened, err := os.Open(path)
+		if err != nil {
+			return "", fmt.Errorf("open steering message file: %w", err)
+		}
+		file = opened
+		defer file.Close()
+		source = file
+	}
+	if source == nil {
+		return "", errors.New("stdin is unavailable for --message-file -")
+	}
+	message, err := io.ReadAll(io.LimitReader(source, 64*1024+1))
+	if err != nil {
+		return "", fmt.Errorf("read steering message: %w", err)
+	}
+	if len(message) > 64*1024 {
+		return "", errors.New("steering message exceeds 65536 bytes")
+	}
+	return string(message), nil
+}
+
 func (a *app) connectProtocolClient(ctx context.Context) (protocolClient, error) {
 	exe, err := os.Executable()
 	if err != nil {
@@ -987,7 +1080,7 @@ func printJobRecordStatus(out io.Writer, record agentclient.JobGetResult) {
 	if record.Timeout != nil {
 		fmt.Fprintf(out, " timeout.effective=%d timeout.source=%s", record.Timeout.Effective, record.Timeout.Source)
 	}
-	fmt.Fprintf(out, " model=%s tags=%s", record.ModelReported, formatTags(record.Tags))
+	fmt.Fprintf(out, " inputMode=%s model=%s tags=%s", protocol.EffectiveInputMode(record.InputMode), record.ModelReported, formatTags(record.Tags))
 	if record.Result != nil {
 		fmt.Fprintf(out, " result.bytes=%d result.sha256=%s", record.Result.Bytes, shortSHA256(record.Result.SHA256))
 	}
@@ -1008,6 +1101,13 @@ func printJobRecordStatus(out io.Writer, record agentclient.JobGetResult) {
 		}
 	}
 	fmt.Fprintln(out)
+	for _, steer := range record.Steers {
+		fmt.Fprintf(out, "steer.messageId=%s status=%s", steer.MessageID, steer.Status)
+		if steer.Mechanism != "" {
+			fmt.Fprintf(out, " mechanism=%s", steer.Mechanism)
+		}
+		fmt.Fprintf(out, " time=%s\n", humanTime(steer.Time))
+	}
 }
 
 func printLogPathTruncationStatus(out io.Writer, stream, path string, truncated *bool) {
@@ -1309,6 +1409,7 @@ func printRootHelp(out io.Writer) {
   agentbus transcript --job <id> [--follow] [--kind <kind>]... [--last <n>] [--since <rfc3339>] [--since-ordinal <n>] [--limit <n>] [--json]
   agentbus result --job <id> [--wait [--wait-timeout <duration>]] [--json]
   agentbus cancel --job <id> [--json]
+  agentbus steer --job <id> --request-id <messageId> --message-file <path|-> [--json]
   agentbus configure-codex-sandbox [--writable-root <absolute-path>]... [--json]
 
 status and result use the same job.get record for a selected job. Their JSON
@@ -1323,6 +1424,8 @@ Exit codes for a selected job:
   daemon-startup-failure=11, shutdown-deadline=13, unknown=14,
   result-artifact-unavailable=15: completed, but the authoritative result artifact is missing, unreadable, or does not match its recorded digest,
   observation-timeout=16: result observation expired; the job was not canceled
+
+Steering exit codes: rejected=17, delivery-unknown=18.
 `)
 }
 

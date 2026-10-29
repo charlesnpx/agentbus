@@ -84,6 +84,124 @@ func TestFixtureDriverHappyPath(t *testing.T) {
 	}
 }
 
+type steerableFixtureDriver struct{ FixtureDriver }
+
+func (driver steerableFixtureDriver) Steer(_ context.Context, conn *Conn, message engine.SteerMessage) (engine.SteerDelivery, error) {
+	if err := conn.WriteJSON(map[string]any{"type": "steer", "id": message.ID, "text": message.Text}); err != nil {
+		return engine.SteerDelivery{}, err
+	}
+	return engine.SteerDelivery{Mechanism: engine.SteerMechanismNative, Confirmed: true}, nil
+}
+
+func TestSessionSteerForwardsWithoutTakingStreamReader(t *testing.T) {
+	proc := newFakeCommand()
+	runner := &fakeRunner{running: proc}
+	driver := steerableFixtureDriver{FixtureDriver{Spec: command.ExecSpec{Argv: []string{"fixture"}}}}
+	session := newSessionWithDriver(t, runner, driver, 0, "")
+	promptSeen := make(chan struct{})
+	steerSeen := make(chan map[string]any, 1)
+	peerDone := make(chan struct{})
+	go func() {
+		defer close(peerDone)
+		scanner := bufio.NewScanner(proc.stdinR)
+		if !scanner.Scan() {
+			t.Errorf("prompt frame missing: %v", scanner.Err())
+			return
+		}
+		close(promptSeen)
+		if !scanner.Scan() {
+			t.Errorf("steer frame missing: %v", scanner.Err())
+			return
+		}
+		steerSeen <- decodeLine(t, scanner.Bytes())
+		writePeerJSON(t, proc.stdoutW, map[string]any{"type": "complete", "text": "resumed final"})
+		_ = proc.stdoutW.Close()
+		_ = proc.stderrW.Close()
+		proc.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
+	}()
+
+	events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "original"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-promptSeen:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for prompt frame")
+	}
+	delivery, err := session.Steer(context.Background(), engine.SteerMessage{ID: "message-1", Text: "continue"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if delivery.Mechanism != engine.SteerMechanismNative || !delivery.Confirmed {
+		t.Fatalf("delivery = %#v, want confirmed native delivery", delivery)
+	}
+	select {
+	case frame := <-steerSeen:
+		if frame["type"] != "steer" || frame["id"] != "message-1" || frame["text"] != "continue" {
+			t.Fatalf("steer frame = %#v", frame)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for steer frame")
+	}
+	got := withoutTurnFinal(collectEventsWithTimeout(t, events, 2*time.Second))
+	<-peerDone
+	var results []string
+	for _, event := range got {
+		if event.Type == engine.EventResultMessage {
+			results = append(results, event.Text)
+		}
+	}
+	if len(results) != 1 || results[0] != "resumed final" {
+		t.Fatalf("logical turn results = %#v, want one resumed final result", results)
+	}
+	if _, err := session.Steer(context.Background(), engine.SteerMessage{ID: "late", Text: "too late"}); !errors.Is(err, engine.ErrSteerNotActive) {
+		t.Fatalf("post-turn Steer error = %v, want ErrSteerNotActive", err)
+	}
+}
+
+func TestSessionWithoutSteerDriverReportsUnsupportedWhileActive(t *testing.T) {
+	proc := newFakeCommand()
+	runner := &fakeRunner{running: proc}
+	session := newFixtureSession(t, runner, 0, "")
+	promptSeen := make(chan struct{})
+	finish := make(chan struct{})
+	peerDone := make(chan struct{})
+	go func() {
+		defer close(peerDone)
+		scanner := bufio.NewScanner(proc.stdinR)
+		if !scanner.Scan() {
+			t.Errorf("prompt frame missing: %v", scanner.Err())
+			return
+		}
+		close(promptSeen)
+		<-finish
+		writePeerJSON(t, proc.stdoutW, map[string]any{"type": "complete", "text": "done"})
+		_ = proc.stdoutW.Close()
+		_ = proc.stderrW.Close()
+		proc.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
+	}()
+
+	events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "original"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-promptSeen:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for prompt frame")
+	}
+	if _, err := session.Steer(context.Background(), engine.SteerMessage{ID: "message-1", Text: "continue"}); !errors.Is(err, engine.ErrSteerUnsupported) {
+		t.Fatalf("active unsupported Steer error = %v, want ErrSteerUnsupported", err)
+	}
+	close(finish)
+	_ = collectEventsWithTimeout(t, events, 2*time.Second)
+	<-peerDone
+	if _, err := session.Steer(context.Background(), engine.SteerMessage{ID: "late", Text: "too late"}); !errors.Is(err, engine.ErrSteerNotActive) {
+		t.Fatalf("post-turn unsupported Steer error = %v, want ErrSteerNotActive", err)
+	}
+}
+
 func TestTurnCapturesBackendStdoutAndStderrLogs(t *testing.T) {
 	proc := newFakeCommand()
 	runner := &fakeRunner{running: proc}

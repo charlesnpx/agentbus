@@ -32,26 +32,42 @@ type activeExecution struct {
 	// cross a process-launch boundary. A request that acquires it first keeps a
 	// queued/starting job from subsequently reaching Backend.Start or
 	// Session.Turn before its durable cancellation is committed.
-	launchMu           sync.Mutex
-	mu                 sync.Mutex
-	cancel             context.CancelFunc
-	session            engine.Session
-	cancelRequested    bool
-	claimAttempted     bool
-	claimRecorded      bool
-	claimErr           error
-	processClaim       *jobstore.ProcessClaim
-	interruptOnce      sync.Once
-	interruptErr       error
-	itemCount          int
-	lastItemAt         time.Time
-	lastActivityAt     time.Time
-	itemSidecarDiag    string
-	modelReported      string
-	turn               *activeTurn
-	latestSessionID    string
-	retiredCleanup     protocol.Cleanup
-	retiredDiagnostics []string
+	launchMu sync.Mutex
+	// controlMu is the per-job ordering point for steering, cancellation,
+	// schema-correction turns, and the first terminal transition.
+	controlMu              sync.Mutex
+	mu                     sync.Mutex
+	cancel                 context.CancelFunc
+	session                engine.Session
+	cancelRequested        bool
+	claimAttempted         bool
+	claimRecorded          bool
+	claimErr               error
+	processClaim           *jobstore.ProcessClaim
+	interruptOnce          sync.Once
+	interruptErr           error
+	itemCount              int
+	lastItemAt             time.Time
+	lastActivityAt         time.Time
+	itemSidecarDiag        string
+	steerDiagnostics       []string
+	modelReported          string
+	turn                   *activeTurn
+	latestSessionID        string
+	retiredCleanup         protocol.Cleanup
+	retiredDiagnostics     []string
+	turnActive             bool
+	schemaCorrectionActive bool
+	steerCanceled          bool
+	steerClosed            bool
+	steerPending           int
+	steerQueue             chan queuedSteer
+	steerQueued            map[string]struct{}
+	steerInFlightDone      chan struct{}
+	steerStop              chan struct{}
+	steerDone              chan struct{}
+	steerStopOnce          sync.Once
+	steerWorkerStarted     bool
 }
 
 // activeTurn owns the one retirement receipt for a turn. A cancellation can
@@ -64,13 +80,40 @@ type activeTurn struct {
 }
 
 func newActiveExecution(jobID string, backend engine.Backend) *activeExecution {
-	return &activeExecution{jobID: jobID, backend: backend}
+	return &activeExecution{
+		jobID:       jobID,
+		backend:     backend,
+		steerQueue:  make(chan queuedSteer, maxPendingSteers),
+		steerQueued: make(map[string]struct{}),
+		steerStop:   make(chan struct{}),
+		steerDone:   make(chan struct{}),
+	}
 }
 
 func (run *activeExecution) setCancel(cancel context.CancelFunc) {
 	run.mu.Lock()
 	run.cancel = cancel
 	run.mu.Unlock()
+}
+
+func (run *activeExecution) noteSteerDiagnostic(diagnostic string) {
+	if run == nil || diagnostic == "" {
+		return
+	}
+	run.mu.Lock()
+	run.steerDiagnostics = append(run.steerDiagnostics, diagnostic)
+	run.mu.Unlock()
+}
+
+func (run *activeExecution) takeSteerDiagnostics() []string {
+	if run == nil {
+		return nil
+	}
+	run.mu.Lock()
+	diagnostics := append([]string(nil), run.steerDiagnostics...)
+	run.steerDiagnostics = nil
+	run.mu.Unlock()
+	return diagnostics
 }
 
 func (run *activeExecution) setSession(session engine.Session) {
@@ -194,6 +237,13 @@ func (run *activeExecution) startTurn(store *jobstore.Store, session engine.Sess
 	events, err := session.Turn(ctx, input)
 	canceled := run.cancellationRequested()
 	releaseLaunch()
+	if err == nil {
+		run.controlMu.Lock()
+		if !run.steerCanceled && !run.steerClosed {
+			run.turnActive = true
+		}
+		run.controlMu.Unlock()
+	}
 	if canceled {
 		_ = run.interrupt()
 	}
@@ -204,6 +254,9 @@ func (run *activeExecution) startTurn(store *jobstore.Store, session engine.Sess
 // retired. Each retained adapter turn owns exactly one process and therefore
 // has exactly one separate durable claim transaction.
 func (run *activeExecution) beginTurn() {
+	run.controlMu.Lock()
+	run.turnActive = false
+	run.controlMu.Unlock()
 	run.mu.Lock()
 	run.claimAttempted = false
 	run.claimRecorded = false
@@ -228,6 +281,20 @@ func (run *activeExecution) retireTurn(store *jobstore.Store, outcome turnOutcom
 		return outcome
 	}
 	turn.once.Do(func() {
+		run.controlMu.Lock()
+		run.turnActive = false
+		run.rejectQueuedSteersLocked(store, protocol.SteerReasonNotRunning)
+		steerInFlightDone := run.steerInFlightDone
+		run.controlMu.Unlock()
+		if steerInFlightDone != nil {
+			<-steerInFlightDone
+		}
+		run.controlMu.Lock()
+		if run.steerInFlightDone == steerInFlightDone {
+			run.steerInFlightDone = nil
+		}
+		run.controlMu.Unlock()
+		outcome.diagnostics = append(outcome.diagnostics, run.takeSteerDiagnostics()...)
 		if strings.TrimSpace(outcome.modelReported) != "" {
 			if err := store.RecordModelReported(run.jobID, outcome.modelReported); err != nil && !errors.Is(err, jobstore.ErrTerminal) {
 				outcome.diagnostics = append(outcome.diagnostics, "record reported model: "+err.Error())
@@ -670,6 +737,7 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		s.finishContextStop(store, record, err, cleanup, diagnostics)
 		return
 	}
+	s.startSteeringWorker(store, run, jobCtx)
 	itemPath, err := itemSidecarPath(logPaths.Stdout)
 	if err != nil {
 		s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("derive item sidecar path: %w", err), nil)
@@ -747,6 +815,12 @@ func taskSpecFromRecord(record jobstore.Record) (protocol.TaskSpec, error) {
 	}
 	if err := json.Unmarshal(record.TaskSpec, &spec); err != nil {
 		return spec, fmt.Errorf("decode durable task spec: %w", err)
+	}
+	if spec.InputMode != "" && spec.InputMode != protocol.InputModeFixed && spec.InputMode != protocol.InputModeSteerable {
+		return spec, fmt.Errorf("durable task spec has invalid inputMode %q", spec.InputMode)
+	}
+	if record.InputMode != "" && record.InputMode != protocol.EffectiveInputMode(spec.InputMode) {
+		return spec, errors.New("durable task spec inputMode disagrees with job record")
 	}
 	if spec.Backend != record.Backend || spec.CWD == "" || spec.Prompt == "" {
 		return spec, errors.New("durable task spec disagrees with job record")
@@ -889,7 +963,11 @@ func (s *Server) evaluateOutputSchema(store *jobstore.Store, record jobstore.Rec
 	// retained adapter clears that turn's active process before closing its
 	// stream, so the correction's claim is recorded after the initial process
 	// has retired.
-	correction := s.runCorrectionTurn(store, record, run, session, ctx, timeout, logPaths, items, schema.CorrectionPrompt(string(spec.OutputSchema), initial.Violations))
+	run.setSchemaCorrectionActive(true)
+	correction := func() turnOutcome {
+		defer run.setSchemaCorrectionActive(false)
+		return s.runCorrectionTurn(store, record, run, session, ctx, timeout, logPaths, items, schema.CorrectionPrompt(string(spec.OutputSchema), initial.Violations))
+	}()
 	if correction.backendSessionID != "" {
 		backendSessionID = correction.backendSessionID
 	}
@@ -1191,6 +1269,27 @@ func (s *Server) recordExecutionFailureWithSessionID(store *jobstore.Store, reco
 }
 
 func (s *Server) markTerminal(store *jobstore.Store, jobID string, terminal jobstore.TerminalUpdate) {
+	run := s.activeExecution(jobID)
+	if run != nil {
+		run.controlMu.Lock()
+		if run.steerCanceled {
+			run.controlMu.Unlock()
+			return
+		}
+		inFlightDone := run.closeSteeringLocked(store)
+		run.controlMu.Unlock()
+		if inFlightDone != nil {
+			<-inFlightDone
+		}
+		run.waitSteeringWorker()
+		run.controlMu.Lock()
+		if run.steerCanceled {
+			run.controlMu.Unlock()
+			return
+		}
+		defer run.controlMu.Unlock()
+		terminal.Diagnostics = append(terminal.Diagnostics, run.takeSteerDiagnostics()...)
+	}
 	// job.cancel has already reserved this active execution and will commit a
 	// canceled first terminal itself. Do not let an asynchronously drained
 	// backend stream race it with an interrupted, failed, or completed record.
