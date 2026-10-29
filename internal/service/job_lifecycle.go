@@ -202,6 +202,16 @@ func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
 	}
 
 	run := s.activeExecution(record.JobID)
+	if run != nil {
+		if !s.cancelSteering(store, run) {
+			current, getErr := store.Get(record.JobID)
+			if getErr != nil {
+				return jobStoreUnavailable("read completed job after cancellation race", getErr)
+			}
+			return requestOutcome{result: protocol.JobCancelResult{JobID: current.JobID, State: projectedState(current)}}
+		}
+		defer s.finishSteering(store, run)
+	}
 	cleanup, diagnostics := s.cancelActiveOrRecordedProcess(store, record)
 	backendSessionID := record.BackendSessionID
 	if run != nil {
@@ -214,6 +224,7 @@ func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
 				backendSessionID = retired.backendSessionID
 			}
 		}
+		diagnostics = append(diagnostics, run.takeSteerDiagnostics()...)
 		diagnostics = append(diagnostics, run.itemSidecarDiagnostics()...)
 	}
 	terminal, err := store.MarkTerminal(record.JobID, jobstore.TerminalUpdate{
@@ -262,11 +273,25 @@ func (s *Server) jobRecordWire(record jobstore.Record) (protocol.JobRecordWire, 
 	if spec.Tags != nil {
 		tags = *spec.Tags
 	}
+	steers := make([]protocol.SteerSummaryWire, 0, len(record.Steers))
+	for _, steer := range record.Steers {
+		steers = append(steers, protocol.SteerSummaryWire{
+			MessageID: steer.MessageID,
+			Status:    steer.Status,
+			Mechanism: steer.Mechanism,
+			Time:      steer.UpdatedAt,
+		})
+	}
+	inputMode := protocol.EffectiveInputMode(spec.InputMode)
+	if record.InputMode != "" {
+		inputMode = record.InputMode
+	}
 	return protocol.JobRecordWire{
 		JobID:         record.JobID,
 		WorkspaceKey:  record.WorkspaceKey,
 		RequestID:     record.RequestID,
 		Backend:       record.Backend,
+		InputMode:     inputMode,
 		State:         projectedState(record),
 		Tags:          tags,
 		CreatedAt:     record.CreatedAt,
@@ -280,6 +305,8 @@ func (s *Server) jobRecordWire(record jobstore.Record) (protocol.JobRecordWire, 
 		LogsPruned:    record.LogsPruned,
 		LogPaths:      projectLogPaths(record),
 		ModelReported: s.projectedModelReported(record),
+		Execution:     record.Execution,
+		Steers:        steers,
 	}, nil
 }
 
@@ -455,6 +482,9 @@ func (s *Server) reconcileRecoveredJobs(store *jobstore.Store) error {
 		return err
 	}
 	for _, record := range records {
+		if err := store.MarkPendingSteersUnknown(record.JobID); err != nil {
+			return fmt.Errorf("reconcile steering receipts for job %s: %w", record.JobID, err)
+		}
 		switch {
 		case record.State == protocol.PublicStateQueued:
 			_, err = store.MarkTerminal(record.JobID, jobstore.TerminalUpdate{

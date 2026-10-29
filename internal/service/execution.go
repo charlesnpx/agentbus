@@ -32,26 +32,42 @@ type activeExecution struct {
 	// cross a process-launch boundary. A request that acquires it first keeps a
 	// queued/starting job from subsequently reaching Backend.Start or
 	// Session.Turn before its durable cancellation is committed.
-	launchMu           sync.Mutex
-	mu                 sync.Mutex
-	cancel             context.CancelFunc
-	session            engine.Session
-	cancelRequested    bool
-	claimAttempted     bool
-	claimRecorded      bool
-	claimErr           error
-	processClaim       *jobstore.ProcessClaim
-	interruptOnce      sync.Once
-	interruptErr       error
-	itemCount          int
-	lastItemAt         time.Time
-	lastActivityAt     time.Time
-	itemSidecarDiag    string
-	modelReported      string
-	turn               *activeTurn
-	latestSessionID    string
-	retiredCleanup     protocol.Cleanup
-	retiredDiagnostics []string
+	launchMu sync.Mutex
+	// controlMu is the per-job ordering point for steering, cancellation,
+	// schema-correction turns, and the first terminal transition.
+	controlMu              sync.Mutex
+	mu                     sync.Mutex
+	cancel                 context.CancelFunc
+	session                engine.Session
+	cancelRequested        bool
+	claimAttempted         bool
+	claimRecorded          bool
+	claimErr               error
+	processClaim           *jobstore.ProcessClaim
+	interruptOnce          sync.Once
+	interruptErr           error
+	itemCount              int
+	lastItemAt             time.Time
+	lastActivityAt         time.Time
+	itemSidecarDiag        string
+	steerDiagnostics       []string
+	modelReported          string
+	turn                   *activeTurn
+	latestSessionID        string
+	retiredCleanup         protocol.Cleanup
+	retiredDiagnostics     []string
+	turnActive             bool
+	schemaCorrectionActive bool
+	steerCanceled          bool
+	steerClosed            bool
+	steerPending           int
+	steerQueue             chan queuedSteer
+	steerQueued            map[string]struct{}
+	steerInFlightDone      chan struct{}
+	steerStop              chan struct{}
+	steerDone              chan struct{}
+	steerStopOnce          sync.Once
+	steerWorkerStarted     bool
 }
 
 // activeTurn owns the one retirement receipt for a turn. A cancellation can
@@ -64,13 +80,40 @@ type activeTurn struct {
 }
 
 func newActiveExecution(jobID string, backend engine.Backend) *activeExecution {
-	return &activeExecution{jobID: jobID, backend: backend}
+	return &activeExecution{
+		jobID:       jobID,
+		backend:     backend,
+		steerQueue:  make(chan queuedSteer, maxPendingSteers),
+		steerQueued: make(map[string]struct{}),
+		steerStop:   make(chan struct{}),
+		steerDone:   make(chan struct{}),
+	}
 }
 
 func (run *activeExecution) setCancel(cancel context.CancelFunc) {
 	run.mu.Lock()
 	run.cancel = cancel
 	run.mu.Unlock()
+}
+
+func (run *activeExecution) noteSteerDiagnostic(diagnostic string) {
+	if run == nil || diagnostic == "" {
+		return
+	}
+	run.mu.Lock()
+	run.steerDiagnostics = append(run.steerDiagnostics, diagnostic)
+	run.mu.Unlock()
+}
+
+func (run *activeExecution) takeSteerDiagnostics() []string {
+	if run == nil {
+		return nil
+	}
+	run.mu.Lock()
+	diagnostics := append([]string(nil), run.steerDiagnostics...)
+	run.steerDiagnostics = nil
+	run.mu.Unlock()
+	return diagnostics
 }
 
 func (run *activeExecution) setSession(session engine.Session) {
@@ -194,6 +237,13 @@ func (run *activeExecution) startTurn(store *jobstore.Store, session engine.Sess
 	events, err := session.Turn(ctx, input)
 	canceled := run.cancellationRequested()
 	releaseLaunch()
+	if err == nil {
+		run.controlMu.Lock()
+		if !run.steerCanceled && !run.steerClosed {
+			run.turnActive = true
+		}
+		run.controlMu.Unlock()
+	}
 	if canceled {
 		_ = run.interrupt()
 	}
@@ -204,6 +254,9 @@ func (run *activeExecution) startTurn(store *jobstore.Store, session engine.Sess
 // retired. Each retained adapter turn owns exactly one process and therefore
 // has exactly one separate durable claim transaction.
 func (run *activeExecution) beginTurn() {
+	run.controlMu.Lock()
+	run.turnActive = false
+	run.controlMu.Unlock()
 	run.mu.Lock()
 	run.claimAttempted = false
 	run.claimRecorded = false
@@ -228,6 +281,20 @@ func (run *activeExecution) retireTurn(store *jobstore.Store, outcome turnOutcom
 		return outcome
 	}
 	turn.once.Do(func() {
+		run.controlMu.Lock()
+		run.turnActive = false
+		run.rejectQueuedSteersLocked(store, protocol.SteerReasonNotRunning)
+		steerInFlightDone := run.steerInFlightDone
+		run.controlMu.Unlock()
+		if steerInFlightDone != nil {
+			<-steerInFlightDone
+		}
+		run.controlMu.Lock()
+		if run.steerInFlightDone == steerInFlightDone {
+			run.steerInFlightDone = nil
+		}
+		run.controlMu.Unlock()
+		outcome.diagnostics = append(outcome.diagnostics, run.takeSteerDiagnostics()...)
 		if strings.TrimSpace(outcome.modelReported) != "" {
 			if err := store.RecordModelReported(run.jobID, outcome.modelReported); err != nil && !errors.Is(err, jobstore.ErrTerminal) {
 				outcome.diagnostics = append(outcome.diagnostics, "record reported model: "+err.Error())
@@ -513,22 +580,6 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		return
 	}
 
-	// This durable transaction is intentionally separate from the later claim
-	// transaction in activeExecution.persistProcessClaim.
-	started, err := store.MarkStarting(record.JobID)
-	if err != nil {
-		// A failed or ambiguous starting commit must never license a spawn. Try
-		// to make that failure durable so the job remains visible; markTerminal
-		// logs and leaves it alone if that write also fails.
-		s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("commit starting transition: %w", err), nil)
-		log.Printf("agentbus service: job %s starting commit failed; backend was not launched: %v", record.JobID, err)
-		return
-	}
-	record = started
-	if run.cancellationRequested() {
-		return
-	}
-
 	if strings.TrimSpace(record.Artifacts.Log) == "" {
 		s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, errors.New("job log artifact path is missing"), nil)
 		return
@@ -550,13 +601,18 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		Effort:  record.Effort,
 		Timeout: timeout,
 	}
+	var (
+		layout  engine.WorkspaceLayout
+		managed *managedCodexHome
+		cache   jobCachePaths
+		caches  map[string]string
+	)
 	if record.Backend == "codex" {
-		layout, err := engine.LayoutForWorkspace(s.stateRoot, record.CWD)
+		layout, err = engine.LayoutForWorkspace(s.stateRoot, record.CWD)
 		if err != nil {
 			s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("prepare Codex workspace layout: %w", err), nil)
 			return
 		}
-		var managed *managedCodexHome
 		if resumeTarget != nil {
 			codexHome, err := s.resumeCodexHome(store, *resumeTarget)
 			if err != nil {
@@ -580,24 +636,82 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 				opts.EnvOverlay = map[string]string{"CODEX_HOME": codexHome}
 			}
 		}
-		if record.Write {
-			cache, managed, cacheErr := prepareCodexJobCache(layout, record.JobID, managed)
-			if managed != nil {
-				s.rememberManagedCodexHome(record.JobID, managed)
-			}
-			if cacheErr != nil {
-				s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("prepare Codex job cache: %w", cacheErr), nil)
-				return
-			}
-			opts.WriteSandboxRoot = cache.root
-			// Override unconditionally: inherited host cache and temporary paths are
-			// outside the write sandbox, which is the condition this cache fixes.
-			opts.WriteEnvOverlay = map[string]string{
-				"GOCACHE":    cache.goBuild,
-				"GOMODCACHE": cache.goMod,
-				"TMPDIR":     cache.tmp,
-			}
+		if opts.EnvOverlay == nil {
+			opts.EnvOverlay = make(map[string]string)
 		}
+		// The offline Codex sandbox may read the daemon's populated module
+		// cache, but does not get a private empty replacement or network access.
+		if s.moduleCache != "" {
+			opts.EnvOverlay["GOMODCACHE"] = s.moduleCache
+		}
+		opts.EnvOverlay["GOPROXY"] = "off"
+	} else if record.Write {
+		layout, err = engine.LayoutForWorkspace(s.stateRoot, record.CWD)
+		if err != nil {
+			s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("prepare job workspace layout: %w", err), nil)
+			return
+		}
+	}
+	if record.Write {
+		cache, managed, err = prepareJobCache(layout, record.JobID, managed)
+		if managed != nil {
+			s.rememberManagedCodexHome(record.JobID, managed)
+		}
+		if err != nil {
+			s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("prepare job cache: %w", err), nil)
+			return
+		}
+		if record.Backend == "codex" {
+			opts.WriteSandboxRoot = cache.root
+		}
+		opts.WriteEnvOverlay = map[string]string{
+			"GOCACHE":              cache.goBuild,
+			"TMPDIR":               cache.tmp,
+			"npm_config_cache":     cache.npm,
+			"COREPACK_HOME":        cache.corepack,
+			"XDG_CACHE_HOME":       cache.xdg,
+			"npm_config_store_dir": cache.pnpm,
+			"YARN_CACHE_FOLDER":    cache.yarn,
+		}
+		caches = make(map[string]string, len(opts.WriteEnvOverlay)+1)
+		for key, value := range opts.WriteEnvOverlay {
+			caches[key] = value
+		}
+	}
+	if record.Backend == "codex" && s.moduleCache != "" {
+		if caches == nil {
+			caches = make(map[string]string, 1)
+		}
+		caches["GOMODCACHE"] = s.moduleCache
+	}
+	if len(caches) == 0 {
+		caches = nil
+	}
+	scratch := ""
+	if record.Write {
+		scratch = cache.root
+	}
+	posture := executionPosture(record.Backend, record.Write, scratch, caches)
+	if run.cancellationRequested() {
+		s.discardManagedCodexHome(record.JobID)
+		return
+	}
+
+	// Persist the execution description in the same transaction as the
+	// starting marker, before a backend process can be spawned.
+	started, err := store.MarkStartingWithExecution(record.JobID, &posture)
+	if err != nil {
+		s.discardManagedCodexHome(record.JobID)
+		// A failed or ambiguous starting commit must never license a spawn. Try
+		// to make that failure durable so the job remains visible; markTerminal
+		// logs and leaves it alone if that write also fails.
+		s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("commit starting transition: %w", err), nil)
+		log.Printf("agentbus service: job %s starting commit failed; backend was not launched: %v", record.JobID, err)
+		return
+	}
+	record = started
+	if run.cancellationRequested() {
+		return
 	}
 	resumeSessionID := ""
 	if resumeTarget != nil {
@@ -623,6 +737,7 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		s.finishContextStop(store, record, err, cleanup, diagnostics)
 		return
 	}
+	s.startSteeringWorker(store, run, jobCtx)
 	itemPath, err := itemSidecarPath(logPaths.Stdout)
 	if err != nil {
 		s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("derive item sidecar path: %w", err), nil)
@@ -700,6 +815,12 @@ func taskSpecFromRecord(record jobstore.Record) (protocol.TaskSpec, error) {
 	}
 	if err := json.Unmarshal(record.TaskSpec, &spec); err != nil {
 		return spec, fmt.Errorf("decode durable task spec: %w", err)
+	}
+	if spec.InputMode != "" && spec.InputMode != protocol.InputModeFixed && spec.InputMode != protocol.InputModeSteerable {
+		return spec, fmt.Errorf("durable task spec has invalid inputMode %q", spec.InputMode)
+	}
+	if record.InputMode != "" && record.InputMode != protocol.EffectiveInputMode(spec.InputMode) {
+		return spec, errors.New("durable task spec inputMode disagrees with job record")
 	}
 	if spec.Backend != record.Backend || spec.CWD == "" || spec.Prompt == "" {
 		return spec, errors.New("durable task spec disagrees with job record")
@@ -842,7 +963,11 @@ func (s *Server) evaluateOutputSchema(store *jobstore.Store, record jobstore.Rec
 	// retained adapter clears that turn's active process before closing its
 	// stream, so the correction's claim is recorded after the initial process
 	// has retired.
-	correction := s.runCorrectionTurn(store, record, run, session, ctx, timeout, logPaths, items, schema.CorrectionPrompt(string(spec.OutputSchema), initial.Violations))
+	run.setSchemaCorrectionActive(true)
+	correction := func() turnOutcome {
+		defer run.setSchemaCorrectionActive(false)
+		return s.runCorrectionTurn(store, record, run, session, ctx, timeout, logPaths, items, schema.CorrectionPrompt(string(spec.OutputSchema), initial.Violations))
+	}()
 	if correction.backendSessionID != "" {
 		backendSessionID = correction.backendSessionID
 	}
@@ -1144,6 +1269,27 @@ func (s *Server) recordExecutionFailureWithSessionID(store *jobstore.Store, reco
 }
 
 func (s *Server) markTerminal(store *jobstore.Store, jobID string, terminal jobstore.TerminalUpdate) {
+	run := s.activeExecution(jobID)
+	if run != nil {
+		run.controlMu.Lock()
+		if run.steerCanceled {
+			run.controlMu.Unlock()
+			return
+		}
+		inFlightDone := run.closeSteeringLocked(store)
+		run.controlMu.Unlock()
+		if inFlightDone != nil {
+			<-inFlightDone
+		}
+		run.waitSteeringWorker()
+		run.controlMu.Lock()
+		if run.steerCanceled {
+			run.controlMu.Unlock()
+			return
+		}
+		defer run.controlMu.Unlock()
+		terminal.Diagnostics = append(terminal.Diagnostics, run.takeSteerDiagnostics()...)
+	}
 	// job.cancel has already reserved this active execution and will commit a
 	// canceled first terminal itself. Do not let an asynchronously drained
 	// backend stream race it with an interrupted, failed, or completed record.

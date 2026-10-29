@@ -951,6 +951,13 @@ func (c *Client) JobGet(ctx context.Context, params JobGetParams) (JobGetResult,
 	return out, err
 }
 
+// Steer submits or deduplicates one follow-up instruction for a running job.
+func (c *Client) Steer(ctx context.Context, params JobSteerParams) (JobSteerResult, error) {
+	var out JobSteerResult
+	err := c.do(ctx, protocol.MethodJobSteer, params, &out)
+	return out, err
+}
+
 // JobList returns compact summaries filtered by the supplied optional fields.
 func (c *Client) JobList(ctx context.Context, params JobListParams) (JobListResult, error) {
 	var out JobListResult

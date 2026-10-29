@@ -316,6 +316,33 @@ func TestJobGetReflectWalksEveryRecordField(t *testing.T) {
 	assertReflectDecoded(t, reflect.ValueOf(want), reflect.ValueOf(got), "job.get record")
 }
 
+func TestSteerUsesJobSteerWireMethod(t *testing.T) {
+	want := JobSteerResult{
+		JobID: "job-steer", MessageID: "message-1", Status: protocol.SteerStatusAdmitted,
+	}
+	client, requests, done := newOneShotClient(t, protocol.Response{Result: want})
+	params := JobSteerParams{JobID: "job-steer", MessageID: "message-1", Text: "continue"}
+	got, err := client.Steer(context.Background(), params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := <-requests
+	if request.Method != protocol.MethodJobSteer {
+		t.Fatalf("method = %q, want %q", request.Method, protocol.MethodJobSteer)
+	}
+	var gotParams JobSteerParams
+	if err := json.Unmarshal(request.Params, &gotParams); err != nil {
+		t.Fatalf("decode job.steer params: %v", err)
+	}
+	if gotParams != params {
+		t.Fatalf("job.steer params = %#v, want %#v", gotParams, params)
+	}
+	assertOneShotClientDone(t, done)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("job.steer result = %#v, want %#v", got, want)
+	}
+}
+
 func TestJobListReflectWalksEverySummaryField(t *testing.T) {
 	want := reflectPopulatedValue[JobSummaryWire](t)
 	params := JobListParams{

@@ -69,9 +69,31 @@ Agentbus did not create under its state root. It also never follows a symlink
 outside an owned directory. Delegate review-packet directories remain
 Delegate-owned.
 
-A Codex job may also create an implementation-managed private home below
-workspaces/<workspace-hash>/codex/<job-id>. It is separate from the shared job
-store and may contain per-job caches.
+A job may create a managed private directory below
+workspaces/<workspace-hash>/codex/<job-id>. Codex uses it for its private home;
+writable jobs on all backends use it for job-private scratch and build-tool
+caches. It is separate from the shared job store.
+
+Writable jobs set `GOCACHE`, `TMPDIR`, `npm_config_cache`, `COREPACK_HOME`,
+`XDG_CACHE_HOME`, `npm_config_store_dir`, and `YARN_CACHE_FOLDER` to private
+directories there. Writable Codex jobs add that directory as an OS sandbox
+writable root. Inspect jobs get no private scratch or writable-cache
+environment: the current read-only backend profiles do not enforce a writable
+root outside the submitted workspace, and Agentbus does not weaken those
+profiles to add one. Codex may still receive the resolved host `GOMODCACHE` for
+reads.
+
+Codex jobs use the daemon's effective Go module cache for reads. Agentbus
+resolves `GOMODCACHE` once at daemon startup, using the daemon environment first
+and otherwise `go env GOMODCACHE` with a two-second timeout. If neither gives a
+path, Agentbus leaves `GOMODCACHE` at its default. It never redirects this
+variable to an empty per-job directory. The Codex workspace-write sandbox
+keeps the host module cache readable and outside its writable roots on macOS
+and Linux; a cache miss cannot be filled because Codex network access is
+denied. Codex jobs set `GOPROXY=off`, which makes a missing module fail with
+Go's own offline lookup error instead of retrying DNS. `-mod=readonly` only
+restricts module-file changes; it is not a filesystem sandbox or a promise
+that a cache is writable.
 
 The root and token are owner-only. Do not hand-edit jobs.db, token, or
 artifacts while a daemon is using the root.
@@ -118,6 +140,18 @@ projection omits result text, while `--json` emits the full job.get record.
 That JSON is byte-identical to `agentbus result --json` and deliberately
 includes inline result text when the record has it.
 
+The full record includes an `execution` object after the job starts. It records
+`intent` (`inspect` or `edit`), `sourceWritable`, `scratch`, a cache-path map,
+`network`, `gitMetadata`, and `enforcement`. These are descriptive values, not
+a capability negotiation. `sourceWritable` reports the selected inspect/edit
+mode; `enforcement` says whether the backend provides an OS sandbox, agent
+permissions, or no filesystem boundary. Codex uses OS sandbox enforcement and
+denies job network access. Cursor uses agent-mode permissions, which do not
+sandbox filesystem or network access at the OS level. Claude has no filesystem
+or network sandbox; read-only tool permissions do not establish filesystem
+containment. The execution object is a start-time snapshot. This unit has no
+`verify` intent.
+
 agentbus result --job <id> reads the same full record. For a completed job it
 writes the authoritative result to standard output. It writes failure detail or
 the absence of a result to standard error for other states. When it must read a
@@ -147,6 +181,8 @@ class, and schema compliance:
 | 15 | completed but the authoritative result artifact is missing, unreadable, or disagrees with its recorded digest |
 
 Codes 8, 9, and 12 are permanently retired. Do not reuse them.
+
+`agentbus steer` exits 17 for a rejected receipt and 18 for an unknown-delivery receipt.
 
 ## Store failures
 
