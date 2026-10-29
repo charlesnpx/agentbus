@@ -193,17 +193,23 @@ type JobGetParams struct {
 	JobID string `json:"jobId,omitempty"`
 }
 
-// JobListParams is the parameter object for job.list. Every field is
-// optional; omitted or empty filters do not restrict the result.
+// JobListParams is the parameter object for job.list. Every field is optional;
+// omitted or empty filters do not restrict results, while limit and cursor
+// select an optional page.
 type JobListParams struct {
 	WorkspaceKey string            `json:"workspaceKey,omitempty"`
 	Tags         map[string]string `json:"tags,omitempty"`
 	States       []PublicState     `json:"states,omitempty"`
+	Limit        int               `json:"limit,omitempty"`
+	Cursor       string            `json:"cursor,omitempty"`
 }
 
-// JobListResult is the response to job.list.
+// JobListResult is the response to job.list. Truncated and NextCursor are set
+// only when another page exists.
 type JobListResult struct {
-	Jobs []JobSummaryWire `json:"jobs"`
+	Jobs       []JobSummaryWire `json:"jobs"`
+	Truncated  bool             `json:"truncated,omitempty"`
+	NextCursor string           `json:"nextCursor,omitempty"`
 }
 
 // JobTranscriptParams selects a stateless view of one job's captured
