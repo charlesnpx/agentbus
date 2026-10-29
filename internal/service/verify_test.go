@@ -178,6 +178,20 @@ func TestCreateFrozenCopyPreservesEligibleFilesAndMetadata(t *testing.T) {
 	}
 }
 
+func TestFrozenSourceIdentityCountsUntrackedFilesWhenGitHidesThem(t *testing.T) {
+	repo := newFrozenTestRepo(t)
+	runGitTest(t, repo, "config", "status.showUntrackedFiles", "no")
+	writeFrozenTestFile(t, filepath.Join(repo, "untracked.txt"), "untracked contents", 0o644)
+
+	identity, err := frozenSourceIdentity(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !identity.Dirty {
+		t.Fatalf("frozen source identity = %+v, want dirty=true for untracked input", identity)
+	}
+}
+
 func TestVerifyCopyBoundFailsBeforeBackendStart(t *testing.T) {
 	originalLimit := frozenCopyMaxBytes
 	frozenCopyMaxBytes = 8

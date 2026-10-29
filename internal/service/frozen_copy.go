@@ -89,7 +89,7 @@ func frozenSourceIdentity(parent context.Context, source string) (protocol.Froze
 	if err != nil || strings.TrimSpace(string(head)) == "" {
 		return protocol.FrozenSource{}, errors.New("read frozen source Git HEAD")
 	}
-	status, err := frozenGitCommand(parent, source, "-c", "core.fsmonitor=false", "status", "--porcelain").Output()
+	status, err := frozenGitCommand(parent, source, "-c", "core.fsmonitor=false", "status", "--porcelain", "--untracked-files=all").Output()
 	if err != nil {
 		return protocol.FrozenSource{}, errors.New("read frozen source Git status")
 	}
@@ -146,7 +146,6 @@ func copyFrozenFiles(ctx context.Context, source, destination string, listing io
 	var copiedEntries int
 	createdDirectories := make(map[string]struct{})
 	seen := make(map[string]struct{})
-	var listedEntries int
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -158,10 +157,6 @@ func copyFrozenFiles(ctx context.Context, source, destination string, listing io
 		if len(name) != 0 {
 			name = strings.TrimSuffix(name, "\x00")
 			if _, duplicate := seen[name]; !duplicate {
-				if listedEntries >= frozenCopyMaxEntries {
-					return fmt.Errorf("frozen copy exceeds entry bound of %s (production bound: 200,000 entries)", formatEntryBound(frozenCopyMaxEntries))
-				}
-				listedEntries++
 				seen[name] = struct{}{}
 				if err := copyFrozenEntry(ctx, rootFD, destination, name, &copiedBytes, &copiedEntries, createdDirectories); err != nil {
 					return err

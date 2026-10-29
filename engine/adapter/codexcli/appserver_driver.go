@@ -1262,7 +1262,12 @@ func turnStartParams(threadID string, opts engine.SessionOpts, input engine.Turn
 		if opts.Verify {
 			writePolicy = WritePolicyWorkspaceOffline
 		}
-		params["sandboxPolicy"] = sandboxPolicy(workspaceWrite, opts.CWD, opts.WriteSandboxRoot, writePolicy)
+		policy := sandboxPolicy(workspaceWrite, opts.CWD, opts.WriteSandboxRoot, writePolicy)
+		if opts.Verify {
+			policy["excludeSlashTmp"] = true
+			policy["excludeTmpdirEnvVar"] = true
+		}
+		params["sandboxPolicy"] = policy
 	}
 	if opts.CWD != "" {
 		params["cwd"] = opts.CWD

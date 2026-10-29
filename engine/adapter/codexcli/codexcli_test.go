@@ -931,6 +931,13 @@ func TestAppServerWriteCacheAppliesOnlyToWriteTurns(t *testing.T) {
 				if !ok || !reflect.DeepEqual(gotPolicy, tt.wantPolicy) {
 					t.Fatalf("turn/start sandboxPolicy = %#v, want %#v", params["sandboxPolicy"], tt.wantPolicy)
 				}
+				if tt.write {
+					for _, key := range []string{"excludeSlashTmp", "excludeTmpdirEnvVar"} {
+						if _, ok := gotPolicy[key]; ok {
+							t.Fatalf("ordinary write sandboxPolicy contains verify-only %q: %#v", key, gotPolicy)
+						}
+					}
+				}
 				peer.respond(turn, turnResult("turn-1"))
 				peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
 			})
@@ -1993,9 +2000,11 @@ func TestAppServerVerifyUsesFrozenWorkspaceAndOfflineWritableRoots(t *testing.T)
 		turn := peer.expectRequest("turn/start")
 		turnParams := turn["params"].(map[string]any)
 		wantPolicy := map[string]any{
-			"type":          "workspaceWrite",
-			"networkAccess": false,
-			"writableRoots": []any{frozenCopy, scratch},
+			"type":                "workspaceWrite",
+			"networkAccess":       false,
+			"writableRoots":       []any{frozenCopy, scratch},
+			"excludeSlashTmp":     true,
+			"excludeTmpdirEnvVar": true,
 		}
 		if turnParams["cwd"] != frozenCopy || !reflect.DeepEqual(turnParams["sandboxPolicy"], wantPolicy) {
 			t.Fatalf("verify turn/start params = %#v, want cwd %q and policy %#v", turnParams, frozenCopy, wantPolicy)

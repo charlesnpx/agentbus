@@ -147,9 +147,11 @@ scratch or writable caches. **Verify** sets TaskSpec `verify: true` with
 copy contains tracked and untracked, non-ignored files as they exist when the
 job starts, has no `.git` metadata, and sits under managed scratch. Codex's OS
 sandbox grants writes only to that copy and scratch, adding the private IPC
-directory when `localIPC` is requested. Network access is denied apart from
-the requested local IPC. The submitted source is not a writable root. Verify
-is refused for Claude and Cursor because their configured modes do not enforce
+directory when `localIPC` is requested. Verify turns do not get the sandbox's
+implicit `/tmp` and `TMPDIR` writable grants; managed scratch remains writable
+through its explicit root. Network access is denied apart from the requested
+local IPC. The submitted source is not a writable root. Verify is refused for
+Claude and Cursor because their configured modes do not enforce
 that boundary. It requires a Git work tree, cannot resume or retain a session,
 and is limited to 2 GiB and 200,000 copied entries. **Edit** grants workspace
 writes. Ordinary Codex edits use the OS sandbox with managed scratch and network denied; trusted

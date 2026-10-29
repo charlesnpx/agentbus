@@ -533,7 +533,9 @@ read-only jobs (the adapter's allowed/denied shell tool lists), and
 jobs. The posture is descriptive:
 `sourceWritable` reports the selected mode, while `enforcement` identifies
 whether the backend uses an OS sandbox, agent permissions, or no filesystem
-boundary. Before a sandboxed Codex job, including every Verify job, launches
+boundary. Verify turns do not get the sandbox's implicit `/tmp` and `TMPDIR`
+writable grants; managed scratch remains writable through its explicit root.
+Before a sandboxed Codex job, including every Verify job, launches
 app-server, Agentbus runs a bounded `codex sandbox -- true` check. A failure
 records `backend_unavailable` with the sandbox diagnostic and does not fall
 back to a weaker mode. For Codex
