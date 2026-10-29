@@ -58,6 +58,7 @@ Agentbus errors. The stable data.code values are:
 | method_not_found | The requested method is not part of the version-3 surface. |
 | backend_unavailable | The daemon cannot use the requested backend or its job store. |
 | invalid_task_spec | Parameters, identity, task specification, or inline schema are invalid. |
+| queue_full | The new submission would exceed the daemon's bounded waiting queue. |
 | unknown_job | No job has the requested jobId. |
 
 jobId is included when the error relates to a known or requested job. Clients
@@ -92,7 +93,10 @@ available model and effort metadata:
 
 Submission has a compound identity. A matching replay returns the existing job
 without launching it again. Reusing the same identity with a different task
-specification is rejected.
+specification is rejected. A new submission that exceeds the daemon's bounded
+waiting queue returns `queue_full`; matching deduplicated submissions are not
+new queue entries. Execution timeouts begin when the daemon reserves an
+execution slot, not when the job is submitted.
 
 ~~~json
 {
@@ -193,6 +197,7 @@ The result contains compact summaries:
       "tags": {"team": "core"},
       "cleanup": "clean",
       "createdAt": "2026-08-20T12:00:00Z",
+      "queuedAt": "2026-08-20T12:00:00Z",
       "updatedAt": "2026-08-20T12:00:01Z",
       "failureClass": "backend_error",
       "contract": {
@@ -208,10 +213,11 @@ The result contains compact summaries:
 }
 ~~~
 
-Each summary always contains jobId, backend, state, cleanup, createdAt, and
-updatedAt. tags, modelReported, failureClass, and contract appear when
-applicable. tags is the submitted tag map, allowing a caller to see why a tag
-filter matched.
+Each summary always contains jobId, backend, state, cleanup, createdAt,
+queuedAt, and updatedAt. queuedAt is the time the job entered the queue;
+startedAt on job.get shows when the durable running transition was recorded. tags,
+modelReported, failureClass, and contract appear when applicable. tags is the
+submitted tag map, allowing a caller to see why a tag filter matched.
 
 itemCount and liveness appear only while this daemon has an active execution
 for that job. lastItemAt appears after that active execution has assembled an
@@ -330,6 +336,7 @@ invalid_task_spec parameter error rather than a list request.
   "state": "completed",
   "cleanup": "clean",
   "createdAt": "2026-08-20T12:00:00Z",
+  "queuedAt": "2026-08-20T12:00:00Z",
   "startedAt": "2026-08-20T12:00:01Z",
   "finishedAt": "2026-08-20T12:00:05Z",
   "timeout": {
@@ -363,9 +370,9 @@ invalid_task_spec parameter error rather than a list request.
 }
 ~~~
 
-jobId, workspaceKey, requestId, backend, state, cleanup, createdAt, and timeout
-are always present. startedAt, finishedAt, tags, result, contract, failure,
-and logPaths appear only when they apply.
+jobId, workspaceKey, requestId, backend, state, cleanup, createdAt, queuedAt,
+and timeout are always present. startedAt, finishedAt, tags, result, contract,
+failure, and logPaths appear only when they apply.
 
 result exists only for a completed job with an authoritative result. Its
 resultPath, sha256, and bytes are required; text may be omitted when the result

@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -35,6 +36,7 @@ const (
 	cliExitDaemonStartupFailure = 11
 	cliExitShutdownForced       = 13
 	cliExitResultUnavailable    = 15
+	cliExitQueueFull            = 16
 	shortSHA256HexLength        = 12
 )
 
@@ -143,14 +145,20 @@ func (a *app) runVersion(args []string, out, errOut io.Writer) int {
 func (a *app) runServe(ctx context.Context, args []string, errOut io.Writer) int {
 	fs := newCommandFlagSet("serve", errOut)
 	foreground := fs.Bool("foreground", false, "run daemon in foreground")
+	maxJobs := fs.Int("max-jobs", 4, "maximum concurrent jobs across all backends (positive integer)")
+	maxJobsPerBackend := fs.Int("max-jobs-per-backend", 2, "maximum concurrent jobs per backend (positive integer)")
+	maxQueued := fs.Int("max-queued", 64, "maximum waiting jobs before submissions are rejected (positive integer)")
 	if code, ok := parseFlags(fs, args); !ok {
 		return code
 	}
 	if fs.NArg() != 0 {
 		return usageError(errOut, "serve does not accept positional arguments")
 	}
+	if *maxJobs <= 0 || *maxJobsPerBackend <= 0 || *maxQueued <= 0 {
+		return usageError(errOut, "--max-jobs, --max-jobs-per-backend, and --max-queued must be positive integers")
+	}
 	if !*foreground {
-		if err := a.startBackgroundDaemon(ctx); err != nil {
+		if err := a.startBackgroundDaemon(ctx, *maxJobs, *maxJobsPerBackend, *maxQueued); err != nil {
 			return protocolCommandError(errOut, "serve", err)
 		}
 		return 0
@@ -164,6 +172,9 @@ func (a *app) runServe(ctx context.Context, args []string, errOut io.Writer) int
 		CodexHomeOverride: codexHomeOverride,
 		CodexHomeInherit:  codexHomeInherit,
 		CodexAuthHome:     codexAuthHome,
+		MaxJobs:           *maxJobs,
+		MaxJobsPerBackend: *maxJobsPerBackend,
+		MaxQueued:         *maxQueued,
 	})
 	if err != nil {
 		return serveCommandError(errOut, err)
@@ -178,7 +189,7 @@ func codexHomeSettings() (override string, inherit bool, authHome string) {
 		strings.TrimSpace(os.Getenv("CODEX_HOME"))
 }
 
-func (a *app) startBackgroundDaemon(ctx context.Context) error {
+func (a *app) startBackgroundDaemon(ctx context.Context, maxJobs, maxJobsPerBackend, maxQueued int) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return err
@@ -189,10 +200,15 @@ func (a *app) startBackgroundDaemon(ctx context.Context) error {
 	}
 	result, err := launcher(ctx, daemonlaunch.Options{
 		CommandPath: exe,
-		Args:        []string{"serve", "--foreground"},
-		StateRoot:   a.stateRoot,
-		Timeout:     daemonlaunch.DefaultTimeout,
-		Starter:     startDaemonProcess,
+		Args: []string{
+			"serve", "--foreground",
+			"--max-jobs", strconv.Itoa(maxJobs),
+			"--max-jobs-per-backend", strconv.Itoa(maxJobsPerBackend),
+			"--max-queued", strconv.Itoa(maxQueued),
+		},
+		StateRoot: a.stateRoot,
+		Timeout:   daemonlaunch.DefaultTimeout,
+		Starter:   startDaemonProcess,
 	})
 	if err != nil {
 		return err
@@ -342,6 +358,7 @@ func (a *app) runStatus(ctx context.Context, args []string, out, errOut io.Write
 				summary.Backend,
 				summary.Cleanup,
 				summary.CreatedAt,
+				summary.QueuedAt,
 				summary.FailureClass,
 				summary.Contract,
 				summary.Tags,
@@ -616,8 +633,11 @@ func (a *app) connectProtocolClient(ctx context.Context) (protocolClient, error)
 	return agentclient.Connect(ctx, opts)
 }
 
-func printJobSummary(out io.Writer, jobID string, state protocol.PublicState, backend string, cleanup protocol.Cleanup, createdAt time.Time, failureClass protocol.FailureClass, contract *protocol.ContractVerdict, tags map[string]string, itemCount *int, lastItemAt, lastActivityAt *time.Time, liveness protocol.Liveness) {
-	fmt.Fprintf(out, "jobId=%s state=%s backend=%s cleanup=%s age=%s", jobID, state, backend, cleanup, jobAge(createdAt))
+func printJobSummary(out io.Writer, jobID string, state protocol.PublicState, backend string, cleanup protocol.Cleanup, createdAt, queuedAt time.Time, failureClass protocol.FailureClass, contract *protocol.ContractVerdict, tags map[string]string, itemCount *int, lastItemAt, lastActivityAt *time.Time, liveness protocol.Liveness) {
+	if queuedAt.IsZero() {
+		queuedAt = createdAt
+	}
+	fmt.Fprintf(out, "jobId=%s state=%s backend=%s cleanup=%s queuedAt=%s age=%s", jobID, state, backend, cleanup, humanTime(queuedAt), jobAge(createdAt))
 	if failureClass != "" {
 		fmt.Fprintf(out, " failure.class=%s", failureClass)
 	}
@@ -643,7 +663,7 @@ func printJobSummary(out io.Writer, jobID string, state protocol.PublicState, ba
 }
 
 func printJobRecordStatus(out io.Writer, record agentclient.JobGetResult) {
-	printJobSummary(out, record.JobID, record.State, record.Backend, record.Cleanup, record.CreatedAt, "", nil, nil, nil, nil, nil, "")
+	printJobSummary(out, record.JobID, record.State, record.Backend, record.Cleanup, record.CreatedAt, record.QueuedAt, "", nil, nil, nil, nil, nil, "")
 	fmt.Fprintf(out, "createdAt=%s", humanTime(record.CreatedAt))
 	if record.StartedAt != nil {
 		fmt.Fprintf(out, " startedAt=%s", humanTime(*record.StartedAt))
@@ -895,6 +915,10 @@ func protocolCommandError(errOut io.Writer, operation string, err error) int {
 		return cliExitDaemonStartupFailure
 	}
 	var rpcErr *protocol.RPCError
+	if errors.As(err, &rpcErr) && rpcErr.Object.Data.Code == protocol.ErrorQueueFull {
+		fmt.Fprintf(errOut, "agentbus: %s: code=%s: %s\n", operation, rpcErr.Object.Data.Code, rpcErr.Object.Message)
+		return cliExitQueueFull
+	}
 	if errors.As(err, &rpcErr) && rpcErr.Object.Data.Code == protocol.ErrorUnknownJob {
 		jobID := rpcErr.Object.Data.JobID
 		if jobID == "" {
@@ -925,7 +949,7 @@ func writeJSON(out io.Writer, v any) error {
 func printRootHelp(out io.Writer) {
 	fmt.Fprint(out, `Usage:
   agentbus version [--json] (aliases: --version, -version, -V)
-  agentbus serve [--foreground]
+  agentbus serve [--foreground] [--max-jobs <n>] [--max-jobs-per-backend <n>] [--max-queued <n>]
   agentbus status [--job <id>] [--workspace-key <key>] [--tag <key=value>] [--state <state>] [--json]
   agentbus transcript --job <id> [--kind <kind>]... [--last <n>] [--since <rfc3339>] [--since-ordinal <n>] [--limit <n>] [--json]
   agentbus result --job <id> [--json]
@@ -935,11 +959,12 @@ func printRootHelp(out io.Writer) {
 status and result use the same job.get record for a selected job. Their JSON
 output is identical; status is the operator projection and result is pipeable.
 
-Exit codes for a selected job:
+Exit codes for a selected job and protocol outcomes:
   completed=0, queued/running=2, completed-noncompliant=3, failed=4,
   timeout=5, interrupted=6, canceled=7, unknown-job=10,
   daemon-startup-failure=11, shutdown-deadline=13, unknown=14,
   result-artifact-unavailable=15: completed, but the authoritative result artifact is missing, unreadable, or does not match its recorded digest
+  queue-full=16: submission rejected because the daemon's waiting queue is full
 `)
 }
 

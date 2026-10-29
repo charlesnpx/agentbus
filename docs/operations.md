@@ -51,7 +51,26 @@ artifacts while a daemon is using the root.
 ## Starting and selecting backends
 
 Use agentbus serve to start a background daemon. Use agentbus serve --foreground
-when a supervisor owns the process. The public CLI commands are version, serve,
+when a supervisor owns the process. Both forms accept `--max-jobs`,
+`--max-jobs-per-backend`, and `--max-queued`. Their defaults are 4 total jobs,
+2 jobs per backend, and 64 waiting jobs. These are starting values, not
+measured optima. Each value must be a positive integer; zero does not mean
+unlimited. The values apply when a daemon starts and do not reconfigure an
+already serving daemon.
+
+Jobs beyond the execution limits remain queued and start in FIFO order within
+their backend when a slot opens. A queued job for a saturated backend does not
+block a later job for another backend with a free slot. The queue bound counts
+waiting jobs; a matching deduplicated submission does not consume another
+entry. When the bound is reached, a new job.submit returns the typed
+`queue_full` error and CLI exit code 16. A queued cancellation removes the job
+before it can start a provider. Job lookup, listing, transcript, and queued
+cancellation remain available while all execution slots are occupied.
+
+The timeout is execution time: it begins when the daemon reserves a slot, not
+when job.submit is accepted. `queuedAt` records queue entry and `startedAt`
+records the start transition, so status shows both the waiting age and whether
+the job is queued or running. The public CLI commands are version, serve,
 status, transcript, result, cancel, and configure-codex-sandbox.
 
 `agentbus configure-codex-sandbox` adds the Agentbus state root and cache root to
@@ -117,6 +136,7 @@ class, and schema compliance:
 | 13 | shutdown deadline exceeded |
 | 14 | unknown |
 | 15 | completed but the authoritative result artifact is missing, unreadable, or disagrees with its recorded digest |
+| 16 | submission rejected because the daemon's waiting queue is full |
 
 Codes 8, 9, and 12 are permanently retired. Do not reuse them.
 
