@@ -98,6 +98,11 @@ Codex uses native app-server `turn/steer`; confirmation means its correlated
 JSON-RPC success response arrived before the steer context ended. No response
 before that deadline is reported as unconfirmed.
 `agentbus steer` exits 17 for a rejected receipt and 18 when delivery is unknown.
+Claude Code uses `interrupt_continue` on its existing stream-json connection:
+it waits for the interrupt acknowledgement, drains the interrupted result, and
+writes the follow-up user message before reporting confirmed delivery. This is
+not same-turn injection; confirmed delivery does not mean Claude followed the
+instruction.
 The wire details and receipt reasons are in [docs/protocol.md](docs/protocol.md).
 
 Set AGENTBUS_STATE_ROOT to select daemon state. Otherwise Agentbus uses
