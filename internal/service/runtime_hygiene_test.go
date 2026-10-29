@@ -448,6 +448,13 @@ func TestContentPolicyFailurePrecedesModelUnavailable(t *testing.T) {
 	}
 }
 
+func TestUnrecognizedClaudeModelIsModelUnavailable(t *testing.T) {
+	err := errors.New(`[claude-code:unrecognized_model] {"model":"orch-no-such-model-1","query_source":"sdk"}`)
+	if got := classifyExecutionFailure(err); got != protocol.FailureClassModelUnavailable {
+		t.Fatalf("failure class = %q, want %q", got, protocol.FailureClassModelUnavailable)
+	}
+}
+
 func TestAccountFlaggedForAbuseStaysBackendError(t *testing.T) {
 	err := errors.New("This account was flagged for possible abuse")
 	if got := classifyExecutionFailure(err); got != protocol.FailureClassBackendError {
