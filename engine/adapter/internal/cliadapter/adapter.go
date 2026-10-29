@@ -339,6 +339,12 @@ func (s *Session) Interrupt(ctx context.Context) error {
 	return s.duplexSession.Interrupt(ctx)
 }
 
+// Steer forwards an active-turn instruction through the duplex session.
+// Drivers without a steering extension return ErrSteerUnsupported.
+func (s *Session) Steer(ctx context.Context, message engine.SteerMessage) (engine.SteerDelivery, error) {
+	return s.duplexSession.Steer(ctx, message)
+}
+
 func (s *Session) NativeInterrupt(ctx context.Context) (bool, error) {
 	return s.duplexSession.NativeInterrupt(ctx)
 }
