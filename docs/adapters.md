@@ -196,6 +196,16 @@ Claude's bidirectional stream-json input protocol: it sends a control-protocol
 turn completion. A `result` with subtype `success` and no error flag emits the
 result text; other result subtypes or `is_error` values emit terminal errors.
 
+Steering uses `interrupt_continue` over that same persistent connection. The
+driver sends a `control_request` with `request.subtype` set to `interrupt` and
+waits for a matching `control_response` with subtype `success`. It drains the
+interrupted segment's `result` without emitting it as the logical result, then
+writes the follow-up as a user message and continues reading the resumed
+segment. A delivery is confirmed only after the interrupt acknowledgement and
+follow-up write. This is not same-turn injection and does not confirm that
+Claude followed the instruction. The adapter does not enable
+`--replay-user-messages`, which would change the existing transcript behavior.
+
 ### claude effort values
 
 When `SessionOpts.Effort` is provided, the claude adapter passes it as:

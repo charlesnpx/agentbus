@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -17,12 +18,28 @@ import (
 
 const defaultInitializeTimeout = 60 * time.Second
 
+const defaultSteerAckTimeout = 60 * time.Second
+
 const progressEmissionInterval = time.Second
 
 type streamJSONDriver struct {
 	binary            string
 	initializeTimeout time.Duration
 	nextID            atomic.Uint64
+	streamsMu         sync.Mutex
+	streams           map[*duplex.Conn]*claudeStream
+}
+
+type pendingSteer struct {
+	requestID string
+	message   engine.SteerMessage
+	ctx       context.Context
+	ack       chan error
+	delivered chan error
+
+	acknowledged bool
+	abandoned    bool
+	failure      error
 }
 
 type claudeStream struct {
@@ -31,6 +48,15 @@ type claudeStream struct {
 	emit         duplex.EmitFunc
 	pending      []duplex.Frame
 	lastProgress time.Time
+	mu           sync.Mutex
+	steer        *pendingSteer
+	completed    bool
+	finished     bool
+	runErr       error
+	ready        chan struct{}
+	done         chan struct{}
+	readyOnce    sync.Once
+	doneOnce     sync.Once
 	// Claude is assumed to send a completed assistant frame before the next
 	// message_start. If it does not, this flag could suppress that later
 	// message's completed text after the prior message emitted partial text.
@@ -41,6 +67,7 @@ func newStreamJSONDriver(binary string) *streamJSONDriver {
 	return &streamJSONDriver{
 		binary:            binary,
 		initializeTimeout: defaultInitializeTimeout,
+		streams:           make(map[*duplex.Conn]*claudeStream),
 	}
 }
 
@@ -78,15 +105,25 @@ func (d *streamJSONDriver) ExecSpec(resumeID string, opts engine.SessionOpts, in
 	return command.ExecSpec{Argv: args, Dir: opts.CWD}, nil
 }
 
-func (d *streamJSONDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resumeID string, _ engine.SessionOpts, input engine.TurnInput, emit duplex.EmitFunc) (string, error) {
-	stream := &claudeStream{driver: d, conn: conn, emit: emit}
-	sessionID := resumeID
+func (d *streamJSONDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resumeID string, _ engine.SessionOpts, input engine.TurnInput, emit duplex.EmitFunc) (sessionID string, runErr error) {
+	stream := &claudeStream{
+		driver: d,
+		conn:   conn,
+		emit:   emit,
+		ready:  make(chan struct{}),
+		done:   make(chan struct{}),
+	}
+	d.registerStream(stream)
+	defer d.unregisterStream(stream)
+	defer func() { stream.finish(runErr) }()
+	sessionID = resumeID
 	if err := stream.initialize(ctx); err != nil {
 		return sessionID, err
 	}
 	if err := stream.writeUserMessage(ctx, input.Prompt); err != nil {
 		return sessionID, err
 	}
+	stream.markReady()
 	for {
 		frame, err := stream.nextFrame(ctx)
 		if err != nil {
@@ -100,6 +137,86 @@ func (d *streamJSONDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resum
 			return sessionID, nil
 		}
 	}
+}
+
+func (d *streamJSONDriver) Steer(ctx context.Context, conn *duplex.Conn, msg engine.SteerMessage) (engine.SteerDelivery, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	stream := d.activeStream(conn)
+	if stream == nil {
+		return engine.SteerDelivery{}, engine.ErrSteerNotActive
+	}
+	select {
+	case <-stream.ready:
+	case <-stream.done:
+		return engine.SteerDelivery{}, stream.finishedError()
+	case <-ctx.Done():
+		return engine.SteerDelivery{}, ctx.Err()
+	}
+
+	pending := &pendingSteer{
+		requestID: d.nextRequestID(),
+		message:   msg,
+		ctx:       ctx,
+		ack:       make(chan error, 1),
+		delivered: make(chan error, 1),
+	}
+	if err := stream.beginSteer(ctx, pending); err != nil {
+		return engine.SteerDelivery{}, err
+	}
+
+	ackCtx, cancel := context.WithTimeout(ctx, defaultSteerAckTimeout)
+	defer cancel()
+	select {
+	case err := <-pending.ack:
+		if err != nil {
+			return engine.SteerDelivery{}, err
+		}
+	case <-stream.done:
+		return engine.SteerDelivery{}, stream.finishedError()
+	case <-ackCtx.Done():
+		err := fmt.Errorf("claude interrupt was not acknowledged: %w", ackCtx.Err())
+		stream.abandonSteer(pending, err)
+		return engine.SteerDelivery{}, err
+	}
+
+	select {
+	case err := <-pending.delivered:
+		if err != nil {
+			return engine.SteerDelivery{}, err
+		}
+		return engine.SteerDelivery{Mechanism: engine.SteerMechanismInterruptContinue, Confirmed: true}, nil
+	case <-stream.done:
+		return engine.SteerDelivery{}, stream.finishedError()
+	case <-ctx.Done():
+		err := ctx.Err()
+		stream.abandonSteer(pending, err)
+		return engine.SteerDelivery{}, err
+	}
+}
+
+func (d *streamJSONDriver) registerStream(stream *claudeStream) {
+	d.streamsMu.Lock()
+	defer d.streamsMu.Unlock()
+	if d.streams == nil {
+		d.streams = make(map[*duplex.Conn]*claudeStream)
+	}
+	d.streams[stream.conn] = stream
+}
+
+func (d *streamJSONDriver) unregisterStream(stream *claudeStream) {
+	d.streamsMu.Lock()
+	defer d.streamsMu.Unlock()
+	if d.streams[stream.conn] == stream {
+		delete(d.streams, stream.conn)
+	}
+}
+
+func (d *streamJSONDriver) activeStream(conn *duplex.Conn) *claudeStream {
+	d.streamsMu.Lock()
+	defer d.streamsMu.Unlock()
+	return d.streams[conn]
 }
 
 func (d *streamJSONDriver) Interrupt(ctx context.Context, conn *duplex.Conn) error {
@@ -206,6 +323,157 @@ func (s *claudeStream) writeUserMessage(ctx context.Context, prompt string) erro
 	})
 }
 
+func (s *claudeStream) markReady() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.readyOnce.Do(func() { close(s.ready) })
+}
+
+func (s *claudeStream) beginSteer(ctx context.Context, pending *pendingSteer) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.finished || s.completed {
+		return engine.ErrSteerNotActive
+	}
+	if s.steer != nil {
+		return errors.New("claude steering already pending")
+	}
+	if err := s.writeControlRequest(ctx, pending.requestID, "interrupt", nil); err != nil {
+		return err
+	}
+	s.steer = pending
+	return nil
+}
+
+func (s *claudeStream) abandonSteer(pending *pendingSteer, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.steer == pending {
+		pending.abandoned = true
+		pending.failure = err
+	}
+}
+
+func (s *claudeStream) finish(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.finished {
+		return
+	}
+	s.finished = true
+	s.runErr = err
+	s.readyOnce.Do(func() { close(s.ready) })
+	if pending := s.steer; pending != nil {
+		steerErr := err
+		if steerErr == nil {
+			steerErr = engine.ErrSteerNotActive
+		}
+		notifySteer(pending.ack, steerErr)
+		notifySteer(pending.delivered, steerErr)
+		s.steer = nil
+	}
+	s.doneOnce.Do(func() { close(s.done) })
+}
+
+func (s *claudeStream) finishedError() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.runErr != nil {
+		return s.runErr
+	}
+	return engine.ErrSteerNotActive
+}
+
+func notifySteer(ch chan error, err error) {
+	select {
+	case ch <- err:
+	default:
+	}
+}
+
+func (s *claudeStream) handleSteerControlResponse(obj map[string]any) bool {
+	if strings.ToLower(firstString(obj, "type")) != "control_response" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pending := s.steer
+	if pending == nil || !isControlResponseTo(obj, pending.requestID) {
+		return false
+	}
+	if err := controlResponseError(obj); err != nil {
+		s.steer = nil
+		notifySteer(pending.ack, err)
+		notifySteer(pending.delivered, err)
+		return true
+	}
+	pending.acknowledged = true
+	if !pending.abandoned {
+		notifySteer(pending.ack, nil)
+	}
+	return true
+}
+
+func (s *claudeStream) handleResult(ctx context.Context, obj map[string]any) (bool, error) {
+	s.mu.Lock()
+	pending := s.steer
+	if pending == nil {
+		s.completed = true
+		s.mu.Unlock()
+		s.emitResult(obj)
+		return true, nil
+	}
+	if pending.abandoned {
+		s.steer = nil
+		s.completed = true
+		err := pending.failure
+		if err == nil {
+			err = errors.New("claude interrupt was not acknowledged")
+		}
+		notifySteer(pending.ack, err)
+		notifySteer(pending.delivered, err)
+		s.mu.Unlock()
+		return false, err
+	}
+	if !pending.acknowledged {
+		s.steer = nil
+		s.completed = true
+		err := errors.New("claude interrupt control request was not acknowledged")
+		notifySteer(pending.ack, err)
+		notifySteer(pending.delivered, err)
+		s.mu.Unlock()
+		// The result arrived before a successful interrupt acknowledgement, so
+		// the original segment completed normally and remains the logical result.
+		s.emitResult(obj)
+		return true, nil
+	}
+	if err := ctx.Err(); err != nil {
+		s.steer = nil
+		s.completed = true
+		notifySteer(pending.delivered, err)
+		s.mu.Unlock()
+		return false, err
+	}
+	if err := pending.ctx.Err(); err != nil {
+		s.steer = nil
+		s.completed = true
+		notifySteer(pending.delivered, err)
+		s.mu.Unlock()
+		return false, err
+	}
+	if err := s.writeUserMessage(ctx, pending.message.Text); err != nil {
+		s.steer = nil
+		s.completed = true
+		notifySteer(pending.delivered, err)
+		s.mu.Unlock()
+		return false, err
+	}
+	s.steer = nil
+	s.mu.Unlock()
+	notifySteer(pending.delivered, nil)
+	return false, nil
+}
+
 func (s *claudeStream) nextFrame(ctx context.Context) (duplex.Frame, error) {
 	if len(s.pending) > 0 {
 		frame := s.pending[0]
@@ -256,6 +524,7 @@ func (s *claudeStream) handleFrame(ctx context.Context, frame duplex.Frame, sess
 		_, err := s.handleControlRequest(ctx, obj)
 		return false, err
 	case "control_response":
+		s.handleSteerControlResponse(obj)
 		return false, nil
 	case "user":
 		s.emitToolResults(obj)
@@ -270,8 +539,7 @@ func (s *claudeStream) handleFrame(ctx context.Context, frame duplex.Frame, sess
 		s.emitAssistant(obj)
 		return false, nil
 	case "result":
-		s.emitResult(obj)
-		return true, nil
+		return s.handleResult(ctx, obj)
 	case "warning":
 		if text := textFrom(obj); text != "" {
 			s.emitEvent(engine.Event{Type: engine.EventWarning, Text: text, Metadata: obj})
@@ -493,7 +761,7 @@ func isControlResponseTo(obj map[string]any, id string) bool {
 func controlResponseError(obj map[string]any) error {
 	response, _ := firstMap(obj, "response")
 	subtype := strings.ToLower(firstString(response, "subtype"))
-	if subtype != "error" && response["error"] == nil {
+	if subtype == "success" {
 		return nil
 	}
 	msg := textValue(response["error"])
@@ -501,7 +769,11 @@ func controlResponseError(obj map[string]any) error {
 		msg = textFrom(response)
 	}
 	if msg == "" {
-		msg = "claude control initialize failed"
+		if subtype == "" {
+			msg = "claude control response missing success acknowledgement"
+		} else {
+			msg = "claude control " + subtype
+		}
 	}
 	return errors.New(msg)
 }
