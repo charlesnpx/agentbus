@@ -365,7 +365,7 @@ func (s *Server) jobRecordWire(record jobstore.Record) (protocol.JobRecordWire, 
 	modelRequested := cloneRequestedValue(spec.Model)
 	effortRequested := cloneRequestedValue(spec.Effort)
 	modelReported, effortReported := s.projectedSelection(record)
-	return protocol.JobRecordWire{
+	wire := protocol.JobRecordWire{
 		JobID:              record.JobID,
 		WorkspaceKey:       record.WorkspaceKey,
 		RequestID:          record.RequestID,
@@ -395,7 +395,11 @@ func (s *Server) jobRecordWire(record jobstore.Record) (protocol.JobRecordWire, 
 		Execution:          record.Execution,
 		Steers:             steers,
 		CancellationReason: record.CancellationReason,
-	}, nil
+	}
+	if record.State == protocol.PublicStateQueued && !record.Starting {
+		wire.Queue = s.queueProjection(record.JobID, record.Backend)
+	}
+	return wire, nil
 }
 
 func (s *Server) projectedSelection(record jobstore.Record) (string, string) {

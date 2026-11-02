@@ -294,6 +294,17 @@ type JobSubmitResult struct {
 	State        PublicState               `json:"state"`
 	Deduplicated bool                      `json:"deduplicated"`
 	Timeout      *engine.TimeoutResolution `json:"timeout,omitempty"`
+	Queue        *QueueProjection          `json:"queue,omitempty"`
+}
+
+// QueueProjection describes a queued job's current place and occupied limits.
+// It is derived from the daemon's in-memory queue and omitted when unavailable.
+type QueueProjection struct {
+	Position       int `json:"position"`
+	BackendRunning int `json:"backendRunning"`
+	BackendLimit   int `json:"backendLimit"`
+	Running        int `json:"running"`
+	Limit          int `json:"limit"`
 }
 
 // JobGetParams is the parameter object for job.get.
@@ -442,6 +453,7 @@ type JobRecordWire struct {
 	Execution          *ExecutionPosture         `json:"execution,omitempty"`
 	Steers             []SteerSummaryWire        `json:"steers"`
 	CancellationReason CancellationReason        `json:"cancellationReason,omitempty"`
+	Queue              *QueueProjection          `json:"queue,omitempty"`
 }
 
 // JobSummaryWire is the compact item returned when job.list lists jobs. It

@@ -88,6 +88,9 @@ When the waiting queue is full, a new job.submit is rejected with
 `queue_full` (CLI exit code 19). A matching deduplicated request does not use
 another queue entry. Job execution timeouts begin when a job gets a slot;
 `queuedAt` and `startedAt` show its wait and execution start.
+For a queued job, `status --job <id>` prints its position among jobs for the
+same backend and the current backend and total running limits. `status --json`
+with `--job` includes the same optional `queue` projection as `job.get`.
 
 TaskSpec `inputMode` is `fixed` when omitted. Set it to `steerable` only when
 the running task may receive follow-up instructions. `agentbus steer` submits
