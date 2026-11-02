@@ -23,8 +23,20 @@ const (
 	// maxSteerMessageBytes caps steering text at 64 KiB.
 	maxSteerMessageBytes = 64 * 1024
 	// maxPendingSteers bounds each job's in-memory ordered delivery queue.
-	maxPendingSteers = 8
+	maxPendingSteers         = 8
+	deadlineWarningMessageID = "agentbus-deadline-warning"
 )
+
+var waitForDeadlineWarning = func(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
 
 type queuedSteer struct {
 	message engine.SteerMessage
@@ -38,6 +50,10 @@ func (s *Server) handleJobSteer(raw json.RawMessage) requestOutcome {
 	if err := decodeStrict(raw, &params); err != nil {
 		return invalidParams(err)
 	}
+	return s.handleJobSteerParams(params, nil)
+}
+
+func (s *Server) handleJobSteerParams(params protocol.JobSteerParams, daemonContext context.Context) requestOutcome {
 	if strings.TrimSpace(params.JobID) == "" {
 		return invalidParams(errors.New("jobId is required"))
 	}
@@ -69,6 +85,11 @@ func (s *Server) handleJobSteer(raw json.RawMessage) requestOutcome {
 			return jobStoreUnavailable("refresh job for steering", err)
 		}
 	}
+	if daemonContext != nil {
+		if daemonContext.Err() != nil || record.State.IsTerminal() {
+			return requestOutcome{}
+		}
+	}
 
 	digest := sha256.Sum256([]byte(params.Text))
 	textHash := hex.EncodeToString(digest[:])
@@ -83,6 +104,25 @@ func (s *Server) handleJobSteer(raw json.RawMessage) requestOutcome {
 	mode := protocol.EffectiveInputMode(spec.InputMode)
 	if record.InputMode != "" {
 		mode = record.InputMode
+	}
+	if daemonContext == nil && params.MessageID == deadlineWarningMessageID && mode == protocol.InputModeSteerable {
+		resolution, timeoutErr := timeoutFromMillis(spec.TimeoutMS)
+		if timeoutErr != nil {
+			return jobStoreUnavailable("read timeout for steering", errors.New(timeoutErr.Message))
+		}
+		warningMayUseID := record.State == protocol.PublicStateQueued || record.Starting
+		if run != nil && !record.State.IsTerminal() && !run.steerCanceled && !run.steerClosed {
+			run.mu.Lock()
+			session := run.session
+			run.mu.Unlock()
+			warningMayUseID = session == nil
+			if session != nil {
+				_, warningMayUseID = session.(engine.Steerer)
+			}
+		}
+		if resolution.Effective > 0 && warningMayUseID {
+			return invalidParams(errors.New("messageId is reserved for the daemon deadline warning"))
+		}
 	}
 	status := protocol.SteerStatusRejected
 	reason := protocol.SteerReasonNotRunning
@@ -108,6 +148,9 @@ func (s *Server) handleJobSteer(raw json.RawMessage) requestOutcome {
 			reason = ""
 		}
 	}
+	if daemonContext != nil && daemonContext.Err() != nil {
+		return requestOutcome{}
+	}
 
 	steer := newSteerRecord(params.MessageID, textHash, len(params.Text), status, reason)
 	stored, existed, err := store.RecordSteer(params.JobID, steer)
@@ -124,6 +167,47 @@ func (s *Server) handleJobSteer(raw json.RawMessage) requestOutcome {
 		return requestOutcome{result: steerReceipt(params.JobID, stored, false)}
 	}
 	return requestOutcome{result: steerReceipt(params.JobID, stored, false)}
+}
+
+func (s *Server) recordDeadlineWarning(ctx context.Context, run *activeExecution, jobID, text string) {
+	outcome := s.handleJobSteerParams(protocol.JobSteerParams{
+		JobID: jobID, MessageID: deadlineWarningMessageID, Text: text,
+	}, ctx)
+	if outcome.err != nil {
+		run.noteSteerDiagnostic("record deadline warning steer: " + outcome.err.Message)
+	}
+}
+
+func (s *Server) startDeadlineWarning(jobID string, run *activeExecution, session engine.Session, parent context.Context, acquiredAt time.Time, timeout time.Duration, mode protocol.InputMode) {
+	if timeout <= 0 || mode != protocol.InputModeSteerable {
+		return
+	}
+	if _, ok := session.(engine.Steerer); !ok {
+		return
+	}
+	deadline := acquiredAt.Add(timeout)
+	warningAt := acquiredAt.Add(timeout * 9 / 10)
+
+	run.controlMu.Lock()
+	delay := time.Until(warningAt)
+	if !run.turnActive || run.steerCanceled || run.steerClosed || delay <= 0 {
+		run.controlMu.Unlock()
+		return
+	}
+	ctx, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+	run.deadlineWarningCancel = cancel
+	run.deadlineWarningDone = done
+	run.controlMu.Unlock()
+
+	text := fmt.Sprintf("agentbus: about 10%% of this task's time limit remains (deadline %s). Stop starting new work. Write your final answer now, including results so far and anything left undone.", deadline.UTC().Format(time.RFC3339))
+	go func() {
+		defer close(done)
+		if !waitForDeadlineWarning(ctx, delay) || ctx.Err() != nil {
+			return
+		}
+		s.recordDeadlineWarning(ctx, run, jobID, text)
+	}()
 }
 
 func newSteerRecord(messageID, textHash string, textBytes int, status protocol.SteerStatus, reason protocol.SteerReason) protocol.SteerRecord {
@@ -285,8 +369,12 @@ func (s *Server) cancelSteering(store *jobstore.Store, run *activeExecution) boo
 	}
 	run.steerCanceled = true
 	run.turnActive = false
+	deadlineWarningDone := run.stopDeadlineWarningLocked()
 	run.rejectQueuedSteersLocked(store, protocol.SteerReasonNotRunning)
 	run.controlMu.Unlock()
+	if deadlineWarningDone != nil {
+		<-deadlineWarningDone
+	}
 	return true
 }
 
@@ -311,13 +399,14 @@ func (run *activeExecution) rejectQueuedSteersLocked(store *jobstore.Store, reas
 	}
 }
 
-func (run *activeExecution) closeSteeringLocked(store *jobstore.Store) <-chan struct{} {
+func (run *activeExecution) closeSteeringLocked(store *jobstore.Store) (<-chan struct{}, <-chan struct{}) {
 	run.steerClosed = true
 	run.turnActive = false
+	deadlineWarningDone := run.stopDeadlineWarningLocked()
 	run.rejectQueuedSteersLocked(store, protocol.SteerReasonNotRunning)
 	inFlightDone := run.steerInFlightDone
 	run.steerStopOnce.Do(func() { close(run.steerStop) })
-	return inFlightDone
+	return inFlightDone, deadlineWarningDone
 }
 
 func (run *activeExecution) waitSteeringWorker() {
@@ -339,8 +428,11 @@ func (s *Server) finishSteering(store *jobstore.Store, run *activeExecution) {
 		return
 	}
 	run.controlMu.Lock()
-	inFlightDone := run.closeSteeringLocked(store)
+	inFlightDone, deadlineWarningDone := run.closeSteeringLocked(store)
 	run.controlMu.Unlock()
+	if deadlineWarningDone != nil {
+		<-deadlineWarningDone
+	}
 	if inFlightDone != nil {
 		<-inFlightDone
 	}

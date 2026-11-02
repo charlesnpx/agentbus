@@ -76,6 +76,8 @@ type activeExecution struct {
 	steerDone              chan struct{}
 	steerStopOnce          sync.Once
 	steerWorkerStarted     bool
+	deadlineWarningCancel  context.CancelFunc
+	deadlineWarningDone    chan struct{}
 }
 
 // activeTurn owns the one retirement receipt for a turn. A cancellation can
@@ -267,6 +269,18 @@ func (run *activeExecution) startTurn(store *jobstore.Store, session engine.Sess
 	return events, err, canceled
 }
 
+func (run *activeExecution) stopDeadlineWarningLocked() <-chan struct{} {
+	if run.deadlineWarningCancel == nil {
+		return nil
+	}
+	cancel := run.deadlineWarningCancel
+	done := run.deadlineWarningDone
+	run.deadlineWarningCancel = nil
+	run.deadlineWarningDone = nil
+	cancel()
+	return done
+}
+
 // beginTurn resets process-claim tracking only after the preceding turn has
 // retired. Each retained adapter turn owns exactly one process and therefore
 // has exactly one separate durable claim transaction.
@@ -300,9 +314,13 @@ func (run *activeExecution) retireTurn(store *jobstore.Store, outcome turnOutcom
 	turn.once.Do(func() {
 		run.controlMu.Lock()
 		run.turnActive = false
+		deadlineWarningDone := run.stopDeadlineWarningLocked()
 		run.rejectQueuedSteersLocked(store, protocol.SteerReasonNotRunning)
 		steerInFlightDone := run.steerInFlightDone
 		run.controlMu.Unlock()
+		if deadlineWarningDone != nil {
+			<-deadlineWarningDone
+		}
 		if steerInFlightDone != nil {
 			<-steerInFlightDone
 		}
@@ -699,11 +717,12 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 	// Derived from the resolution rather than returned alongside it, so the
 	// effective timeout has exactly one source of truth.
 	timeout := time.Duration(resolution.Effective) * time.Millisecond
+	var acquiredAt time.Time
 
 	var jobCtx context.Context
 	var cancel context.CancelFunc
 	if timeout > 0 {
-		acquiredAt := run.slotAcquiredAt
+		acquiredAt = run.slotAcquiredAt
 		if acquiredAt.IsZero() {
 			acquiredAt = time.Now().UTC()
 		}
@@ -997,6 +1016,7 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		return
 	}
 
+	s.startDeadlineWarning(record.JobID, run, session, jobCtx, acquiredAt, timeout, protocol.EffectiveInputMode(spec.InputMode))
 	outcome := collectTurn(s, jobCtx, run, events, items)
 	outcome.cleanup, outcome.diagnostics = cleanupForRun(run, outcome.cleanup, outcome.diagnostics)
 	outcome = run.retireTurn(store, outcome)
@@ -1597,8 +1617,11 @@ func (s *Server) markTerminal(store *jobstore.Store, jobID string, terminal jobs
 			run.controlMu.Unlock()
 			return
 		}
-		inFlightDone := run.closeSteeringLocked(store)
+		inFlightDone, deadlineWarningDone := run.closeSteeringLocked(store)
 		run.controlMu.Unlock()
+		if deadlineWarningDone != nil {
+			<-deadlineWarningDone
+		}
 		if inFlightDone != nil {
 			<-inFlightDone
 		}

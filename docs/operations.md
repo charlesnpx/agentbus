@@ -138,8 +138,12 @@ starts or is no longer in the daemon's queue.
 The timeout is execution time: it begins when the daemon reserves a slot, not
 when job.submit is accepted. `queuedAt` records queue entry and `startedAt`
 records the start transition, so status shows both the waiting age and whether
-the job is queued or running. The public CLI commands are version, serve,
-status, transcript, result, cancel, prune, and configure-codex-sandbox.
+the job is queued or running. Steerable jobs with a finite effective timeout
+and backend steering support receive one warning steer at 90% of that timeout,
+measured from slot acquisition. The warning uses the reserved message ID
+`agentbus-deadline-warning` and is visible in the job's steer records. The
+public CLI commands are version, serve, status, transcript, result, cancel,
+prune, and configure-codex-sandbox.
 
 `agentbus configure-codex-sandbox` adds the Agentbus state root and cache root to
 Codex's `sandbox_workspace_write.writable_roots` array. It preserves existing

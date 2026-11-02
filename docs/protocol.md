@@ -695,6 +695,14 @@ return `backend_unsupported`.
 restart, an admitted steer without a recorded outcome becomes
 `unknown`/`delivery_unconfirmed`; it is never sent again automatically.
 Deduplication is client-request identity, not provider exactly-once delivery.
+For a steerable job with a finite effective timeout, a session that supports
+steering receives one daemon warning steer when 90% of the timeout has elapsed
+since slot acquisition. It uses the reserved message ID
+`agentbus-deadline-warning` and appears in the job's `steers` records like any
+other steer. Client requests that could collide with this reserved ID are
+rejected with invalid params. No warning is recorded for fixed-mode jobs, jobs
+without a timeout, or sessions without steering support. If 90% has elapsed
+before the provider turn becomes active, the warning is not sent.
 The daemon does not promise simultaneous interruption across backends, provider
 compliance with the new instruction, a stable provider turn ID across an
 interrupt-and-continue, rollback of already-started tools, a fresh-session
