@@ -1239,6 +1239,13 @@ func printJobSummary(out io.Writer, jobID string, state protocol.PublicState, ba
 
 func printJobRecordStatus(out io.Writer, record agentclient.JobGetResult) {
 	printJobSummary(out, record.JobID, record.State, record.Backend, record.Cleanup, record.CreatedAt, record.QueuedAt, "", nil, nil, nil, nil, nil, "")
+	if record.Queue != nil && record.State == protocol.PublicStateQueued {
+		fmt.Fprintf(out, "queue: position %d for backend %s (%d/%d running for %s; %d/%d total)\n",
+			record.Queue.Position, record.Backend,
+			record.Queue.BackendRunning, record.Queue.BackendLimit, record.Backend,
+			record.Queue.Running, record.Queue.Limit,
+		)
+	}
 	fmt.Fprintf(out, "createdAt=%s", humanTime(record.CreatedAt))
 	if record.StartedAt != nil {
 		fmt.Fprintf(out, " startedAt=%s", humanTime(*record.StartedAt))

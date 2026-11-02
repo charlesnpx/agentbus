@@ -128,12 +128,22 @@ entry. When the bound is reached, a new job.submit returns the typed
 `queue_full` error and CLI exit code 19. A queued cancellation removes the job
 before it can start a provider. Job lookup, listing, transcript, and queued
 cancellation remain available while all execution slots are occupied.
+For a queued job still in the daemon's in-memory queue, `job.submit` and
+`status --job <id>` report its one-based position among jobs for the same
+backend, along with occupied backend and total slots and their limits. Human
+status prints a line such as `queue: position 3 for backend claude (12/12
+running for claude; 12/12 total)`. The projection disappears when the job
+starts or is no longer in the daemon's queue.
 
 The timeout is execution time: it begins when the daemon reserves a slot, not
 when job.submit is accepted. `queuedAt` records queue entry and `startedAt`
 records the start transition, so status shows both the waiting age and whether
-the job is queued or running. The public CLI commands are version, serve,
-status, transcript, result, cancel, prune, and configure-codex-sandbox.
+the job is queued or running. Steerable jobs with a finite effective timeout
+and backend steering support receive one warning steer at 90% of that timeout,
+measured from slot acquisition. The warning uses the reserved message ID
+`agentbus-deadline-warning` and is visible in the job's steer records. The
+public CLI commands are version, serve, status, transcript, result, cancel,
+prune, and configure-codex-sandbox.
 
 `agentbus configure-codex-sandbox` adds the Agentbus state root and cache root to
 Codex's `sandbox_workspace_write.writable_roots` array. It preserves existing

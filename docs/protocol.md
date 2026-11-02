@@ -225,9 +225,12 @@ the target must be terminal, use the same backend, and have a recorded backend
 session ID at turn retirement. A target without that ID returns
 `invalid_task_spec` with its jobId; Agentbus never falls back to a fresh thread.
 A completed target is resumable only when its original submission included
-`retainSession: true`; other terminal states retain their existing resume
-rules. With retention, the managed Codex session home remains in place and is
-never cleaned automatically. An operator may remove
+`retainSession: true`. Failed, canceled, and unknown terminal jobs keep their
+backend session without session retention because their session homes are kept
+by the terminal-state retention rule. Eligibility still requires a recorded
+backend session ID; that ID is not exposed on the job record. The managed
+Codex session home for an eligible target remains in place and is never cleaned
+automatically. An operator may remove
 `<state-root>/workspaces/<workspace-hash>/codex/<job-id>` after no further
 resume is needed.
 
@@ -250,13 +253,29 @@ The result always includes the resolved timeout:
     "requested": 1800000,
     "effective": 1800000,
     "source": "client"
+  },
+  "queue": {
+    "position": 2,
+    "backendRunning": 2,
+    "backendLimit": 2,
+    "running": 4,
+    "limit": 4
   }
 }
 ~~~
 
 timeout.effective is milliseconds. timeout.source is client when timeoutMs was
 provided, otherwise daemon_default. timeout.requested is omitted when the
-daemon default is used.
+daemon default is used. `queue` appears only when the returned job is still in
+the daemon's in-memory queue. It may appear on a deduplicated receipt if that
+job is still queued; it is omitted if the job has started or is no longer in
+this daemon's queue.
+
+`queue.position` is one-based among queued jobs for the same backend, in the
+order the dispatcher considers them. `backendRunning` and `backendLimit` are
+that backend's occupied execution slots and configured limit. `running` and
+`limit` are the corresponding daemon-wide values. The projection is a snapshot
+at response time.
 
 ## job.list
 
@@ -512,6 +531,19 @@ invalid_task_spec parameter error rather than a list request.
 }
 ~~~
 
+For a queued job that is still in the daemon's in-memory queue, job.get also
+includes this derived projection:
+
+~~~json
+{"queue":{"position":1,"backendRunning":2,"backendLimit":2,"running":2,"limit":4}}
+~~~
+
+`position` is one-based among queued jobs for the same backend, in dispatcher
+order. `backendRunning`/`backendLimit` report occupied backend slots and their
+limit; `running`/`limit` report the daemon-wide counts and limit. The field is
+omitted for running or terminal jobs, and for queued records that were
+recovered or are otherwise absent from this daemon's in-memory queue.
+
 jobId, workspaceKey, requestId, backend, inputMode, state, cleanup, createdAt,
 queuedAt, timeout, and steers are always present. Older stored jobs without
 inputMode project as `fixed`; steers is an empty array when there are no
@@ -550,10 +582,12 @@ cancellationReason, logPaths, modelRequested, effortRequested, modelReported,
 and effortReported appear only when they apply. resumable is a derived
 projection of the same session and retention rules used when validating resume
 submissions. Its `eligible` value describes local admission only; it is not a
-promise that the provider will accept the resume. deadline and remainingMs are
-present for a running job with a finite effective timeout. deadline is derived
-from startedAt plus timeout.effective; remainingMs is the current time left,
-clamped at zero.
+promise that the provider will accept the resume. Eligibility requires a
+recorded backend session ID, which is not exposed on the job record. The
+human-readable `reason` explains which retention rule applied; clients should
+not depend on its exact wording. deadline and remainingMs are present for a
+running job with a finite effective timeout. deadline is derived from startedAt
+plus timeout.effective; remainingMs is the current time left, clamped at zero.
 
 modelRequested and effortRequested preserve only values in the submitted
 TaskSpec, so they may be absent when a configured daemon default was applied.
@@ -661,6 +695,14 @@ return `backend_unsupported`.
 restart, an admitted steer without a recorded outcome becomes
 `unknown`/`delivery_unconfirmed`; it is never sent again automatically.
 Deduplication is client-request identity, not provider exactly-once delivery.
+For a steerable job with a finite effective timeout, a session that supports
+steering receives one daemon warning steer when 90% of the timeout has elapsed
+since slot acquisition. It uses the reserved message ID
+`agentbus-deadline-warning` and appears in the job's `steers` records like any
+other steer. Client requests that could collide with this reserved ID are
+rejected with invalid params. No warning is recorded for fixed-mode jobs, jobs
+without a timeout, or sessions without steering support. If 90% has elapsed
+before the provider turn becomes active, the warning is not sent.
 The daemon does not promise simultaneous interruption across backends, provider
 compliance with the new instruction, a stable provider turn ID across an
 interrupt-and-continue, rollback of already-started tools, a fresh-session

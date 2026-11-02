@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -90,12 +91,17 @@ func queuedExecutionRecord(t *testing.T, server *Server, backend, prompt string,
 }
 
 func queuedExecutionRecordWithSchema(t *testing.T, server *Server, backend, prompt string, timeoutMS *int64, outputSchema json.RawMessage) jobstore.Record {
+	return queuedExecutionRecordWithInputMode(t, server, backend, prompt, timeoutMS, "", outputSchema)
+}
+
+func queuedExecutionRecordWithInputMode(t *testing.T, server *Server, backend, prompt string, timeoutMS *int64, inputMode protocol.InputMode, outputSchema json.RawMessage) jobstore.Record {
 	t.Helper()
 	spec := protocol.TaskSpec{
 		Backend:      backend,
 		CWD:          t.TempDir(),
 		Prompt:       prompt,
 		Write:        false,
+		InputMode:    inputMode,
 		TimeoutMS:    timeoutMS,
 		OutputSchema: append(json.RawMessage(nil), outputSchema...),
 	}
@@ -111,7 +117,11 @@ func queuedExecutionRecordWithSchema(t *testing.T, server *Server, backend, prom
 		jobstore.RequestKey{WorkspaceKey: "execution-workspace", RequestID: "execution-request"},
 		raw,
 		func(id string) (jobstore.Record, error) {
-			return jobstore.Record{JobID: id, Backend: backend, CWD: spec.CWD, Write: spec.Write}, nil
+			record := jobstore.Record{JobID: id, Backend: backend, CWD: spec.CWD, Write: spec.Write}
+			if spec.InputMode != "" {
+				record.InputMode = spec.InputMode
+			}
+			return record, nil
 		},
 	)
 	if err != nil {
@@ -131,6 +141,161 @@ func runExecution(t *testing.T, server *Server, record jobstore.Record) {
 	}
 	run := newActiveExecution(record.JobID, backend)
 	server.runJob(context.Background(), record, run)
+}
+
+type deadlineWarningTestSession struct {
+	events <-chan engine.Event
+	steers chan engine.SteerMessage
+	calls  atomic.Int64
+}
+
+func (*deadlineWarningTestSession) ID() string { return "deadline-warning-test-session" }
+
+func (session *deadlineWarningTestSession) Turn(_ context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
+	input.OnProcessStart(engine.ProcessRef{PID: 4201, PGID: 4201, StartTime: "deadline-warning-token"}, 0)
+	return session.events, nil
+}
+
+func (*deadlineWarningTestSession) Interrupt(context.Context) error { return nil }
+
+func (session *deadlineWarningTestSession) Steer(ctx context.Context, message engine.SteerMessage) (engine.SteerDelivery, error) {
+	session.calls.Add(1)
+	select {
+	case session.steers <- message:
+		return engine.SteerDelivery{Mechanism: engine.SteerMechanismNative, Confirmed: true}, nil
+	case <-ctx.Done():
+		return engine.SteerDelivery{}, ctx.Err()
+	}
+}
+
+func TestExecutionWarnsSteerableJobAtDeadlineThreshold(t *testing.T) {
+	oldWait := waitForDeadlineWarning
+	armed := make(chan time.Duration, 1)
+	fire := make(chan struct{})
+	waitForDeadlineWarning = func(ctx context.Context, delay time.Duration) bool {
+		armed <- delay
+		select {
+		case <-fire:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+	t.Cleanup(func() { waitForDeadlineWarning = oldWait })
+
+	events := make(chan engine.Event, 1)
+	session := &deadlineWarningTestSession{events: events, steers: make(chan engine.SteerMessage, 2)}
+	backend := &executionFakeBackend{name: "warning-fake"}
+	backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) { return session, nil }
+	server := newExecutionServer(t, backend)
+	timeoutMS := int64(10_000)
+	record := queuedExecutionRecordWithInputMode(t, server, backend.Name(), "finish", &timeoutMS, protocol.InputModeSteerable, nil)
+	run := newActiveExecution(record.JobID, backend)
+	run.slotAcquiredAt = time.Now().UTC()
+	server.executionMu.Lock()
+	if server.executions == nil {
+		server.executions = make(map[string]*activeExecution)
+	}
+	server.executions[record.JobID] = run
+	server.executionMu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		server.runJob(context.Background(), record, run)
+		close(done)
+	}()
+
+	select {
+	case delay := <-armed:
+		warningAt := run.slotAcquiredAt.Add(time.Duration(timeoutMS) * time.Millisecond * 9 / 10)
+		wantDelay := warningAt.Sub(time.Now())
+		if delta := delay - wantDelay; delay <= 0 || delta > time.Second || delta < -time.Second {
+			t.Fatalf("warning delay = %s, want about %s from slot acquisition", delay, wantDelay)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("deadline warning timer did not arm")
+	}
+	close(fire)
+	var warning engine.SteerMessage
+	select {
+	case warning = <-session.steers:
+	case <-time.After(5 * time.Second):
+		t.Fatal("deadline warning was not delivered to the session")
+	}
+	if warning.ID != deadlineWarningMessageID {
+		t.Fatalf("warning ID = %q, want %q", warning.ID, deadlineWarningMessageID)
+	}
+	const wantPrefix = "agentbus: about 10% of this task's time limit remains (deadline "
+	if !strings.HasPrefix(warning.Text, wantPrefix) {
+		t.Fatalf("warning text = %q, want prefix %q", warning.Text, wantPrefix)
+	}
+	events <- engine.Event{Type: engine.EventResultMessage, Text: "done"}
+	close(events)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("execution did not finish after the warning")
+	}
+	if got := session.calls.Load(); got != 1 {
+		t.Fatalf("session steer calls = %d, want exactly one", got)
+	}
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored.Steers) != 1 || stored.Steers[0].MessageID != deadlineWarningMessageID || stored.Steers[0].Status != protocol.SteerStatusDelivered {
+		t.Fatalf("stored warning steer = %#v, want one delivered reserved-ID record", stored.Steers)
+	}
+}
+
+func TestExecutionDoesNotWarnFixedModeJob(t *testing.T) {
+	oldWait := waitForDeadlineWarning
+	var timerCalls atomic.Int64
+	waitForDeadlineWarning = func(context.Context, time.Duration) bool {
+		timerCalls.Add(1)
+		return false
+	}
+	t.Cleanup(func() { waitForDeadlineWarning = oldWait })
+
+	session := &deadlineWarningTestSession{
+		events: executionEvents(engine.Event{Type: engine.EventResultMessage, Text: "done"}),
+		steers: make(chan engine.SteerMessage, 1),
+	}
+	backend := &executionFakeBackend{name: "warning-fixed-fake"}
+	backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) { return session, nil }
+	server := newExecutionServer(t, backend)
+	timeoutMS := int64(10_000)
+	record := queuedExecutionRecordWithInputMode(t, server, backend.Name(), "finish", &timeoutMS, protocol.InputModeFixed, nil)
+	run := newActiveExecution(record.JobID, backend)
+	run.slotAcquiredAt = time.Now().UTC()
+	server.executionMu.Lock()
+	if server.executions == nil {
+		server.executions = make(map[string]*activeExecution)
+	}
+	server.executions[record.JobID] = run
+	server.executionMu.Unlock()
+	server.runJob(context.Background(), record, run)
+
+	if got := timerCalls.Load(); got != 0 {
+		t.Fatalf("deadline warning timer calls = %d, want 0", got)
+	}
+	if got := session.calls.Load(); got != 0 {
+		t.Fatalf("session steer calls = %d, want 0", got)
+	}
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored.Steers) != 0 {
+		t.Fatalf("fixed job steer records = %#v, want none", stored.Steers)
+	}
 }
 
 func claimedResultSession(result string) *executionFakeSession {

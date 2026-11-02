@@ -147,7 +147,11 @@ func (s *Server) handleJobSubmit(raw json.RawMessage) requestOutcome {
 	if !deduplicated {
 		s.enqueueQueuedJob(record, executionBackend)
 	}
-	return requestOutcome{result: jobSubmitResult(record, deduplicated, timeout)}
+	result := jobSubmitResult(record, deduplicated, timeout)
+	if record.State == protocol.PublicStateQueued {
+		result.Queue = s.queueProjection(record.JobID, record.Backend)
+	}
+	return requestOutcome{result: result}
 }
 
 func taskSpecBackendName(fields map[string]json.RawMessage) string {

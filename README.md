@@ -88,6 +88,9 @@ When the waiting queue is full, a new job.submit is rejected with
 `queue_full` (CLI exit code 19). A matching deduplicated request does not use
 another queue entry. Job execution timeouts begin when a job gets a slot;
 `queuedAt` and `startedAt` show its wait and execution start.
+For a queued job, `status --job <id>` prints its position among jobs for the
+same backend and the current backend and total running limits. `status --json`
+with `--job` includes the same optional `queue` projection as `job.get`.
 
 TaskSpec `inputMode` is `fixed` when omitted. Set it to `steerable` only when
 the running task may receive follow-up instructions. `agentbus steer` submits
@@ -202,7 +205,11 @@ the evidence of what was observed, and it may be absent.
 Detailed job.get responses and `agentbus status --job <id>` expose `deadline`
 and `remainingMs` for running jobs with a finite timeout, plus
 `resumable: {eligible, reason}` derived from the existing session and retention
-rules. **Eligible is not guaranteed**: the provider may still reject a resume.
+rules. Failed, canceled, and unknown terminal jobs keep their backend session
+without `--retain-session`; completed jobs require session retention. Resume
+eligibility requires a recorded backend session ID, which is not exposed on the
+job record. The human-readable `reason` names the retention rule that applied.
+**Eligible is not guaranteed**: the provider may still reject a resume.
 `cancellationReason` records `operator`, `deadline`, `daemon_shutdown`, or
 `provider_interruption` independently of the existing terminal state.
 

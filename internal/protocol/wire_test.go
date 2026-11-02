@@ -337,6 +337,7 @@ func TestJobRecordWireFieldAllowList(t *testing.T) {
 		"ModelRequested": {}, "EffortRequested": {}, "Result": {}, "Contract": {},
 		"Failure": {}, "Diagnostics": {}, "Cleanup": {}, "LogsPruned": {}, "LogPaths": {},
 		"ModelReported": {}, "EffortReported": {}, "Execution": {}, "Steers": {}, "CancellationReason": {},
+		"Queue": {},
 	}
 
 	recordType := reflect.TypeOf(JobRecordWire{})
