@@ -337,6 +337,28 @@ func TestStatusHumanProjectionIncludesOperatorFieldsAndNeverResultText(t *testin
 	}
 }
 
+func TestStatusHumanProjectionIncludesQueuedPositionAndLimits(t *testing.T) {
+	record := detailedRecord(protocol.PublicStateQueued)
+	record.Queue = &protocol.QueueProjection{
+		Position:       3,
+		BackendRunning: 12,
+		BackendLimit:   12,
+		Running:        12,
+		Limit:          12,
+	}
+	a := testApp(t)
+	a.clientConnect = fakeConnector(&fakeProtocolClient{records: map[string]agentclient.JobGetResult{"job-1": record}})
+
+	code, stdout, stderr := runTestCLI(t, a, []string{"status", "--job", "job-1"})
+	if code != 2 || stderr != "" {
+		t.Fatalf("status=(%d,%q), want queued status without error", code, stderr)
+	}
+	want := "queue: position 3 for backend codex (12/12 running for codex; 12/12 total)"
+	if strings.Count(stdout, "queue: position ") != 1 || !strings.Contains(stdout, want) {
+		t.Fatalf("status output = %q, want one queue line %q", stdout, want)
+	}
+}
+
 func TestSteerCommandReceiptAndExitCodes(t *testing.T) {
 	for _, test := range []struct {
 		name   string

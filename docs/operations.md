@@ -128,6 +128,12 @@ entry. When the bound is reached, a new job.submit returns the typed
 `queue_full` error and CLI exit code 19. A queued cancellation removes the job
 before it can start a provider. Job lookup, listing, transcript, and queued
 cancellation remain available while all execution slots are occupied.
+For a queued job still in the daemon's in-memory queue, `job.submit` and
+`status --job <id>` report its one-based position among jobs for the same
+backend, along with occupied backend and total slots and their limits. Human
+status prints a line such as `queue: position 3 for backend claude (12/12
+running for claude; 12/12 total)`. The projection disappears when the job
+starts or is no longer in the daemon's queue.
 
 The timeout is execution time: it begins when the daemon reserves a slot, not
 when job.submit is accepted. `queuedAt` records queue entry and `startedAt`

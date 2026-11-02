@@ -590,6 +590,32 @@ func (s *Server) enqueueQueuedJob(record jobstore.Record, backend engine.Backend
 	s.executionMu.Unlock()
 }
 
+// queueProjection reports a queued job's one-based place among jobs for its
+// backend, plus the slot counts and limits used by dispatchQueuedLocked.
+// The caller does not need to hold executionMu.
+func (s *Server) queueProjection(jobID, backend string) *protocol.QueueProjection {
+	s.executionMu.Lock()
+	defer s.executionMu.Unlock()
+
+	position := 0
+	for _, queued := range s.queuedJobs {
+		if queued.record.Backend != backend {
+			continue
+		}
+		position++
+		if queued.record.JobID == jobID {
+			return &protocol.QueueProjection{
+				Position:       position,
+				BackendRunning: s.runningByBackend[backend],
+				BackendLimit:   s.maxJobsPerBackend,
+				Running:        len(s.executions),
+				Limit:          s.maxJobs,
+			}
+		}
+	}
+	return nil
+}
+
 // dispatchQueuedLocked starts as many eligible jobs as the daemon-owned
 // global and per-backend limits permit. The first eligible item wins; an
 // earlier item for a saturated backend does not block a different backend.

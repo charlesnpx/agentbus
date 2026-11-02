@@ -5,6 +5,7 @@ package service
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -155,6 +156,71 @@ func TestBackendQueueStartsInFIFOOrderWhenSlotsFree(t *testing.T) {
 	}
 	gate.releaseAll()
 	server.executionWG.Wait()
+}
+
+func TestQueuedJobProjectionReportsPositionAndLimits(t *testing.T) {
+	gate := newProviderGate()
+	backend := gate.backend("alpha")
+	server := concurrencyTestServer(t, 2, 2, 4, backend)
+	t.Cleanup(gate.releaseAll)
+	for _, id := range []string{"a1", "a2", "a3", "a4"} {
+		gate.add(id)
+	}
+	submitConcurrencyJob(t, server, "alpha", "a1")
+	submitConcurrencyJob(t, server, "alpha", "a2")
+
+	active := map[string]bool{
+		receiveProviderStart(t, gate): true,
+		receiveProviderStart(t, gate): true,
+	}
+	if !active["a1"] || !active["a2"] {
+		t.Fatalf("active provider starts = %#v, want a1 and a2", active)
+	}
+	first := submitConcurrencyJob(t, server, "alpha", "a3")
+	second := submitConcurrencyJob(t, server, "alpha", "a4")
+
+	wantQueue := func(position int) *protocol.QueueProjection {
+		return &protocol.QueueProjection{
+			Position:       position,
+			BackendRunning: 2,
+			BackendLimit:   2,
+			Running:        2,
+			Limit:          2,
+		}
+	}
+	for _, test := range []struct {
+		name string
+		job  protocol.JobSubmitResult
+		want *protocol.QueueProjection
+	}{
+		{name: "first queued receipt", job: first, want: wantQueue(1)},
+		{name: "second queued receipt", job: second, want: wantQueue(2)},
+	} {
+		if !reflect.DeepEqual(test.job.Queue, test.want) {
+			t.Errorf("%s queue = %#v, want %#v", test.name, test.job.Queue, test.want)
+		}
+		outcome := server.handleJobGet(mustJSON(t, protocol.JobGetParams{JobID: test.job.JobID}))
+		if outcome.err != nil {
+			t.Fatalf("%s job.get error = %#v", test.name, outcome.err)
+		}
+		record := outcome.result.(protocol.JobRecordWire)
+		if !reflect.DeepEqual(record.Queue, test.want) {
+			t.Errorf("%s job.get queue = %#v, want %#v", test.name, record.Queue, test.want)
+		}
+	}
+
+	gate.releaseOne("a1")
+	if got := receiveProviderStart(t, gate); got != "a3" {
+		t.Fatalf("freed backend slot started %q, want a3", got)
+	}
+	started := server.handleJobGet(mustJSON(t, protocol.JobGetParams{JobID: first.JobID}))
+	if started.err != nil {
+		t.Fatalf("started job.get error = %#v", started.err)
+	}
+	startedRecord := started.result.(protocol.JobRecordWire)
+	if startedRecord.State != protocol.PublicStateRunning || startedRecord.Queue != nil {
+		t.Fatalf("started job projection = %+v, want running without queue", startedRecord)
+	}
 }
 
 func TestSaturatedBackendDoesNotBlockOtherBackend(t *testing.T) {

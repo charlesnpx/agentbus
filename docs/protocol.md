@@ -250,13 +250,29 @@ The result always includes the resolved timeout:
     "requested": 1800000,
     "effective": 1800000,
     "source": "client"
+  },
+  "queue": {
+    "position": 2,
+    "backendRunning": 2,
+    "backendLimit": 2,
+    "running": 4,
+    "limit": 4
   }
 }
 ~~~
 
 timeout.effective is milliseconds. timeout.source is client when timeoutMs was
 provided, otherwise daemon_default. timeout.requested is omitted when the
-daemon default is used.
+daemon default is used. `queue` appears only when the returned job is still in
+the daemon's in-memory queue. It may appear on a deduplicated receipt if that
+job is still queued; it is omitted if the job has started or is no longer in
+this daemon's queue.
+
+`queue.position` is one-based among queued jobs for the same backend, in the
+order the dispatcher considers them. `backendRunning` and `backendLimit` are
+that backend's occupied execution slots and configured limit. `running` and
+`limit` are the corresponding daemon-wide values. The projection is a snapshot
+at response time.
 
 ## job.list
 
@@ -511,6 +527,19 @@ invalid_task_spec parameter error rather than a list request.
   }
 }
 ~~~
+
+For a queued job that is still in the daemon's in-memory queue, job.get also
+includes this derived projection:
+
+~~~json
+{"queue":{"position":1,"backendRunning":2,"backendLimit":2,"running":2,"limit":4}}
+~~~
+
+`position` is one-based among queued jobs for the same backend, in dispatcher
+order. `backendRunning`/`backendLimit` report occupied backend slots and their
+limit; `running`/`limit` report the daemon-wide counts and limit. The field is
+omitted for running or terminal jobs, and for queued records that were
+recovered or are otherwise absent from this daemon's in-memory queue.
 
 jobId, workspaceKey, requestId, backend, inputMode, state, cleanup, createdAt,
 queuedAt, timeout, and steers are always present. Older stored jobs without
