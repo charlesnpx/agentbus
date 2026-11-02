@@ -151,6 +151,53 @@ func TestJobGetProjectsDeadlineAndResumabilityFromDurableFields(t *testing.T) {
 	}
 }
 
+func TestResumableProjectionExplainsRetentionBasis(t *testing.T) {
+	const backendSessionID = "session-id-should-not-leak"
+	tests := []struct {
+		name   string
+		state  protocol.PublicState
+		retain bool
+		want   string
+	}{
+		{
+			name:   "completed with session retention",
+			state:  protocol.PublicStateCompleted,
+			retain: true,
+			want:   "recorded backend session was retained because the job was submitted with session retention",
+		},
+		{
+			name:  "failed terminal job",
+			state: protocol.PublicStateFailed,
+			want:  "backend session is recorded and was kept because the job ended failed; failed, canceled, and unknown jobs keep their session",
+		},
+		{
+			name:  "canceled terminal job",
+			state: protocol.PublicStateCanceled,
+			want:  "backend session is recorded and was kept because the job ended canceled; failed, canceled, and unknown jobs keep their session",
+		},
+		{
+			name:  "unknown terminal job",
+			state: protocol.PublicStateUnknown,
+			want:  "backend session is recorded and was kept because the job ended unknown; failed, canceled, and unknown jobs keep their session",
+		},
+	}
+	server := &Server{}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			projection := server.resumableProjection(jobstore.Record{
+				JobID:            "resume-target",
+				Backend:          "fake",
+				BackendSessionID: backendSessionID,
+				RetainSession:    test.retain,
+				State:            test.state,
+			})
+			if !projection.Eligible || projection.Reason != test.want {
+				t.Fatalf("resumability = %#v, want eligible reason %q", projection, test.want)
+			}
+		})
+	}
+}
+
 func TestJobGetProjectsDeadlineFromActiveExecutionSlot(t *testing.T) {
 	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "fake"}}})
 	timeoutMS := int64(120_000)

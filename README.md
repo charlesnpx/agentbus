@@ -205,7 +205,11 @@ the evidence of what was observed, and it may be absent.
 Detailed job.get responses and `agentbus status --job <id>` expose `deadline`
 and `remainingMs` for running jobs with a finite timeout, plus
 `resumable: {eligible, reason}` derived from the existing session and retention
-rules. **Eligible is not guaranteed**: the provider may still reject a resume.
+rules. Failed, canceled, and unknown terminal jobs keep their backend session
+without `--retain-session`; completed jobs require session retention. Resume
+eligibility requires a recorded backend session ID, which is not exposed on the
+job record. The human-readable `reason` names the retention rule that applied.
+**Eligible is not guaranteed**: the provider may still reject a resume.
 `cancellationReason` records `operator`, `deadline`, `daemon_shutdown`, or
 `provider_interruption` independently of the existing terminal state.
 

@@ -494,7 +494,16 @@ func (s *Server) resumableProjection(record jobstore.Record) *protocol.Resumable
 	if reason != "" {
 		return &protocol.ResumableProjection{Eligible: false, Reason: reason}
 	}
-	return &protocol.ResumableProjection{Eligible: true, Reason: "retained backend session is available"}
+	if record.State == protocol.PublicStateCompleted {
+		return &protocol.ResumableProjection{
+			Eligible: true,
+			Reason:   "recorded backend session was retained because the job was submitted with session retention",
+		}
+	}
+	return &protocol.ResumableProjection{
+		Eligible: true,
+		Reason:   fmt.Sprintf("backend session is recorded and was kept because the job ended %s; failed, canceled, and unknown jobs keep their session", record.State),
+	}
 }
 
 func taskSpecForProjection(record jobstore.Record) (protocol.TaskSpec, *engine.TimeoutResolution, error) {
