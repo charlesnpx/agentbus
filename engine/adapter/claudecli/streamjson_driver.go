@@ -588,10 +588,15 @@ func (s *claudeStream) nextFrame(ctx context.Context) (duplex.Frame, error) {
 
 func (s *claudeStream) handleFrame(ctx context.Context, frame duplex.Frame, sessionID *string) (bool, error) {
 	obj := frame.Object
+	frameType := strings.ToLower(firstString(obj, "type"))
+	if frameType == "result" {
+		if origin, ok := obj["origin"]; ok && origin != nil {
+			return false, nil
+		}
+	}
 	if id := sessionIDFrom(obj); id != "" {
 		*sessionID = id
 	}
-	frameType := strings.ToLower(firstString(obj, "type"))
 	if isClaudeProgressFrameType(frameType) {
 		s.emitThinking(obj, obj)
 		return false, nil

@@ -211,6 +211,8 @@ Claude's bidirectional stream-json input protocol: it sends a control-protocol
 `control_request` messages, and treats the `result` message as authoritative
 turn completion. A `result` with subtype `success` and no error flag emits the
 result text; other result subtypes or `is_error` values emit terminal errors.
+Result frames with a non-null `origin` are ignored as non-turn notifications;
+the driver keeps reading until it receives the submitted turn's result.
 
 Steering uses `interrupt_continue` over that same persistent connection. The
 driver sends a `control_request` with `request.subtype` set to `interrupt` and

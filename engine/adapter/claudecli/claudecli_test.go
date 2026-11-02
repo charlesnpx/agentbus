@@ -987,6 +987,73 @@ func TestClaudeSessionIDCapturedAndResumed(t *testing.T) {
 	assertArgValue(t, runner.specAt(1).Argv, "--resume", "claude-session-1")
 }
 
+func TestClaudeResumeIgnoresOriginResultUntilTurnResult(t *testing.T) {
+	runner := newFakeClaudeRunner(t,
+		func(t *testing.T, proc *fakeClaudeProcess, _ command.ExecSpec) {
+			peer := newClaudePeer(t, proc)
+			peer.handshake()
+			peer.expectUser("first turn")
+			peer.emitSystem("claude-session-resume", "claude-sonnet")
+			peer.emitResult("success", false, "first turn result")
+		},
+		func(t *testing.T, proc *fakeClaudeProcess, _ command.ExecSpec) {
+			peer := newClaudePeer(t, proc)
+			peer.handshake()
+			peer.expectUser("resumed turn")
+			for range 2 {
+				peer.write(map[string]any{
+					"type":    "system",
+					"subtype": "task_notification",
+					"status":  "stopped",
+				})
+			}
+			peer.write(map[string]any{
+				"type":      "result",
+				"subtype":   "success",
+				"result":    "",
+				"num_turns": 0,
+				"origin":    map[string]any{"kind": "task-notification"},
+			})
+			peer.write(map[string]any{
+				"type":       "system",
+				"subtype":    "init",
+				"session_id": "claude-session-resume",
+				"model":      "claude-sonnet",
+			})
+			peer.write(map[string]any{
+				"type": "assistant",
+				"message": map[string]any{
+					"role": "assistant",
+					"content": []any{
+						map[string]any{"type": "text", "text": "resumed assistant output"},
+					},
+				},
+			})
+			peer.emitResult("success", false, "resumed turn result")
+		},
+	)
+
+	session := startFakeClaudeSession(t, engine.SessionOpts{})
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "first turn"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = collectEventsWithTimeout(t, events, 2*time.Second)
+
+	events, err = turnWithRunner(t, session, engine.TurnInput{Prompt: "resumed turn"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	if resultText(got) != "resumed turn result" {
+		t.Fatalf("result text = %q, want resumed turn result; events = %#v", resultText(got), got)
+	}
+	if containsEventType(got, engine.EventTerminalError) {
+		t.Fatalf("events = %#v, origin result must not end the resumed turn", got)
+	}
+	assertArgValue(t, runner.specAt(1).Argv, "--resume", "claude-session-resume")
+}
+
 func TestClaudeAnswersControlRequestsAndMapsAssistantEvents(t *testing.T) {
 	runner := newFakeClaudeRunner(t, func(t *testing.T, proc *fakeClaudeProcess, spec command.ExecSpec) {
 		peer := newClaudePeer(t, proc)
