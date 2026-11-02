@@ -76,7 +76,6 @@ type activeExecution struct {
 	steerDone              chan struct{}
 	steerStopOnce          sync.Once
 	steerWorkerStarted     bool
-	deadlineWarningStarted bool
 	deadlineWarningCancel  context.CancelFunc
 	deadlineWarningDone    chan struct{}
 }

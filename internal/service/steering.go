@@ -189,11 +189,6 @@ func (s *Server) startDeadlineWarning(jobID string, run *activeExecution, sessio
 	warningAt := acquiredAt.Add(timeout * 9 / 10)
 
 	run.controlMu.Lock()
-	if run.deadlineWarningStarted {
-		run.controlMu.Unlock()
-		return
-	}
-	run.deadlineWarningStarted = true
 	delay := time.Until(warningAt)
 	if !run.turnActive || run.steerCanceled || run.steerClosed || delay <= 0 {
 		run.controlMu.Unlock()
