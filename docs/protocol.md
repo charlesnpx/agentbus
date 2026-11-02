@@ -225,9 +225,12 @@ the target must be terminal, use the same backend, and have a recorded backend
 session ID at turn retirement. A target without that ID returns
 `invalid_task_spec` with its jobId; Agentbus never falls back to a fresh thread.
 A completed target is resumable only when its original submission included
-`retainSession: true`; other terminal states retain their existing resume
-rules. With retention, the managed Codex session home remains in place and is
-never cleaned automatically. An operator may remove
+`retainSession: true`. Failed, canceled, and unknown terminal jobs keep their
+backend session without session retention because their session homes are kept
+by the terminal-state retention rule. Eligibility still requires a recorded
+backend session ID; that ID is not exposed on the job record. The managed
+Codex session home for an eligible target remains in place and is never cleaned
+automatically. An operator may remove
 `<state-root>/workspaces/<workspace-hash>/codex/<job-id>` after no further
 resume is needed.
 
@@ -550,10 +553,12 @@ cancellationReason, logPaths, modelRequested, effortRequested, modelReported,
 and effortReported appear only when they apply. resumable is a derived
 projection of the same session and retention rules used when validating resume
 submissions. Its `eligible` value describes local admission only; it is not a
-promise that the provider will accept the resume. deadline and remainingMs are
-present for a running job with a finite effective timeout. deadline is derived
-from startedAt plus timeout.effective; remainingMs is the current time left,
-clamped at zero.
+promise that the provider will accept the resume. Eligibility requires a
+recorded backend session ID, which is not exposed on the job record. The
+human-readable `reason` explains which retention rule applied; clients should
+not depend on its exact wording. deadline and remainingMs are present for a
+running job with a finite effective timeout. deadline is derived from startedAt
+plus timeout.effective; remainingMs is the current time left, clamped at zero.
 
 modelRequested and effortRequested preserve only values in the submitted
 TaskSpec, so they may be absent when a configured daemon default was applied.
