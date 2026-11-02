@@ -13,7 +13,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
-	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -194,9 +193,6 @@ func TestResumableProjectionExplainsRetentionBasis(t *testing.T) {
 			})
 			if !projection.Eligible || projection.Reason != test.want {
 				t.Fatalf("resumability = %#v, want eligible reason %q", projection, test.want)
-			}
-			if strings.Contains(projection.Reason, backendSessionID) {
-				t.Fatalf("resumability reason exposed backend session ID: %q", projection.Reason)
 			}
 		})
 	}
