@@ -114,8 +114,8 @@ artifacts while a daemon is using the root.
 
 Use agentbus serve to start a background daemon. Use agentbus serve --foreground
 when a supervisor owns the process. Both forms accept `--max-jobs`,
-`--max-jobs-per-backend`, and `--max-queued`. Their defaults are 4 total jobs,
-2 jobs per backend, and 64 waiting jobs. These are starting values, not
+`--max-jobs-per-backend`, and `--max-queued`. Their defaults are 12 total jobs,
+12 jobs per backend, and 64 waiting jobs. These are starting values, not
 measured optima. Each value must be a positive integer; zero does not mean
 unlimited. The values apply when a daemon starts and do not reconfigure an
 already serving daemon.

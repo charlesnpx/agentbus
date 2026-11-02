@@ -272,8 +272,8 @@ func (a *app) runVersion(args []string, out, errOut io.Writer) int {
 func (a *app) runServe(ctx context.Context, args []string, errOut io.Writer) int {
 	fs := newCommandFlagSet("serve", errOut)
 	foreground := fs.Bool("foreground", false, "run daemon in foreground")
-	maxJobs := fs.Int("max-jobs", 4, "maximum concurrent jobs across all backends (positive integer)")
-	maxJobsPerBackend := fs.Int("max-jobs-per-backend", 2, "maximum concurrent jobs per backend (positive integer)")
+	maxJobs := fs.Int("max-jobs", 12, "maximum concurrent jobs across all backends (positive integer)")
+	maxJobsPerBackend := fs.Int("max-jobs-per-backend", 12, "maximum concurrent jobs per backend (positive integer)")
 	maxQueued := fs.Int("max-queued", 64, "maximum waiting jobs before submissions are rejected (positive integer)")
 	pruneInterval := fs.Duration("prune-interval", 0, "run the owned-artifact retention sweep at this interval (default off)")
 	if code, ok := parseFlags(fs, args); !ok {

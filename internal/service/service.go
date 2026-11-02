@@ -29,8 +29,8 @@ const (
 
 	defaultIdleTimeout       = 30 * time.Minute
 	defaultShutdown          = 30 * time.Second
-	defaultMaxJobs           = 4
-	defaultMaxJobsPerBackend = 2
+	defaultMaxJobs           = 12
+	defaultMaxJobsPerBackend = 12
 	defaultMaxQueued         = 64
 	oversizedWriteTimeout    = time.Second
 )
