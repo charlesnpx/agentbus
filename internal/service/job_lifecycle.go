@@ -627,7 +627,7 @@ func logEndsWithTruncationMarker(path string) *bool {
 
 // reconcileRecoveredJobs is intentionally called before the listener exists.
 // It snapshots all records once, never enqueues recovered work, and writes
-// only records that were nonterminal in that snapshot.
+// only records that were nonterminal or had admitted steers in that snapshot.
 func (s *Server) reconcileRecoveredJobs(store *jobstore.Store) error {
 	if store == nil {
 		return errors.New("restart reconciliation requires a job store")
@@ -637,8 +637,14 @@ func (s *Server) reconcileRecoveredJobs(store *jobstore.Store) error {
 		return err
 	}
 	for _, record := range records {
-		if err := store.MarkPendingSteersUnknown(record.JobID); err != nil {
-			return fmt.Errorf("reconcile steering receipts for job %s: %w", record.JobID, err)
+		for _, steer := range record.Steers {
+			if steer.Status != protocol.SteerStatusAdmitted {
+				continue
+			}
+			if err := store.MarkPendingSteersUnknown(record.JobID); err != nil {
+				return fmt.Errorf("reconcile steering receipts for job %s: %w", record.JobID, err)
+			}
+			break
 		}
 		var terminal jobstore.TerminalUpdate
 		switch {
