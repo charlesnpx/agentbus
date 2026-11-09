@@ -142,6 +142,8 @@ func (a *app) run(ctx context.Context, args []string, stdin io.Reader, out, errO
 	switch command {
 	case "version":
 		return a.runVersion(args[1:], out, errOut)
+	case "__local-ipc-probe":
+		return runLocalIPCProbe(args[1:], errOut)
 	case "backends":
 		return a.runBackends(ctx, args[1:], out, errOut)
 	case "serve":

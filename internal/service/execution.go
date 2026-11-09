@@ -896,6 +896,9 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 				return
 			}
 			opts.LocalIPCRoot = ipcRoot
+			if localIPCGOOS == "linux" {
+				opts.LocalIPCDenyPaths = localIPCDenyPaths(s.stateRoot, opts.CWD, cache.root, ipcRoot)
+			}
 			s.rememberManagedLocalIPCRoot(record.JobID, ipcRoot)
 		}
 		opts.WriteEnvOverlay = map[string]string{
@@ -909,6 +912,8 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		}
 		if spec.LocalIPC {
 			opts.WriteEnvOverlay["TMPDIR"] = opts.LocalIPCRoot
+			opts.WriteEnvOverlay["SCCACHE_SERVER_UDS"] = filepath.Join(opts.LocalIPCRoot, "sccache.sock")
+			opts.WriteEnvOverlay["SCCACHE_DIR"] = cache.sccache
 		}
 		caches = make(map[string]string, len(opts.WriteEnvOverlay)+1)
 		for key, value := range opts.WriteEnvOverlay {
@@ -924,11 +929,22 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 	if len(caches) == 0 {
 		caches = nil
 	}
+	if spec.LocalIPC && localIPCGOOS == "linux" {
+		if err := s.ensureCodexLocalIPCSandbox(jobCtx, run.backend, opts); err != nil {
+			if jobCtx.Err() != nil {
+				s.finishStartError(store, record, jobCtx, jobCtx.Err())
+				return
+			}
+			s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassBackendUnavailable,
+				fmt.Errorf("local IPC is unsupported by the Codex sandbox on this host: %w", err), nil)
+			return
+		}
+	}
 	scratch := ""
 	if record.Write || spec.Verify {
 		scratch = cache.root
 	}
-	posture := executionPosture(record.Backend, record.Write, spec.Verify, spec.LocalIPC, codexSandboxed, scratch, caches)
+	posture := executionPosture(record.Backend, record.Write, spec.Verify, spec.LocalIPC, localIPCGOOS, codexSandboxed, scratch, caches)
 	if spec.Verify {
 		posture.FrozenCopy = frozenCopyPath
 		posture.FrozenSource = frozenSource
@@ -1064,7 +1080,7 @@ func taskSpecFromRecord(record jobstore.Record) (protocol.TaskSpec, error) {
 	if err := validateVerifyTaskSpec(spec); err != nil {
 		return spec, fmt.Errorf("durable task spec has invalid verify: %w", err)
 	}
-	if err := validateLocalIPCSpec(spec, localIPCGOOS); err != nil {
+	if err := validateLocalIPCSpec(spec); err != nil {
 		return spec, fmt.Errorf("durable task spec has invalid localIPC: %w", err)
 	}
 	if record.InputMode != "" && record.InputMode != protocol.EffectiveInputMode(spec.InputMode) {

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -76,6 +77,102 @@ func (s *Server) ensureCodexSandbox(ctx context.Context, backend engine.Backend)
 	s.codexSandboxResults[key] = entry
 	if entry.err != "" {
 		return errors.New(entry.err)
+	}
+	return nil
+}
+
+type codexSandboxArgsProvider interface {
+	CodexSandboxArgs(engine.SessionOpts) ([]string, error)
+}
+
+func (s *Server) ensureCodexLocalIPCSandbox(ctx context.Context, backend engine.Backend, opts engine.SessionOpts) error {
+	provider, ok := backend.(codexSandboxArgsProvider)
+	if !ok {
+		return errors.New("backend does not expose local-IPC sandbox arguments")
+	}
+	configured := "codex"
+	if inspection, ok := backend.(engine.BackendInspectionProvider); ok {
+		if executable := strings.TrimSpace(inspection.BackendInspection().Executable); executable != "" {
+			configured = executable
+		}
+	}
+	path, err := resolveBackendExecutable(configured)
+	if err != nil {
+		return fmt.Errorf("resolve Codex executable: %w", err)
+	}
+	version, versionErr := s.backendVersion(path)
+	if versionErr != "" {
+		return fmt.Errorf("read Codex version: %s", versionErr)
+	}
+	args, err := provider.CodexSandboxArgs(opts)
+	if err != nil {
+		return err
+	}
+	probeExecutable, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("resolve agentbus executable for local-IPC probe: %w", err)
+	}
+	key := codexSandboxCacheKey{path: path, version: version}
+
+	s.codexSandboxMu.Lock()
+	defer s.codexSandboxMu.Unlock()
+	if s.codexLocalIPCResults == nil {
+		s.codexLocalIPCResults = make(map[codexSandboxCacheKey]codexSandboxCacheEntry)
+	}
+	if cached, ok := s.codexLocalIPCResults[key]; ok {
+		if cached.err != "" {
+			return errors.New(cached.err)
+		}
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, codexSandboxProbeTimeout)
+	defer cancel()
+	probe := s.codexLocalIPCProbe
+	if probe == nil {
+		probe = runCodexLocalIPCProbe
+	}
+	probeErr := probe(probeCtx, path, args, opts.CWD, probeExecutable, opts.LocalIPCRoot)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	entry := codexSandboxCacheEntry{}
+	if probeErr != nil {
+		entry.err = boundInspectionText(probeErr.Error())
+		if entry.err == "" {
+			entry.err = "sandbox local-IPC probe failed"
+		}
+	}
+	s.codexLocalIPCResults[key] = entry
+	if entry.err != "" {
+		return errors.New(entry.err)
+	}
+	return nil
+}
+
+func runCodexLocalIPCProbe(ctx context.Context, binary string, sandboxArgs []string, cwd, probeExecutable, ipcRoot string) error {
+	args := make([]string, 0, len(sandboxArgs)+5)
+	args = append(args, "sandbox")
+	args = append(args, sandboxArgs...)
+	args = append(args, "--", probeExecutable, "__local-ipc-probe", ipcRoot)
+	cmd := exec.CommandContext(ctx, binary, args...)
+	cmd.Dir = cwd
+	cmd.WaitDelay = 500 * time.Millisecond
+	cmd.Stdout = io.Discard
+	stderr := &boundedOutput{limit: backendVersionOutputCap}
+	cmd.Stderr = stderr
+	if err := cmd.Run(); err != nil {
+		diagnostic := strings.TrimSpace(stderr.String())
+		if diagnostic == "" {
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				diagnostic = "local-IPC sandbox probe timed out"
+			} else {
+				diagnostic = err.Error()
+			}
+		}
+		return errors.New(boundInspectionText(diagnostic))
 	}
 	return nil
 }

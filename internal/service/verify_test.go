@@ -74,8 +74,8 @@ func TestJobSubmitVerifyValidationAndOmissionReplayHash(t *testing.T) {
 	linux := submissionParams("verify-local-ipc-linux", "request", "codex", repo, "verify")
 	linux.TaskSpec.Verify = true
 	linux.TaskSpec.LocalIPC = true
-	if outcome := submitForTest(t, server, linux); outcome.err == nil || !strings.Contains(outcome.err.Message, "Unix sockets") {
-		t.Fatalf("verify with localIPC on Linux = %#v, want C2 sandbox refusal", outcome.err)
+	if outcome := submitForTest(t, server, linux); outcome.err != nil {
+		t.Fatalf("verify with localIPC on Linux = %#v, want accepted task", outcome.err)
 	}
 
 	oldRaw := json.RawMessage(fmt.Sprintf(`{"workspaceKey":"verify-hash","requestId":"same","taskSpec":{"backend":"codex","cwd":%q,"write":false,"prompt":"same"}}`, repo))
@@ -265,6 +265,8 @@ func TestVerifyExecutionUsesAndRemovesFrozenScratch(t *testing.T) {
 	wantWriteEnv := map[string]string{
 		"GOCACHE":              filepath.Join(posture.Scratch, "cache", "go-build"),
 		"TMPDIR":               started.LocalIPCRoot,
+		"SCCACHE_SERVER_UDS":   filepath.Join(started.LocalIPCRoot, "sccache.sock"),
+		"SCCACHE_DIR":          filepath.Join(posture.Scratch, "cache", "sccache"),
 		"npm_config_cache":     filepath.Join(posture.Scratch, "cache", "npm"),
 		"COREPACK_HOME":        filepath.Join(posture.Scratch, "cache", "corepack"),
 		"XDG_CACHE_HOME":       filepath.Join(posture.Scratch, "cache", "xdg"),

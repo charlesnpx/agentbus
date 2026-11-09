@@ -237,7 +237,7 @@ func validateNewTaskSpec(spec protocol.TaskSpec, raw map[string]json.RawMessage)
 	if err := validateVerifyTaskSpec(spec); err != nil {
 		return err
 	}
-	if err := validateLocalIPCSpec(spec, localIPCGOOS); err != nil {
+	if err := validateLocalIPCSpec(spec); err != nil {
 		return err
 	}
 	for _, required := range []string{"backend", "cwd", "write", "prompt"} {
@@ -300,7 +300,7 @@ func validateVerifyTaskSpec(spec protocol.TaskSpec) error {
 	return nil
 }
 
-func validateLocalIPCSpec(spec protocol.TaskSpec, goos string) error {
+func validateLocalIPCSpec(spec protocol.TaskSpec) error {
 	if !spec.LocalIPC {
 		return nil
 	}
@@ -310,10 +310,6 @@ func validateLocalIPCSpec(spec protocol.TaskSpec, goos string) error {
 	switch spec.Backend {
 	case "claude", "cursor":
 		return fmt.Errorf("taskSpec.localIPC is not supported by backend %q", spec.Backend)
-	case "codex":
-		if goos == "linux" {
-			return errors.New("taskSpec.localIPC is unsupported on Linux: Codex's Linux sandbox cannot grant Unix sockets (TCP loopback only)")
-		}
 	}
 	return nil
 }
