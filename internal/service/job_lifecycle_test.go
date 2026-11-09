@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -1259,6 +1260,48 @@ func TestRestartPreservesUnknownTerminalRecordBytes(t *testing.T) {
 	}
 	if got := starts.Load(); got != 0 {
 		t.Fatalf("recovered terminal backend Start calls = %d, want 0", got)
+	}
+}
+
+func TestRestartTerminalRecordsWithoutAdmittedSteersDoNotWriteStore(t *testing.T) {
+	root := t.TempDir()
+	server := newTestServer(t, root, Config{Backends: []engine.Backend{helloBackend{name: "restart-no-pending-steers"}}})
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, state := range []protocol.PublicState{
+		protocol.PublicStateCompleted,
+		protocol.PublicStateCanceled,
+		protocol.PublicStateUnknown,
+	} {
+		params := submissionParams("restart-no-pending-steers-workspace", fmt.Sprintf("request-%d", i), "restart-no-pending-steers", t.TempDir(), "task")
+		submitted := submitResultForTest(t, submitForTest(t, server, params))
+		if _, err := store.MarkTerminal(submitted.JobID, jobstore.TerminalUpdate{State: state, Cleanup: protocol.CleanupClean}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	server.closeJobStore()
+	server = newTestServer(t, root, Config{Backends: []engine.Backend{helloBackend{name: "restart-no-pending-steers"}}})
+	store, err = server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(root, "jobs.db")
+	before, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.reconcileRecoveredJobs(store); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("reconciliation wrote jobs.db for terminal records without admitted steers")
 	}
 }
 
