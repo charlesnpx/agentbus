@@ -169,23 +169,45 @@ rejects it as `invalid_task_spec` through strict unknown-field decoding, so no
 protocol major-version bump is needed. The field is independent of `write` and
 does not infer review intent from prompt text.
 `localIPC` is also immutable request data; omitting it preserves existing replay
-hashes. Set it to true only for a Codex write or verify job on macOS. It allows
-Unix sockets under a short, private per-job temp directory and TCP loopback. That
-directory is used as `TMPDIR`; the other writable caches remain under the job's
-managed scratch root. The job fails before launch with `backend_unavailable`
-if the resolved directory exceeds 80 bytes. It shares loopback with the host;
-the profile adds no other Unix socket paths, Docker socket access, or outbound
-domains. Claude and Cursor requests are rejected. Linux requests are rejected
-because Codex's current Linux sandbox blocks Unix sockets before applying its
-allowlist. A resumed job follows its new TaskSpec value and does not inherit
-IPC permission from the target job.
+hashes. This optional request is supported for Codex write and verify jobs on
+macOS and Linux. Set it to true only for those jobs.
+On macOS, Unix sockets are limited to a short, private per-job IPC directory,
+and TCP loopback is shared with the host. The macOS profile grants no Docker
+socket access or outbound domains. On Linux, the profile allows connections to
+any host Unix socket at a path the job can read, except masked paths:
+`/run/user/<uid>`, `/run/docker.sock`, `/var/run/docker.sock`, the directory of
+`$SSH_AUTH_SOCK` (or the socket file when that directory is shared with a job
+writable path), and the Agentbus daemon socket and token file. Linux abstract
+sockets, host loopback TCP and external network connections remain blocked.
+Linux's Unix socket access is broader than macOS's private-directory access.
+
+The private IPC directory is used as `TMPDIR`. Local-IPC jobs set
+`SCCACHE_SERVER_UDS=<ipc>/sccache.sock` and
+`SCCACHE_DIR=<scratch>/cache/sccache`. Each sandboxed command starts its own
+sccache server, which exits with the command. The cache persists for the job.
+It is removed with the managed home when the job completes without
+`--retain-session`; failed, canceled and unknown jobs keep it with the
+resumable session until prune. Before launch, Agentbus checks the
+longest expected sccache startup socket path under the resolved IPC directory,
+`<resolved-ipc>/sccacheXXXXXX/sock`. If its byte length exceeds 107 bytes on
+Linux or 103 bytes on macOS, the job fails with
+`backend_unavailable`.
+
+For Linux, Agentbus checks before launch that the Codex sandbox can bind a Unix
+socket with the job's profile. If the check fails, the job fails with
+`backend_unavailable` and a diagnostic beginning `local IPC is unsupported by
+the Codex sandbox on this host:`; there is no weaker fallback. Agentbus caches
+the result per Codex executable path and version. The IPC directory is removed
+on completion, cancellation, timeout and restart recovery. Agentbus does not
+run `sccache --stop-server`. Claude and Cursor requests are rejected. A resumed
+job follows its new TaskSpec value and does not inherit IPC permission from the
+target job.
 `verify` is immutable request data; omission preserves existing replay hashes.
 Set it to true only with `backend: "codex"` and `write: false`. The submitted
 `cwd` must be inside a Git work tree. Verify cannot use `resumeJobId` or retain
 a backend session. Claude and Cursor are rejected because their configured
 modes do not enforce a read-only boundary for a copy outside the submitted
-source. `localIPC` may be combined with verify on macOS; the existing Linux
-Unix-socket sandbox refusal still applies.
+source. `localIPC` may be combined with Verify on both macOS and Linux.
 
 A Verify task spec has this shape:
 
@@ -556,9 +578,12 @@ policy, local IPC, network policy, Git metadata access, and enforcement
 strength. Verify posture also includes `frozenCopy` (the absolute copy path) and
 `frozenSource`, an object with the captured Git `head` commit and `dirty` status.
 For Verify, `sourceWritable` is false, `gitMetadata` is `none`, and
-`enforcement` is `os-sandbox`. `localIPC` is `denied` for Codex jobs using the ordinary sandbox,
-`private-dir` for Codex jobs using the local IPC profile, and `unenforced` for
-trusted full-access Codex writes and Claude/Cursor. The `shell` field is
+`enforcement` is `os-sandbox`. `localIPC` is `denied` for Codex jobs using the
+ordinary sandbox, `all-unix-sockets` for Linux Codex jobs using the local IPC
+profile, `private-dir` for macOS Codex jobs using that profile, and `unenforced`
+for trusted full-access Codex writes and Claude/Cursor. Linux's
+`all-unix-sockets` posture is not equivalent to macOS's `private-dir` posture.
+The `shell` field is
 `sandboxed` for Codex jobs using the OS sandbox, `restricted` for Claude
 read-only jobs (the adapter's allowed/denied shell tool lists), and
 `unenforced` for trusted full-access Codex writes, Claude write, and Cursor
