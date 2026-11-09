@@ -100,15 +100,39 @@ deadline, permission envelope, model, effort, and schema. Delivery may be
 native or interrupt-and-continue depending on the adapter. Delivery uncertainty
 is reported without automatic redelivery; a steerable task does not guarantee
 that a provider follows the instruction or rolls back tools already started.
-TaskSpec `localIPC` is an optional Codex-only request for a write or verify job on macOS.
-It permits Unix sockets under a short, private per-job temp directory used as
-`TMPDIR`, and TCP loopback. Other writable caches remain under the job's
-managed scratch directory. Agentbus rejects the job before launch with
-`backend_unavailable` if the resolved directory exceeds 80 bytes. The host
-shares loopback with the job. Agentbus does not grant other socket paths,
-Docker access, or outbound domains; Claude and Cursor requests are rejected, as
-are Linux requests because Codex's Linux sandbox cannot grant Unix sockets. A
-resumed job follows the new TaskSpec's `localIPC` value.
+TaskSpec `localIPC` is supported for Codex write and verify jobs on macOS and
+Linux; it is an optional request. On macOS, Unix sockets are limited to a
+short, private per-job IPC directory used as `TMPDIR`; TCP loopback is shared
+with the host.
+The macOS profile grants no Docker socket access or outbound domains. On Linux,
+the Codex profile allows connections to any host Unix socket at a path the job
+can read, except masked paths: `/run/user/<uid>`, `/run/docker.sock`,
+`/var/run/docker.sock`, the directory of `$SSH_AUTH_SOCK` (or just that socket
+file when its directory is shared with a job writable path), and the Agentbus
+daemon socket and token file. Linux abstract sockets, host loopback TCP and
+external network connections remain blocked. Linux `localIPC` therefore has a
+broader Unix socket scope than macOS.
+
+Local-IPC jobs set `TMPDIR` to the private IPC directory, set
+`SCCACHE_SERVER_UDS=<ipc>/sccache.sock`, and set
+`SCCACHE_DIR=<scratch>/cache/sccache`. Each sandboxed command starts its own
+sccache server, which exits with that command. Its cache lasts for the job. It
+is removed with the managed home when the job completes without
+`--retain-session`; failed, canceled and unknown jobs keep it with the
+resumable session until prune. Agentbus checks the longest
+expected socket path under the resolved IPC directory,
+`<resolved-ipc>/sccacheXXXXXX/sock`, before launch; if its byte length exceeds
+107 bytes on Linux or 103 bytes on macOS, the job fails with
+`backend_unavailable`.
+
+Before a Linux local-IPC job launches, Agentbus checks that the Codex sandbox
+can bind a Unix socket using that job's profile. If it cannot, the job fails
+with `backend_unavailable` and a diagnostic beginning `local IPC is unsupported
+by the Codex sandbox on this host:`. There is no weaker fallback. Agentbus
+caches the probe result by Codex executable path and version. The IPC directory
+is removed on completion, cancellation, timeout and restart recovery. Agentbus
+does not run `sccache --stop-server`. Claude and Cursor requests are rejected.
+A resumed job follows the new TaskSpec's `localIPC` value.
 Codex uses native app-server `turn/steer`; confirmation means its correlated
 JSON-RPC success response arrived before the steer context ended. No response
 before that deadline is reported as unconfirmed.
@@ -173,8 +197,10 @@ intent, whether the submitted source is writable, shell policy, local IPC,
 network and Git metadata policy, scratch/cache paths, and enforcement strength.
 For verify, the posture also records the frozen copy path and its Git HEAD and
 dirty status. `localIPC` is `denied` for ordinary sandboxed Codex jobs,
-`private-dir` for Codex jobs requesting local IPC, and `unenforced` for trusted
-full-access Codex edits and Claude/Cursor. `sourceWritable` describes the
+`all-unix-sockets` for Linux Codex jobs requesting local IPC, `private-dir` for
+macOS Codex jobs requesting it, and `unenforced` for trusted full-access Codex
+edits and Claude/Cursor. Linux's `all-unix-sockets` posture is not equivalent
+to macOS's `private-dir` posture. `sourceWritable` describes the
 submitted source tree; `enforcement` identifies an OS sandbox, agent
 permissions, or no filesystem boundary.
 

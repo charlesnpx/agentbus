@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -64,12 +65,25 @@ func (d *appServerDriver) ExecSpec(_ string, opts engine.SessionOpts, _ engine.T
 		if opts.CWD == "" || opts.WriteSandboxRoot == "" || opts.LocalIPCRoot == "" {
 			return command.ExecSpec{}, errors.New("Codex local IPC requires workspace, scratch, and private temp roots")
 		}
-		argv = append(argv, localIPCConfigArgsForWorkspace(opts.CWD, opts.WriteSandboxRoot, opts.LocalIPCRoot, !opts.Verify, !opts.Verify)...)
+		argv = append(argv, localIPCConfigArgsForWorkspace(opts.CWD, opts.WriteSandboxRoot, opts.LocalIPCRoot, runtime.GOOS, opts.LocalIPCDenyPaths, !opts.Verify, !opts.Verify)...)
 	}
 	return command.ExecSpec{
 		Argv: argv,
 		Dir:  opts.CWD,
 	}, nil
+}
+
+// CodexSandboxArgs returns the CLI sandbox overrides used to probe a local-IPC
+// session. The profile fields come from the same builder used by app-server.
+func (b *backend) CodexSandboxArgs(opts engine.SessionOpts) ([]string, error) {
+	if !opts.LocalIPC {
+		return nil, errors.New("Codex local IPC sandbox args require local IPC")
+	}
+	if opts.CWD == "" || opts.WriteSandboxRoot == "" || opts.LocalIPCRoot == "" {
+		return nil, errors.New("Codex local IPC requires workspace, scratch, and private temp roots")
+	}
+	args := localIPCConfigArgsForWorkspace(opts.CWD, opts.WriteSandboxRoot, opts.LocalIPCRoot, runtime.GOOS, opts.LocalIPCDenyPaths, !opts.Verify, !opts.Verify)
+	return append(args, "-P", localIPCPermissionProfile), nil
 }
 
 func (d *appServerDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resumeID string, opts engine.SessionOpts, input engine.TurnInput, emit duplex.EmitFunc) (string, error) {
@@ -1282,16 +1296,16 @@ func turnStartParams(threadID string, opts engine.SessionOpts, input engine.Turn
 }
 
 func localIPCConfigArgs(workspace, scratch, ipcRoot string) []string {
-	return localIPCConfigArgsForWorkspace(workspace, scratch, ipcRoot, true, true)
+	return localIPCConfigArgsForWorkspace(workspace, scratch, ipcRoot, runtime.GOOS, nil, true, true)
 }
 
-func localIPCConfigArgsForWorkspace(workspace, scratch, ipcRoot string, includeGitMetadata, includeSystemTemp bool) []string {
+func localIPCConfigArgsForWorkspace(workspace, scratch, ipcRoot, targetGOOS string, denyPaths []string, includeGitMetadata, includeSystemTemp bool) []string {
 	type filesystemEntry struct {
 		path       string
 		permission string
 	}
-	entries := make([]filesystemEntry, 0, 6)
-	indices := make(map[string]int, 6)
+	entries := make([]filesystemEntry, 0, 6+len(denyPaths))
+	indices := make(map[string]int, 6+len(denyPaths))
 	setFilesystemPermission := func(path, permission string) {
 		if index, ok := indices[path]; ok {
 			entries[index].permission = permission
@@ -1304,25 +1318,35 @@ func localIPCConfigArgsForWorkspace(workspace, scratch, ipcRoot string, includeG
 	setFilesystemPermission(workspace, "write")
 	setFilesystemPermission(scratch, "write")
 	setFilesystemPermission(ipcRoot, "write")
-	if includeSystemTemp {
+	if includeSystemTemp && targetGOOS != "linux" {
 		setFilesystemPermission("/tmp", "write")
 	}
 	if includeGitMetadata {
 		setFilesystemPermission(filepath.Join(workspace, ".git"), "read")
+	}
+	if targetGOOS == "linux" {
+		for _, path := range denyPaths {
+			setFilesystemPermission(path, "deny")
+		}
 	}
 	filesystemParts := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		filesystemParts = append(filesystemParts, tomlString(entry.path)+"=\""+entry.permission+"\"")
 	}
 	filesystem := "{" + strings.Join(filesystemParts, ",") + "}"
-	return []string{
+	args := []string{
 		"-c", `default_permissions=":workspace"`,
 		"-c", "features.network_proxy=true",
 		"-c", "permissions." + localIPCPermissionProfile + ".filesystem=" + filesystem,
 		"-c", "permissions." + localIPCPermissionProfile + ".network.enabled=true",
 		"-c", "permissions." + localIPCPermissionProfile + ".network.allow_local_binding=true",
-		"-c", "permissions." + localIPCPermissionProfile + ".network.unix_sockets={" + tomlString(ipcRoot) + "=\"allow\"}",
 	}
+	if targetGOOS == "linux" {
+		args = append(args, "-c", "permissions."+localIPCPermissionProfile+".network.dangerously_allow_all_unix_sockets=true")
+	} else {
+		args = append(args, "-c", "permissions."+localIPCPermissionProfile+".network.unix_sockets={"+tomlString(ipcRoot)+"=\"allow\"}")
+	}
+	return args
 }
 
 func tomlString(value string) string {

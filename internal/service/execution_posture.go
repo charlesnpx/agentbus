@@ -31,7 +31,7 @@ func resolveModuleCache() string {
 	return strings.TrimSpace(string(output))
 }
 
-func executionPosture(backend string, write, verify, localIPC, codexSandboxed bool, scratch string, caches map[string]string) protocol.ExecutionPosture {
+func executionPosture(backend string, write, verify, localIPC bool, goos string, codexSandboxed bool, scratch string, caches map[string]string) protocol.ExecutionPosture {
 	intent := "inspect"
 	if verify {
 		intent = "verify"
@@ -59,6 +59,9 @@ func executionPosture(backend string, write, verify, localIPC, codexSandboxed bo
 			posture.LocalIPC = "denied"
 			if localIPC {
 				posture.LocalIPC = "private-dir"
+				if goos == "linux" {
+					posture.LocalIPC = "all-unix-sockets"
+				}
 			}
 			posture.GitMetadata = "read-only"
 			if verify {

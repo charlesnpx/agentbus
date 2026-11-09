@@ -8,3 +8,8 @@
   backend profiles.
 - [ADR index](adr/README.md) — the current ADR and the historical decision
   record.
+
+## Open work
+
+- [Linux per-path Unix socket access](todo/linux-per-path-unix-sockets.md) —
+  current limits and the Codex support needed to narrow Linux local IPC.

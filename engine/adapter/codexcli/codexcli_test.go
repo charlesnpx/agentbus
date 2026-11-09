@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -131,6 +132,17 @@ func TestAppServerLocalIPCUsesScopedPermissionsProfile(t *testing.T) {
 		"-c", "permissions.agentbus_local_ipc.network.allow_local_binding=true",
 		"-c", `permissions.agentbus_local_ipc.network.unix_sockets={"/tmp/ipc/r\"oot\\w"="allow"}`,
 	}
+	if runtime.GOOS == "linux" {
+		wantArgv = []string{
+			"fake-codex", "app-server",
+			"-c", `default_permissions=":workspace"`,
+			"-c", "features.network_proxy=true",
+			"-c", `permissions.agentbus_local_ipc.filesystem={":root"="read","/work/a\"b\\c"="write","/scratch/d\"e\\f"="write","/tmp/ipc/r\"oot\\w"="write","/work/a\"b\\c/.git"="read"}`,
+			"-c", "permissions.agentbus_local_ipc.network.enabled=true",
+			"-c", "permissions.agentbus_local_ipc.network.allow_local_binding=true",
+			"-c", "permissions.agentbus_local_ipc.network.dangerously_allow_all_unix_sockets=true",
+		}
+	}
 	runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
 		if !reflect.DeepEqual(spec.Argv, wantArgv) {
 			t.Fatalf("argv = %#v, want quoted local IPC profile overrides %#v", spec.Argv, wantArgv)
@@ -198,6 +210,55 @@ func TestAppServerLocalIPCUsesScopedPermissionsProfile(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = collectEventsWithTimeout(t, events, 2*time.Second)
+}
+
+func TestLocalIPCProfileArgsByGOOS(t *testing.T) {
+	workspace := "/work/project"
+	scratch := "/scratch/job"
+	ipcRoot := "/tmp/agentbus-ipc-test"
+	denyPaths := []string{"/run/user/501", "/run/docker.sock"}
+	backend := New(Options{Binary: "codex"}).(*backend)
+	opts := engine.SessionOpts{CWD: workspace, WriteSandboxRoot: scratch, LocalIPCRoot: ipcRoot, LocalIPC: true}
+	sandboxArgs, err := backend.CodexSandboxArgs(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantSandboxArgs := append(localIPCConfigArgsForWorkspace(workspace, scratch, ipcRoot, runtime.GOOS, nil, true, true), "-P", localIPCPermissionProfile)
+	if !reflect.DeepEqual(sandboxArgs, wantSandboxArgs) {
+		t.Fatalf("Codex sandbox local IPC args = %#v, want shared profile args plus selector %#v", sandboxArgs, wantSandboxArgs)
+	}
+
+	t.Run("linux", func(t *testing.T) {
+		args := localIPCConfigArgsForWorkspace(workspace, scratch, ipcRoot, "linux", denyPaths, true, true)
+		joined := strings.Join(args, "\n")
+		for _, want := range []string{
+			`permissions.agentbus_local_ipc.network.dangerously_allow_all_unix_sockets=true`,
+			`"/run/user/501"="deny"`,
+			`"/run/docker.sock"="deny"`,
+		} {
+			if !strings.Contains(joined, want) {
+				t.Fatalf("Linux local IPC args missing %q: %#v", want, args)
+			}
+		}
+		if strings.Contains(joined, ".network.unix_sockets=") || strings.Contains(joined, `"/tmp"="write"`) {
+			t.Fatalf("Linux local IPC args contain per-path sockets or /tmp write: %#v", args)
+		}
+	})
+
+	t.Run("macOS", func(t *testing.T) {
+		args := localIPCConfigArgsForWorkspace(workspace, scratch, ipcRoot, "darwin", denyPaths, true, true)
+		want := []string{
+			"-c", `default_permissions=":workspace"`,
+			"-c", "features.network_proxy=true",
+			"-c", `permissions.agentbus_local_ipc.filesystem={":root"="read","/work/project"="write","/scratch/job"="write","/tmp/agentbus-ipc-test"="write","/tmp"="write","/work/project/.git"="read"}`,
+			"-c", "permissions.agentbus_local_ipc.network.enabled=true",
+			"-c", "permissions.agentbus_local_ipc.network.allow_local_binding=true",
+			"-c", `permissions.agentbus_local_ipc.network.unix_sockets={"/tmp/agentbus-ipc-test"="allow"}`,
+		}
+		if !reflect.DeepEqual(args, want) {
+			t.Fatalf("macOS local IPC args = %#v, want unchanged profile %#v", args, want)
+		}
+	})
 }
 
 func TestAppServerThreadSettingsUpdateReportsEffectiveSelection(t *testing.T) {

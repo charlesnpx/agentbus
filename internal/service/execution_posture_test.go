@@ -11,13 +11,19 @@ import (
 
 func TestExecutionPostureByBackend(t *testing.T) {
 	writeCaches := map[string]string{"GOCACHE": "job-cache/go-build"}
-	localIPCCaches := map[string]string{"GOCACHE": "job-cache/go-build", "TMPDIR": "private-ipc"}
+	localIPCCaches := map[string]string{
+		"GOCACHE":            "job-cache/go-build",
+		"TMPDIR":             "private-ipc",
+		"SCCACHE_SERVER_UDS": "private-ipc/sccache.sock",
+		"SCCACHE_DIR":        "job-cache/cache/sccache",
+	}
 	tests := []struct {
 		name      string
 		backend   string
 		write     bool
 		verify    bool
 		localIPC  bool
+		goos      string
 		sandboxed bool
 		want      protocol.ExecutionPosture
 	}{
@@ -54,10 +60,23 @@ func TestExecutionPostureByBackend(t *testing.T) {
 			backend:   "codex",
 			write:     true,
 			localIPC:  true,
+			goos:      "darwin",
 			sandboxed: true,
 			want: protocol.ExecutionPosture{
 				Intent: "edit", SourceWritable: true, Scratch: "job-cache", Caches: localIPCCaches,
 				Shell: "sandboxed", Network: "denied", LocalIPC: "private-dir", GitMetadata: "read-only", Enforcement: "os-sandbox",
+			},
+		},
+		{
+			name:      "codex edit with Linux local IPC",
+			backend:   "codex",
+			write:     true,
+			localIPC:  true,
+			goos:      "linux",
+			sandboxed: true,
+			want: protocol.ExecutionPosture{
+				Intent: "edit", SourceWritable: true, Scratch: "job-cache", Caches: localIPCCaches,
+				Shell: "sandboxed", Network: "denied", LocalIPC: "all-unix-sockets", GitMetadata: "read-only", Enforcement: "os-sandbox",
 			},
 		},
 		{
@@ -113,7 +132,7 @@ func TestExecutionPostureByBackend(t *testing.T) {
 					caches = localIPCCaches
 				}
 			}
-			got := executionPosture(test.backend, test.write, test.verify, test.localIPC, test.sandboxed, scratch, caches)
+			got := executionPosture(test.backend, test.write, test.verify, test.localIPC, test.goos, test.sandboxed, scratch, caches)
 			if !reflect.DeepEqual(got, test.want) {
 				t.Fatalf("executionPosture(%q, %t) = %#v, want %#v", test.backend, test.write, got, test.want)
 			}

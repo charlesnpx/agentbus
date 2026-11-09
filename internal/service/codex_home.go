@@ -36,6 +36,7 @@ type managedCodexHome struct {
 type jobCachePaths struct {
 	root     string
 	goBuild  string
+	sccache  string
 	tmp      string
 	npm      string
 	corepack string
@@ -152,6 +153,7 @@ func prepareJobCache(layout engine.WorkspaceLayout, jobID string, managed *manag
 	paths := jobCachePaths{
 		root:     root,
 		goBuild:  filepath.Join(root, "cache", "go-build"),
+		sccache:  filepath.Join(root, "cache", "sccache"),
 		tmp:      filepath.Join(root, "tmp"),
 		npm:      filepath.Join(root, "cache", "npm"),
 		corepack: filepath.Join(root, "cache", "corepack"),
@@ -164,7 +166,7 @@ func prepareJobCache(layout engine.WorkspaceLayout, jobID string, managed *manag
 		return paths, managed, err
 	}
 	defer unix.Close(cacheFD)
-	for _, name := range []string{"go-build", "npm", "corepack", "xdg", "pnpm", "yarn"} {
+	for _, name := range []string{"go-build", "sccache", "npm", "corepack", "xdg", "pnpm", "yarn"} {
 		directoryFD, err := createManagedDirectory(cacheFD, name)
 		if err != nil {
 			return paths, managed, err

@@ -142,16 +142,18 @@ func (lifecycle *serveLifecycle) settleAccept() {
 
 // Server serves protocol version 3 over one private Unix socket.
 type Server struct {
-	stateRoot           string
-	socketPath          string
-	token               string
-	backends            map[string]engine.Backend
-	backendDefaults     map[string]BackendDefaults
-	backendVersionMu    sync.Mutex
-	backendVersions     map[backendVersionCacheKey]backendVersionCacheEntry
-	codexSandboxMu      sync.Mutex
-	codexSandboxResults map[codexSandboxCacheKey]codexSandboxCacheEntry
-	codexSandboxProbe   func(context.Context, string) error
+	stateRoot            string
+	socketPath           string
+	token                string
+	backends             map[string]engine.Backend
+	backendDefaults      map[string]BackendDefaults
+	backendVersionMu     sync.Mutex
+	backendVersions      map[backendVersionCacheKey]backendVersionCacheEntry
+	codexSandboxMu       sync.Mutex
+	codexSandboxResults  map[codexSandboxCacheKey]codexSandboxCacheEntry
+	codexSandboxProbe    func(context.Context, string) error
+	codexLocalIPCResults map[codexSandboxCacheKey]codexSandboxCacheEntry
+	codexLocalIPCProbe   func(context.Context, string, []string, string, string, string) error
 
 	codexHomeOverride    string
 	codexHomeInherit     bool
@@ -284,6 +286,8 @@ func New(cfg Config) (*Server, error) {
 		backendVersions:      make(map[backendVersionCacheKey]backendVersionCacheEntry),
 		codexSandboxResults:  make(map[codexSandboxCacheKey]codexSandboxCacheEntry),
 		codexSandboxProbe:    runCodexSandboxProbe,
+		codexLocalIPCResults: make(map[codexSandboxCacheKey]codexSandboxCacheEntry),
+		codexLocalIPCProbe:   runCodexLocalIPCProbe,
 		codexHomeOverride:    cfg.CodexHomeOverride,
 		codexHomeInherit:     cfg.CodexHomeInherit,
 		codexAuthHome:        cfg.CodexAuthHome,

@@ -106,10 +106,13 @@ type SessionOpts struct {
 	Verify bool
 	// LocalIPCRoot is the private short temp directory granted for local IPC.
 	LocalIPCRoot string
-	Write        bool
-	Model        string
-	Effort       string
-	Timeout      time.Duration
+	// LocalIPCDenyPaths are host socket paths hidden from Linux local-IPC jobs.
+	// Other platforms ignore them.
+	LocalIPCDenyPaths []string
+	Write             bool
+	Model             string
+	Effort            string
+	Timeout           time.Duration
 }
 
 // TurnInput is the effective input for one backend turn.

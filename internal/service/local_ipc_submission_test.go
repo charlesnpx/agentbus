@@ -51,8 +51,8 @@ func TestJobSubmitLocalIPCValidationAndReplayIdentity(t *testing.T) {
 	linux := submissionParams("local-ipc-linux", "request", "codex", t.TempDir(), "task")
 	linux.TaskSpec.Write = true
 	linux.TaskSpec.LocalIPC = true
-	if outcome := submitForTest(t, server, linux); outcome.err == nil || outcome.err.Data.Code != protocol.ErrorInvalidTaskSpec || !strings.Contains(outcome.err.Message, "Unix sockets") {
-		t.Fatalf("Linux localIPC rejection = %#v, want the Unix socket sandbox limitation", outcome.err)
+	if outcome := submitForTest(t, server, linux); outcome.err != nil {
+		t.Fatalf("Linux localIPC outcome = %#v, want accepted task", outcome.err)
 	}
 
 	localIPCGOOS = "darwin"

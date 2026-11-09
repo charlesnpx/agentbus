@@ -87,13 +87,37 @@ root outside the submitted workspace, and Agentbus does not weaken those
 profiles to add one. Codex may still receive the resolved host `GOMODCACHE` for
 reads.
 
-Codex write jobs requesting `localIPC` use a short, daemon-created private
-directory under the operating-system temp directory as `TMPDIR`. The Codex
-profile grants that directory filesystem writes and Unix socket binding; the
-other cache variables remain under managed scratch. Agentbus removes the
-private temp directory when the job reaches a terminal state and during restart
-recovery. If its resolved path exceeds 80 bytes, the job fails before launch
-with `backend_unavailable`.
+On macOS and Linux, Codex write and Verify jobs support the optional TaskSpec
+field `localIPC`. Agentbus gives the job a short, daemon-created private IPC
+directory as `TMPDIR`,
+`SCCACHE_SERVER_UDS=<ipc>/sccache.sock`, and
+`SCCACHE_DIR=<scratch>/cache/sccache`. Each sandboxed command starts its own
+sccache server, which exits with the command. The cache persists for the job.
+It is removed with the managed home when the job completes without
+`--retain-session`; failed, canceled and unknown jobs keep it with the
+resumable session until prune. Agentbus checks the longest
+expected sccache startup socket path under the resolved IPC directory,
+`<resolved-ipc>/sccacheXXXXXX/sock`, before launch. If its byte length exceeds
+107 bytes on Linux or 103 bytes on macOS,
+the job fails with `backend_unavailable`.
+
+On macOS, Unix sockets are limited to the private IPC directory and TCP
+loopback is shared with the host; the profile grants no Docker socket access or
+outbound domains. On Linux, the profile allows connections to any host Unix
+socket at a path the job can read, unless masked. The masks are
+`/run/user/<uid>`, `/run/docker.sock`, `/var/run/docker.sock`, the directory of
+`$SSH_AUTH_SOCK` (or the socket file when that directory is shared with a job
+writable path), and the Agentbus daemon socket and token file. Linux abstract
+sockets, host loopback TCP and external network connections remain blocked.
+Linux's Unix socket access is broader than macOS's private-directory access.
+
+Before launch on Linux, Agentbus checks that the Codex sandbox can bind a Unix
+socket with the job's profile. A failed check ends the job with
+`backend_unavailable` and a diagnostic beginning `local IPC is unsupported by
+the Codex sandbox on this host:`; there is no weaker fallback. Agentbus caches
+the probe result per Codex executable path and version. It removes the IPC
+directory on completion, cancellation, timeout and restart recovery. Agentbus
+does not run `sccache --stop-server`.
 
 Codex jobs use the daemon's effective Go module cache for reads. Agentbus
 resolves `GOMODCACHE` once at daemon startup, using the daemon environment first
@@ -215,12 +239,13 @@ the selected posture, not a capability negotiation. Codex uses OS sandbox
 enforcement and denies job network access. Agentbus checks that the Codex
 sandbox can start before launching app-server; failure is `backend_unavailable`
 and does not weaken the sandbox. Trusted full-access Codex writes have no shell
-or IPC confinement. `localIPC` is `denied` by default, `private-dir` for a
-Codex edit or Verify with the local IPC profile on macOS, and `unenforced` for
-trusted full-access Codex writes and Claude/Cursor. The existing Linux
-Unix-socket sandbox refusal also applies to Verify.
-That profile allows Unix sockets under the private per-job temp directory and
-TCP loopback; the job shares loopback with the host. Cursor uses agent-mode permissions,
+or IPC confinement. `localIPC` is `denied` by default, `all-unix-sockets` for
+Linux Codex write and Verify jobs using the local IPC profile, `private-dir`
+for macOS Codex write and Verify jobs using that profile, and `unenforced` for
+trusted full-access Codex writes and Claude/Cursor. Linux's
+`all-unix-sockets` posture is not equivalent to macOS's `private-dir` posture.
+On macOS, that profile allows Unix sockets under the private per-job IPC
+directory and TCP loopback, which is shared with the host. Cursor uses agent-mode permissions,
 which do not sandbox filesystem or network access at the OS level. Claude has
 no filesystem or network sandbox; its read-only shell tool list is restricted,
 while Claude write and Cursor shell execution are unenforced by Agentbus. The

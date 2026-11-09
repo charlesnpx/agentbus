@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -119,6 +120,7 @@ func TestCodexWriteTurnUsesPrivateWritableCacheAndHostModuleCache(t *testing.T) 
 		}
 		for _, path := range []string{
 			filepath.Join(opts.WriteSandboxRoot, "cache", "go-build"),
+			filepath.Join(opts.WriteSandboxRoot, "cache", "sccache"),
 			filepath.Join(opts.WriteSandboxRoot, "tmp"),
 			filepath.Join(opts.WriteSandboxRoot, "cache", "npm"),
 			filepath.Join(opts.WriteSandboxRoot, "cache", "corepack"),
@@ -218,10 +220,27 @@ func TestCodexWriteTurnOmitsGOMODCACHEWhenHostCacheCannotResolve(t *testing.T) {
 	}
 }
 
-func TestCodexLocalIPCUsesPrivateTMPDIRAndRemovesItAtCompletion(t *testing.T) {
+func TestCodexLocalIPCPathLimitsSccacheEnvironmentAndCleanup(t *testing.T) {
 	originalGOOS := localIPCGOOS
 	localIPCGOOS = "darwin"
 	t.Cleanup(func() { localIPCGOOS = originalGOOS })
+	for _, test := range []struct {
+		goos  string
+		limit int
+	}{
+		{goos: "linux", limit: 107},
+		{goos: "darwin", limit: 103},
+	} {
+		rootLength := test.limit - len(localIPCSCCacheStartupSocketSuffix)
+		fits := "/" + strings.Repeat("r", rootLength-1)
+		if err := validateLocalIPCSocketPath(fits, test.goos); err != nil {
+			t.Fatalf("%s path at %d-byte socket limit rejected: %v", test.goos, test.limit, err)
+		}
+		err := validateLocalIPCSocketPath(fits+"x", test.goos)
+		if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("%d bytes", test.limit+1)) || !strings.Contains(err.Error(), fmt.Sprintf("limit is %d bytes", test.limit)) {
+			t.Fatalf("%s one-byte-over path error = %v, want length and %d-byte limit", test.goos, err, test.limit)
+		}
+	}
 	originalTempRoot := localIPCTempRoot
 	tempRoot, err := os.MkdirTemp("/tmp", "agentbus-test-")
 	if err != nil {
@@ -240,8 +259,21 @@ func TestCodexLocalIPCUsesPrivateTMPDIRAndRemovesItAtCompletion(t *testing.T) {
 		if opts.LocalIPCRoot == "" || opts.WriteEnvOverlay["TMPDIR"] != opts.LocalIPCRoot {
 			t.Fatalf("LocalIPCRoot=%q WriteEnvOverlay=%#v, want private TMPDIR", opts.LocalIPCRoot, opts.WriteEnvOverlay)
 		}
-		if len(opts.LocalIPCRoot) > localIPCRootMaxBytes || !strings.HasPrefix(filepath.Base(opts.LocalIPCRoot), "agentbus-ipc-") {
+		if !strings.HasPrefix(filepath.Base(opts.LocalIPCRoot), "agentbus-ipc-") {
 			t.Fatalf("LocalIPCRoot = %q, want a short agentbus-ipc directory", opts.LocalIPCRoot)
+		}
+		uds := opts.WriteEnvOverlay["SCCACHE_SERVER_UDS"]
+		if !filepath.IsAbs(uds) {
+			t.Fatalf("SCCACHE_SERVER_UDS = %q, want an absolute IPC socket path", uds)
+		}
+		udsRelative, err := filepath.Rel(opts.LocalIPCRoot, uds)
+		if err != nil || udsRelative != "sccache.sock" {
+			t.Fatalf("SCCACHE_SERVER_UDS = %q, want inside IPC root %q", uds, opts.LocalIPCRoot)
+		}
+		sccacheDir := opts.WriteEnvOverlay["SCCACHE_DIR"]
+		sccacheRelative, err := filepath.Rel(opts.WriteSandboxRoot, sccacheDir)
+		if err != nil || sccacheRelative == ".." || strings.HasPrefix(sccacheRelative, ".."+string(filepath.Separator)) {
+			t.Fatalf("SCCACHE_DIR = %q, want under scratch %q", sccacheDir, opts.WriteSandboxRoot)
 		}
 		info, err := os.Stat(opts.LocalIPCRoot)
 		if err != nil {
@@ -251,7 +283,7 @@ func TestCodexLocalIPCUsesPrivateTMPDIRAndRemovesItAtCompletion(t *testing.T) {
 			t.Fatalf("private IPC directory mode/type = %s, want directory 0700", info.Mode())
 		}
 		for key, path := range opts.WriteEnvOverlay {
-			if key == "TMPDIR" {
+			if key == "TMPDIR" || key == "SCCACHE_SERVER_UDS" {
 				continue
 			}
 			relative, err := filepath.Rel(opts.WriteSandboxRoot, path)
@@ -285,62 +317,14 @@ func TestCodexLocalIPCUsesPrivateTMPDIRAndRemovesItAtCompletion(t *testing.T) {
 	if got.State != protocol.PublicStateCompleted || got.Execution == nil {
 		t.Fatalf("terminal record = %+v, want completed with execution posture", got)
 	}
-	if got.Execution.LocalIPC != "private-dir" || got.Execution.Caches["TMPDIR"] != started.LocalIPCRoot {
+	if got.Execution.LocalIPC != "private-dir" || got.Execution.Caches["TMPDIR"] != started.LocalIPCRoot || got.Execution.Caches["SCCACHE_SERVER_UDS"] != started.WriteEnvOverlay["SCCACHE_SERVER_UDS"] || got.Execution.Caches["SCCACHE_DIR"] != started.WriteEnvOverlay["SCCACHE_DIR"] {
 		t.Fatalf("execution posture = %+v, want private-dir and TMPDIR %q", got.Execution, started.LocalIPCRoot)
 	}
 	if _, err := os.Stat(started.LocalIPCRoot); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("private IPC directory after completion = %v, want removed", err)
 	}
-}
-
-func TestCodexLocalIPCRejectsLongPrivateTMPDIRBeforeLaunch(t *testing.T) {
-	originalGOOS := localIPCGOOS
-	localIPCGOOS = "darwin"
-	t.Cleanup(func() { localIPCGOOS = originalGOOS })
-	originalTempRoot := localIPCTempRoot
-	longRoot := filepath.Join(t.TempDir(), strings.Repeat("x", 96))
-	if err := os.MkdirAll(longRoot, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	localIPCTempRoot = longRoot
-	t.Cleanup(func() { localIPCTempRoot = originalTempRoot })
-
-	starts := 0
-	backend := &executionFakeBackend{name: "codex"}
-	backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) {
-		starts++
-		return claimedResultSession("unexpected launch"), nil
-	}
-	server := newTestServer(t, t.TempDir(), Config{
-		Backends:      []engine.Backend{backend},
-		CodexAuthHome: filepath.Join(t.TempDir(), "missing-auth-home"),
-	})
-	cwd := t.TempDir()
-	record := runtimeHygieneRecordForSpec(t, server, cwd, "local-ipc-long-tmp", protocol.TaskSpec{
-		Backend: "codex", CWD: cwd, Prompt: "runtime hygiene test", Write: true, LocalIPC: true,
-	})
-	runExecution(t, server, record)
-
-	store, err := server.ensureJobStore()
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, err := store.Get(record.JobID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.State != protocol.PublicStateFailed || got.FailureClass != protocol.FailureClassBackendUnavailable || !strings.Contains(got.FailureReason, "80 bytes") {
-		t.Fatalf("long local IPC path result = %+v, want backend_unavailable with the 80-byte limit", got)
-	}
-	if starts != 0 {
-		t.Fatalf("backend Start calls = %d, want no launch", starts)
-	}
-	entries, err := os.ReadDir(longRoot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("long temp root entries = %#v, want the rejected directory removed", entries)
+	if _, err := os.Stat(started.WriteEnvOverlay["SCCACHE_DIR"]); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("per-job sccache cache after completion = %v, want removed with the managed scratch", err)
 	}
 }
 
