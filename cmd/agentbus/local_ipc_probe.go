@@ -25,7 +25,7 @@ func runLocalIPCProbe(args []string, stderr io.Writer) int {
 		return localIPCProbeFailure(stderr, errors.New("IPC path is not a directory"))
 	}
 
-	socketPath := filepath.Join(directory, "agentbus-probe.sock")
+	socketPath := filepath.Join(directory, "probe.sock")
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {
 		return localIPCProbeFailure(stderr, fmt.Errorf("listen on local Unix socket: %w", err))
