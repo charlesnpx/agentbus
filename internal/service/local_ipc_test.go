@@ -5,6 +5,7 @@ package service
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/charlesnpx/agentbus/internal/jobstore"
@@ -86,6 +87,98 @@ func TestBuildLocalIPCDenyPathsResolveAndScopeCandidates(t *testing.T) {
 	gotMissing := buildLocalIPCDenyPaths(stateAlias, workspace, scratch, ipcRoot, missingSocket, home, 987654)
 	if containsString(gotMissing, filepath.Dir(missingSocket)) || containsString(gotMissing, missingSocket) {
 		t.Fatalf("deny paths = %#v, want unresolved SSH path dropped", gotMissing)
+	}
+
+	nestedStateRoot := filepath.Join(root, "nested-state")
+	if err := os.Mkdir(nestedStateRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	nestedStateSocket := filepath.Join(nestedStateRoot, protocol.SocketName)
+	if err := os.WriteFile(nestedStateSocket, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resolvedNestedStateRoot, err := filepath.EvalSymlinks(nestedStateRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolvedNestedStateSocket, err := filepath.EvalSymlinks(nestedStateSocket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotNested := buildLocalIPCDenyPaths(nestedStateRoot, workspace, scratch, ipcRoot, filepath.Join(nestedStateRoot, "ssh-agent.sock"), home, 987654)
+	if !containsString(gotNested, resolvedNestedStateRoot) || containsString(gotNested, resolvedNestedStateSocket) {
+		t.Fatalf("deny paths = %#v, want nested state root %q and no child socket %q", gotNested, resolvedNestedStateRoot, resolvedNestedStateSocket)
+	}
+}
+
+func TestNormalizeLocalIPCDenyPaths(t *testing.T) {
+	root := t.TempDir()
+	parent := filepath.Join(root, "run", "user", "1000")
+	child := filepath.Join(parent, "keyring")
+	sshAuthSock := filepath.Join(child, "ssh")
+	sharedPrefixA := filepath.Join(root, "example", "a")
+	sharedPrefixAB := filepath.Join(root, "example", "ab")
+	unrelated := filepath.Join(root, "unrelated")
+	for _, path := range []string{child, sharedPrefixA, sharedPrefixAB, unrelated} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(sshAuthSock, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(root, "keyring-alias")
+	if err := os.Symlink(child, alias); err != nil {
+		t.Fatal(err)
+	}
+	resolve := func(path string) string {
+		t.Helper()
+		resolved, err := resolveExistingPath(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resolved
+	}
+	resolvedParent := resolve(parent)
+	resolvedSSHDirectory := resolve(filepath.Dir(sshAuthSock))
+	resolvedAlias := resolve(alias)
+	resolvedA := resolve(sharedPrefixA)
+	resolvedAB := resolve(sharedPrefixAB)
+	resolvedUnrelated := resolve(unrelated)
+
+	tests := []struct {
+		name  string
+		paths []string
+		want  []string
+	}{
+		{
+			name:  "parent before child",
+			paths: []string{resolvedParent, resolvedSSHDirectory},
+			want:  []string{resolvedParent},
+		},
+		{
+			name:  "child before parent",
+			paths: []string{resolvedSSHDirectory, resolvedParent},
+			want:  []string{resolvedParent},
+		},
+		{
+			name:  "unrelated and shared text prefix paths stay separate",
+			paths: []string{resolvedA, resolvedAB, resolvedUnrelated},
+			want:  []string{resolvedA, resolvedAB, resolvedUnrelated},
+		},
+		{
+			name:  "duplicate and symlink alias to descendant",
+			paths: []string{resolvedParent, resolvedParent, resolvedAlias},
+			want:  []string{resolvedParent},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := normalizeLocalIPCDenyPaths(test.paths)
+			if !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("normalizeLocalIPCDenyPaths(%#v) = %#v, want %#v", test.paths, got, test.want)
+			}
+		})
 	}
 }
 

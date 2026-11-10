@@ -104,7 +104,32 @@ func buildLocalIPCDenyPaths(stateRoot, workspace, scratch, ipcRoot, sshAuthSock,
 		seen[path] = struct{}{}
 		resolved = append(resolved, path)
 	}
-	return resolved
+	return normalizeLocalIPCDenyPaths(resolved)
+}
+
+func normalizeLocalIPCDenyPaths(paths []string) []string {
+	retained := make([]string, 0, len(paths))
+	for _, candidate := range paths {
+		covered := false
+		for _, path := range retained {
+			if isSameOrAncestorOfAny(path, []string{candidate}) {
+				covered = true
+				break
+			}
+		}
+		if covered {
+			continue
+		}
+
+		kept := retained[:0]
+		for _, path := range retained {
+			if !isSameOrAncestorOfAny(candidate, []string{path}) {
+				kept = append(kept, path)
+			}
+		}
+		retained = append(kept, candidate)
+	}
+	return retained
 }
 
 func resolveExistingPath(path string) (string, error) {
