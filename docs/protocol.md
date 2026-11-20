@@ -439,6 +439,11 @@ then fails with `invalid_task_spec` and `data.reason: session_discarded`;
 matching request replay still returns the original job. Detailed records for
 all members project the root timestamp without modifying their history,
 results, terminal timestamps, or observed provider session IDs.
+Before refusing for uncertain cleanup, the daemon rechecks a terminal job's
+recorded process group. Absence in the same boot, state-root and PID namespace
+scope can establish clean cleanup; this observation sends no signal. Different
+or unreadable scopes remain uncertain. Resume admission and restart
+reconciliation perform the same recheck.
 
 The result is `{rootJobId, sessionDiscardedAt, homeRemoval}`, where
 `homeRemoval` is `removed`, `already_absent`, or `failed`; failures include a
@@ -675,7 +680,9 @@ cleanup is independent of state:
 | uncertain | Cleanup could not be established under the process-claim rule. |
 
 For example, a completed job can have cleanup set to uncertain and still retain
-its result and schema verdict.
+its result and schema verdict. Cleanup may later become clean when the recorded
+process group is observed absent in its original scope; the job outcome,
+result, and request identity do not change.
 
 Failure classes are data on failed jobs, not more states:
 

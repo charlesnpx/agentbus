@@ -3,6 +3,7 @@
 package service
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -16,6 +17,197 @@ import (
 	"github.com/charlesnpx/agentbus/internal/jobstore"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 )
+
+func TestRecoveryAbsentLeaderAndGroupAllowsDiscard(t *testing.T) {
+	s := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "codex"}}})
+	params := submissionParams("absent-recovery", "root", "codex", t.TempDir(), "task")
+	params.TaskSpec.RetainSession = true
+	submitted := submitResultForTest(t, submitForTest(t, s, params))
+	_, home, err := s.prepareCodexHome(codexLayout(s.stateRoot), submitted.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home.close()
+	store, err := s.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := newOrphanReaperFixture()
+	fixture.groupLive = false
+	s.processTable = summaryProcessTable{alive: false}
+	s.processGroups = fixture
+	s.processGroupGoneFn = fixture.processGroupGone
+	if _, err := store.MarkStarting(submitted.JobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RecordProcessClaim(submitted.JobID, fixture.claim()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RecordBackendSessionID(submitted.JobID, "thread-recovered"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.reconcileRecoveredJobs(store); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(submitted.JobID)
+	if err != nil || got.State != protocol.PublicStateUnknown || got.Cleanup != protocol.CleanupClean || got.BackendSessionID != "thread-recovered" {
+		t.Fatalf("recovered record = %#v, error %v", got, err)
+	}
+	if outcome := s.handleSessionDiscard(mustJSON(t, protocol.SessionDiscardParams{JobID: submitted.JobID})); outcome.err != nil {
+		t.Fatalf("discard after recovery = %#v", outcome.err)
+	}
+	if len(fixture.signals) != 0 {
+		t.Fatalf("signals sent for absent group: %#v", fixture.signals)
+	}
+}
+
+func TestTerminalCleanupReobservationPreservesOutcomeAndAllowsReuse(t *testing.T) {
+	for _, path := range []string{"reconciliation", "disposal", "resume", "wrong scope"} {
+		t.Run(path, func(t *testing.T) {
+			s, store, root, _ := ownedLineageFixture(t)
+			params := submissionParams("reobserve", "child", "codex", t.TempDir(), "continue")
+			params.TaskSpec.ResumeJobID = root.JobID
+			params.TaskSpec.RetainSession = true
+			child := submitResultForTest(t, submitForTest(t, s, params))
+			fixture := newOrphanReaperFixture()
+			s.processTable = summaryProcessTable{alive: false}
+			s.processGroups = fixture
+			s.processGroupGoneFn = fixture.processGroupGone
+			if _, err := store.MarkStarting(child.JobID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.RecordProcessClaim(child.JobID, fixture.claim()); err != nil {
+				t.Fatal(err)
+			}
+			before, err := store.MarkTerminal(child.JobID, jobstore.TerminalUpdate{
+				State: protocol.PublicStateCompleted, Cleanup: protocol.CleanupUncertain,
+				BackendSessionID: "thread-child", ResultText: "accepted answer",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if outcome := s.handleSessionDiscard(mustJSON(t, protocol.SessionDiscardParams{JobID: root.JobID})); outcome.err == nil || outcome.err.Data.Reason != protocol.SessionDiscardCleanupUncertain {
+				t.Fatalf("live group discard = %#v", outcome.err)
+			}
+			if path == "resume" {
+				resume := submissionParams("reobserve", "next", "codex", t.TempDir(), "continue again")
+				resume.TaskSpec.ResumeJobID = child.JobID
+				if outcome := submitForTest(t, s, resume); outcome.err == nil || !strings.Contains(outcome.err.Message, "cleanup_uncertain") {
+					t.Fatalf("live group resume = %#v", outcome.err)
+				}
+			}
+			fixture.groupLive = false
+			if path == "wrong scope" {
+				s.processScopeFn = func() (jobstore.ProcessScope, error) {
+					scope := testProcessScope()
+					scope.BootID = "other-boot"
+					return scope, nil
+				}
+				if err := s.reconcileRecoveredJobs(store); err != nil {
+					t.Fatal(err)
+				}
+				if outcome := s.handleSessionDiscard(mustJSON(t, protocol.SessionDiscardParams{JobID: root.JobID})); outcome.err == nil || outcome.err.Data.Reason != protocol.SessionDiscardCleanupUncertain {
+					t.Fatalf("wrong-scope discard = %#v", outcome.err)
+				}
+				s.processScopeFn = func() (jobstore.ProcessScope, error) { return testProcessScope(), nil }
+			}
+			if path == "reconciliation" {
+				if err := s.reconcileRecoveredJobs(store); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if path == "resume" {
+				resume := submissionParams("reobserve", "next", "codex", t.TempDir(), "continue again")
+				resume.TaskSpec.ResumeJobID = child.JobID
+				next := submitResultForTest(t, submitForTest(t, s, resume))
+				if outcome := s.handleJobCancel(mustJSON(t, protocol.JobCancelParams{JobID: next.JobID})); outcome.err != nil {
+					t.Fatalf("cancel admitted continuation = %#v", outcome.err)
+				}
+			}
+			if path == "disposal" || path == "wrong scope" {
+				if outcome := s.handleSessionDiscard(mustJSON(t, protocol.SessionDiscardParams{JobID: root.JobID})); outcome.err != nil {
+					t.Fatalf("discard after group exit = %#v", outcome.err)
+				}
+			}
+			after, err := store.Get(child.JobID)
+			if err != nil || after.Cleanup != protocol.CleanupClean {
+				t.Fatalf("reobserved child = %#v, error %v", after, err)
+			}
+			after.Cleanup = before.Cleanup
+			if !reflect.DeepEqual(before, after) {
+				t.Fatalf("cleanup reobservation changed the accepted outcome: before=%#v after=%#v", before, after)
+			}
+			if replay := submitResultForTest(t, submitForTest(t, s, params)); !replay.Deduplicated || replay.JobID != child.JobID {
+				t.Fatalf("request replay = %#v", replay)
+			}
+			if outcome := s.handleSessionDiscard(mustJSON(t, protocol.SessionDiscardParams{JobID: root.JobID})); outcome.err != nil {
+				t.Fatalf("discard after group exit = %#v", outcome.err)
+			}
+			if len(fixture.signals) != 0 {
+				t.Fatalf("reobservation sent signals: %#v", fixture.signals)
+			}
+		})
+	}
+}
+
+func TestLineageMembersDecodesEachSpecOnce(t *testing.T) {
+	const count = 1000
+	records := make(map[string]jobstore.Record, count)
+	for i := 0; i < count; i++ {
+		id := fmt.Sprintf("job-%04d", i)
+		spec := protocol.TaskSpec{Backend: "codex", CWD: "/workspace", Prompt: "task", Intent: engine.IntentInspect}
+		if i > 0 {
+			spec.ResumeJobID = fmt.Sprintf("job-%04d", i-1)
+		}
+		raw, err := json.Marshal(spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		records[id] = jobstore.Record{JobID: id, Backend: "codex", Intent: engine.IntentInspect, TaskSpec: raw}
+	}
+	decodes := make(map[string]int, count)
+	root, members, err := lineageMembersDecoded(records, fmt.Sprintf("job-%04d", count-1), func(record jobstore.Record) (protocol.TaskSpec, error) {
+		decodes[record.JobID]++
+		return taskSpecFromRecord(record)
+	})
+	if err != nil || root.JobID != "job-0000" || len(members) != count || len(decodes) != count {
+		t.Fatalf("root=%q members=%d decodes=%d error=%v", root.JobID, len(members), len(decodes), err)
+	}
+	for id, n := range decodes {
+		if n != 1 {
+			t.Fatalf("job %s decoded %d times", id, n)
+		}
+	}
+}
+
+func TestLineageMembersRejectsRelatedInvalidLinks(t *testing.T) {
+	makeRecord := func(id, backend, parent string) jobstore.Record {
+		spec := protocol.TaskSpec{Backend: backend, CWD: "/workspace", Prompt: "task", Intent: engine.IntentInspect, ResumeJobID: parent}
+		raw, err := json.Marshal(spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return jobstore.Record{JobID: id, Backend: backend, Intent: engine.IntentInspect, TaskSpec: raw}
+	}
+	records := map[string]jobstore.Record{
+		"root":      makeRecord("root", "codex", ""),
+		"child":     makeRecord("child", "codex", "root"),
+		"unrelated": makeRecord("unrelated", "codex", "missing"),
+		"cycle-a":   makeRecord("cycle-a", "codex", "cycle-b"),
+		"cycle-b":   makeRecord("cycle-b", "codex", "cycle-a"),
+	}
+	root, members, err := lineageMembers(records, "child")
+	if err != nil || root.JobID != "root" || len(members) != 2 {
+		t.Fatalf("unrelated invalid links blocked lineage: root=%q members=%d error=%v", root.JobID, len(members), err)
+	}
+	records["wrong-backend"] = makeRecord("wrong-backend", "other", "root")
+	if _, _, err := lineageMembers(records, "child"); err == nil {
+		t.Fatal("mixed-backend link into the root did not block lineage")
+	}
+	if _, _, err := lineageMembers(records, "cycle-a"); err == nil {
+		t.Fatal("cyclic target was accepted")
+	}
+}
 
 func ownedLineageFixture(t *testing.T) (*Server, *jobstore.Store, jobstore.Record, string) {
 	t.Helper()

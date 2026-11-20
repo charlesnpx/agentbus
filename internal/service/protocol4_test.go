@@ -142,6 +142,7 @@ func TestRecoveryRejectsMismatchedOrUnreadableScope(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			fixture := newOrphanReaperFixture()
+			fixture.groupLive = false
 			server := &Server{processTable: fixture, processGroups: fixture, processGroupGoneFn: fixture.processGroupGone}
 			scope := testProcessScope()
 			server.processScopeFn = func() (jobstore.ProcessScope, error) {
@@ -155,8 +156,8 @@ func TestRecoveryRejectsMismatchedOrUnreadableScope(t *testing.T) {
 				tc.change(&claim.Scope)
 			}
 			cleanup, diagnostics := server.terminateRecordedProcessClaim(&claim)
-			if cleanup != protocol.CleanupUncertain || len(diagnostics) == 0 || fixture.lookups != 0 || len(fixture.signals) != 0 {
-				t.Fatalf("cleanup=%s diagnostics=%v lookups=%d signals=%v", cleanup, diagnostics, fixture.lookups, fixture.signals)
+			if cleanup != protocol.CleanupUncertain || len(diagnostics) == 0 || len(fixture.signals) != 0 {
+				t.Fatalf("cleanup=%s diagnostics=%v signals=%v", cleanup, diagnostics, fixture.signals)
 			}
 		})
 	}

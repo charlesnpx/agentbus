@@ -36,7 +36,9 @@ retries any incomplete removal.
 
 To reclaim an inactive owned Codex conversation, run
 `agentbus session discard <job-id>`. It durably revokes continuation for the entire lineage before
-removing the root home. Active or cleanup-uncertain lineages are refused.
+removing the root home. Active or cleanup-uncertain lineages are refused. Before
+refusing for uncertain cleanup, the daemon rechecks whether the recorded process
+group is absent in its original process scope.
 Repeated calls can retry a failed removal; job history, results, and observed
 provider IDs remain. Retained provider data has no automatic expiry.
 
@@ -92,13 +94,16 @@ Recovered work is never launched again:
 
 - A recovered queued job becomes failed with failure class internal.
 - A recovered running job becomes unknown.
-- A terminal record is preserved.
+- A terminal outcome and result are preserved; cleanup evidence can improve.
 
 For a recovered process claim, the daemon checks boot ID, state-root device
-and inode, Linux PID namespace, and the exact live PID, start token, and
-process group before signaling. It repeats the checks before escalation. It
-records cleanup as uncertain when cleanup cannot be established. Cleanup uncertainty does not
-erase a recorded completed result.
+and inode, and Linux PID namespace before inspecting a recorded process group.
+An absent group in that matching scope establishes clean cleanup even if its
+leader has exited. A group that remains requires the exact live PID, start
+token, and process group before signaling; these checks repeat before escalation.
+Different or unreadable scopes remain uncertain. Startup, resume admission, and
+session disposal can recheck terminal uncertainty as a group exits; this never
+signals a process or changes the execution outcome, result, or request identity.
 
 Replacing the Agentbus binary makes a stale daemon finish accepted work and
 exit after active work and admission handling settle; installs do not signal it.
