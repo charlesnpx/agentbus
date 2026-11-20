@@ -38,15 +38,7 @@ var (
 // EmitFunc emits one engine event from a driver.
 type EmitFunc func(engine.Event)
 
-const resultSegmentBoundaryEvent = "duplex.ResultSegmentBoundary"
 const orderedFrameDropEvent = "duplex.OrderedFrameDrop"
-
-// ResultSegmentBoundary returns a driver control event that clears the
-// fallback segment at an interrupt/continue boundary. The shared emitter
-// consumes it without exposing it to callers.
-func ResultSegmentBoundary() engine.Event {
-	return engine.Event{Type: resultSegmentBoundaryEvent}
-}
 
 // OrderedFrameDrop reports one recoverable omission before a driver consumes
 // any subsequent frame. The emitter accounts for it only after delivery.
@@ -108,8 +100,9 @@ type activeTurn struct {
 }
 
 type retirement struct {
-	done        chan struct{}
-	observation command.FinalObservation
+	done                  chan struct{}
+	observation           command.FinalObservation
+	deadlineExpiredAtWait bool
 }
 
 type turnResult struct {
@@ -383,7 +376,8 @@ func (s *Session) runTurn(driverCtx context.Context, driverCancel context.Cancel
 		active.conn.drainReader()
 		close(drainDone)
 	}()
-	observation, normalRetirement := waitForTurnRetirement(active)
+	settledBeforeDeadline := !earlyExit && !abandoned && !dispositionAtResult.timedOut && !dispositionAtResult.canceled
+	observation, normalRetirement := waitForTurnRetirement(active, settledBeforeDeadline)
 	if abandoned {
 		normalRetirement = false
 	}
@@ -544,13 +538,16 @@ func waitForTurnResult(ctx context.Context, driverDone <-chan turnResult, retire
 	}
 }
 
-// waitForTurnRetirement preserves the old prompt-retirement observation. Once
-// that grace is exhausted, the process interrupt is best-effort and any
-// observation it produces is intentionally discarded: it describes teardown,
-// not the already-settled semantic turn. A zero observation keeps execution
-// failure and return-code fields unknown instead of manufacturing a failure.
-func waitForTurnRetirement(active *activeTurn) (command.FinalObservation, bool) {
+// waitForTurnRetirement preserves a prompt-retirement observation unless a
+// turn had already settled before its deadline terminated the
+// process. Once the grace is exhausted, the process interrupt is best-effort;
+// its exit observation likewise describes teardown, not the semantic turn.
+// In either case, retain cleanup uncertainty independently.
+func waitForTurnRetirement(active *activeTurn, settledBeforeDeadline bool) (command.FinalObservation, bool) {
 	if observation, ok := waitForRetirement(active.retirement, turnRetirementGrace); ok {
+		if settledBeforeDeadline && active.retirement.deadlineExpiredAtWait {
+			return command.FinalObservation{CleanupErr: observation.CleanupErr}, observation.CleanupErr == nil
+		}
 		return observation, observation.CleanupErr == nil
 	}
 
@@ -722,7 +719,7 @@ func collectNativeInterruptErr(nativeDone <-chan error, nativeErr error) error {
 func startRetirement(ctx context.Context, running command.RunningCommand) *retirement {
 	retirement := &retirement{done: make(chan struct{})}
 	go func() {
-		retirement.observation = finalObservation(ctx, running)
+		retirement.observation, retirement.deadlineExpiredAtWait = finalObservation(ctx, running)
 		close(retirement.done)
 	}()
 	return retirement
@@ -741,8 +738,17 @@ func (r *retirement) wait(ctx context.Context) (command.FinalObservation, error)
 	}
 }
 
-func finalObservation(ctx context.Context, running command.RunningCommand) command.FinalObservation {
+func finalObservation(ctx context.Context, running command.RunningCommand) (command.FinalObservation, bool) {
 	exit, waitErr := running.Wait(ctx)
+	// Capture the deadline at process wait completion, before FinalObservation
+	// may spend additional time resolving cleanup. A later deadline must not
+	// obscure an execution failure that was already observed.
+	deadlineExpired := false
+	select {
+	case <-ctx.Done():
+		deadlineExpired = errors.Is(ctx.Err(), context.DeadlineExceeded)
+	default:
+	}
 	if observer, ok := running.(command.FinalObserver); ok {
 		observation, err := observer.FinalObservation(context.WithoutCancel(ctx))
 		if observation.Exit == (command.ExitObservation{}) {
@@ -751,9 +757,9 @@ func finalObservation(ctx context.Context, running command.RunningCommand) comma
 		if observation.ExecutionErr == nil && observation.CleanupErr == nil {
 			observation.ExecutionErr = errors.Join(waitErr, err)
 		}
-		return observation
+		return observation, deadlineExpired
 	}
-	return command.FinalObservation{Exit: exit, ExecutionErr: waitErr}
+	return command.FinalObservation{Exit: exit, ExecutionErr: waitErr}, deadlineExpired
 }
 
 func (s *Session) setID(id string) {
@@ -868,9 +874,6 @@ func turnEmitter(events chan<- engine.Event, drops *frameDropTracker) *eventEmit
 }
 
 func (emitter *eventEmitter) emit(ev engine.Event) {
-	if ev.Type == resultSegmentBoundaryEvent {
-		return
-	}
 	orderedDrop := ev.Type == orderedFrameDropEvent
 	if orderedDrop {
 		ev.Type = engine.EventWarning

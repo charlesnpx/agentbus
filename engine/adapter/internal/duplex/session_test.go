@@ -711,6 +711,100 @@ func TestTurnFinalKeepsSettlementDispositionWhenDeadlineExpiresDuringTeardown(t 
 	}
 }
 
+func TestSuccessfulTurnSurvivesDeadlineTerminationDuringRetirement(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	proc := newFakeCommand()
+	proc.waitIgnoresContext = true
+	executionErr := errors.New("signal: killed")
+	cleanupErr := errors.New("process cleanup uncertain")
+	exit := command.ExitObservation{Code: -1, Signal: "killed"}
+	observed := newFakeObservedCommand(proc, command.FinalObservation{
+		Exit:         exit,
+		ExecutionErr: executionErr,
+		CleanupErr:   cleanupErr,
+	}, nil)
+	t.Cleanup(func() {
+		proc.finish(exit, executionErr)
+		_ = proc.stdinR.Close()
+		_ = proc.stdoutW.Close()
+		_ = proc.stderrW.Close()
+	})
+	session := newFixtureSession(t, &fakeRunner{running: observed}, 0, "")
+
+	peerDone := make(chan error, 1)
+	go func() {
+		scanner := bufio.NewScanner(proc.stdinR)
+		if !scanner.Scan() {
+			peerDone <- fmt.Errorf("prompt frame missing: %v", scanner.Err())
+			return
+		}
+		if _, err := fmt.Fprintln(proc.stdoutW, `{"type":"complete","text":"done","resumeId":"resume-settled"}`); err != nil {
+			peerDone <- err
+			return
+		}
+		if scanner.Scan() {
+			peerDone <- fmt.Errorf("unexpected stdin frame: %s", scanner.Text())
+			return
+		}
+		peerDone <- scanner.Err()
+	}()
+
+	events, err := session.Turn(ctx, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "turn"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-peerDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for stdin to close after semantic completion")
+	}
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("deadline expired before semantic completion was accepted: %v", err)
+	}
+	select {
+	case <-proc.waitCh:
+		t.Fatal("process retired before the deadline")
+	default:
+	}
+	<-ctx.Done()
+	// Simulate the direct runner's deadline termination while the first
+	// retirement window is still open.
+	proc.finish(exit, executionErr)
+	_ = proc.stdoutW.Close()
+	_ = proc.stderrW.Close()
+
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	if len(got) == 0 || got[len(got)-1].Type != engine.EventTurnFinal || got[len(got)-1].TurnFinal == nil {
+		t.Fatalf("events = %#v, want final TurnFinal event", got)
+	}
+	wantFinal := engine.TurnFinalObservation{BackendSessionID: "resume-settled", CleanupFailed: true}
+	if final := *got[len(got)-1].TurnFinal; final != wantFinal {
+		t.Fatalf("TurnFinal = %#v, want %#v", final, wantFinal)
+	}
+	var sawResult, sawCleanupWarning bool
+	for _, event := range got {
+		switch event.Type {
+		case engine.EventResultMessage:
+			sawResult = event.Text == "done"
+		case engine.EventWarning:
+			sawCleanupWarning = strings.Contains(event.Text, cleanupErr.Error())
+		case engine.EventTerminalError:
+			t.Fatalf("deadline termination emitted a terminal error: %#v", got)
+		}
+	}
+	if !sawResult || !sawCleanupWarning {
+		t.Fatalf("events = %#v, want successful result and independent cleanup warning", got)
+	}
+	if got := proc.interrupts.Load(); got != 0 {
+		t.Fatalf("retirement interrupt count = %d, want 0 in the first window", got)
+	}
+}
+
 func TestTurnKeepsDriverErrorWhenDeadlineExpiresDuringRetirement(t *testing.T) {
 	baseCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
