@@ -76,15 +76,24 @@ func (s *Server) handleJobSubmit(raw json.RawMessage) requestOutcome {
 	// original job.
 	s.submissionMu.Lock()
 	defer s.submissionMu.Unlock()
-	// The snapshot is consulted only by the new-binding factory below, after
-	// SubmitTx has resolved exact replays. Ordinary new conversations do not
-	// need to scan the lineage history.
-	var records map[string]jobstore.Record
+	// Prepare lineage and reobserve cleanup before entering the write
+	// transaction. The factory applies validation errors only to new bindings,
+	// after SubmitTx has resolved exact replays. New conversations need no scan.
+	var root jobstore.Record
+	var members []jobstore.Record
 	var active map[string]bool
 	var snapshotErr error
+	var lineageErr error
 	var resumeID string
 	if json.Unmarshal(input.taskSpec["resumeJobId"], &resumeID) == nil && resumeID != "" {
+		var records map[string]jobstore.Record
 		records, active, snapshotErr = s.lineageSnapshot(store)
+		if snapshotErr == nil {
+			root, members, lineageErr = lineageMembers(records, resumeID)
+			if lineageErr == nil {
+				snapshotErr = s.reobserveLineageCleanup(store, members, active)
+			}
+		}
 	}
 	backendName := taskSpecBackendName(input.taskSpec)
 	queueFullAtAdmission := backendName != "" && s.queueWouldExceed(backendName)
@@ -103,7 +112,10 @@ func (s *Server) handleJobSubmit(raw json.RawMessage) requestOutcome {
 			if snapshotErr != nil {
 				return jobstore.Record{}, snapshotErr
 			}
-			if err := s.validateResumeLineage(spec, records, active); err != nil {
+			if lineageErr != nil {
+				return jobstore.Record{}, &resumeTargetError{jobID: spec.ResumeJobID, cause: lineageErr}
+			}
+			if err := s.validateResumeLineage(spec, root, members, active); err != nil {
 				return jobstore.Record{}, err
 			}
 			if _, err := s.resumeTargetFromLookup(spec, lookup); err != nil {

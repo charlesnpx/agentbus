@@ -517,7 +517,12 @@ func (s *Server) resumableProjection(record jobstore.Record) *protocol.Resumable
 	}
 	records, active, err := s.lineageSnapshot(store)
 	if err == nil {
-		err = s.validateResumeLineage(spec, records, active)
+		var root jobstore.Record
+		var members []jobstore.Record
+		root, members, err = lineageMembers(records, spec.ResumeJobID)
+		if err == nil {
+			err = s.validateResumeLineage(spec, root, members, active)
+		}
 	}
 	if err != nil {
 		return &protocol.ResumableProjection{Eligible: false, Reason: err.Error()}
@@ -667,8 +672,8 @@ func logEndsWithTruncationMarker(path string) *bool {
 }
 
 // reconcileRecoveredJobs is intentionally called before the listener exists.
-// It snapshots all records once, never enqueues recovered work, and writes
-// only records that were nonterminal or had admitted steers in that snapshot.
+// It snapshots all records once and never enqueues recovered work. Terminal
+// outcomes are preserved while cleanup evidence may become more certain.
 func (s *Server) reconcileRecoveredJobs(store *jobstore.Store) error {
 	if store == nil {
 		return errors.New("restart reconciliation requires a job store")
@@ -710,9 +715,11 @@ func (s *Server) reconcileRecoveredJobs(store *jobstore.Store) error {
 				FinishedAt: time.Now().UTC(),
 			}
 		default:
-			// A terminal record is deliberately untouched. In particular, do
-			// not use MarkTerminal here: even a logically equivalent rewrite
-			// would violate the byte-for-byte preservation requirement.
+			if record.State.IsTerminal() && record.Cleanup == protocol.CleanupUncertain {
+				if _, err := s.reobserveTerminalCleanup(store, record); err != nil {
+					return fmt.Errorf("reobserve cleanup for job %s: %w", record.JobID, err)
+				}
+			}
 			continue
 		}
 		_, err = store.MarkTerminal(record.JobID, terminal)
@@ -798,22 +805,20 @@ func (diagnostic processClaimDiagnostic) exact() bool {
 	return diagnostic.message == ""
 }
 
-// terminateRecordedProcessClaim is the reaper's only signaling path. It
-// proves exact live-leader token equality immediately before TERM and again
-// before KILL. Any missing, unreadable, or changed identity is an uncertainty
-// result and deliberately sends no group signal.
+// terminateRecordedProcessClaim is the reaper's only signaling path. Group
+// absence needs a matching scope, while signaling additionally requires exact
+// live-leader identity immediately before TERM and again before KILL.
 func (s *Server) terminateRecordedProcessClaim(claim *jobstore.ProcessClaim) (protocol.Cleanup, []string) {
-	if diagnostic := s.exactClaimDiagnostic(claim); !diagnostic.exact() {
+	gone, diagnostic := s.observeRecordedProcessGroup(claim)
+	if !diagnostic.exact() {
 		return protocol.CleanupUncertain, []string{diagnostic.message}
 	}
-	if gone, err := s.processGroupGone(claim.PGID); err != nil {
-		return protocol.CleanupUncertain, []string{"orphan reaper: inspect process group: " + err.Error()}
-	} else if gone {
+	if gone {
 		return protocol.CleanupClean, nil
 	}
-	// Inspecting group existence is not an identity proof. Repeat the exact
-	// leader-token comparison immediately before the first signal so a PID
-	// recycled in that small observation window is never targeted.
+	// Inspecting group existence is not an identity proof. Check the exact
+	// leader token immediately before the first signal so a PID recycled in
+	// that small observation window is never targeted.
 	if diagnostic := s.exactClaimDiagnostic(claim); !diagnostic.exact() {
 		return protocol.CleanupUncertain, []string{diagnostic.message}
 	}
@@ -838,7 +843,37 @@ func (s *Server) terminateRecordedProcessClaim(claim *jobstore.ProcessClaim) (pr
 	return protocol.CleanupUncertain, []string{"orphan reaper: process group did not exit within cancellation grace"}
 }
 
-func (s *Server) exactClaimDiagnostic(claim *jobstore.ProcessClaim) processClaimDiagnostic {
+// reobserveTerminalCleanup never signals and never changes the terminal outcome.
+func (s *Server) reobserveTerminalCleanup(store *jobstore.Store, record jobstore.Record) (jobstore.Record, error) {
+	if !record.State.IsTerminal() || record.Cleanup != protocol.CleanupUncertain {
+		return record, nil
+	}
+	// A failed claim can mean a process was never recorded, or more than one
+	// process was reported. The one stored group cannot prove all are gone.
+	for _, diagnostic := range record.Diagnostics {
+		if strings.HasPrefix(diagnostic, "process claim: ") {
+			return record, nil
+		}
+	}
+	gone, diagnostic := s.observeRecordedProcessGroup(record.ProcessClaim)
+	if !diagnostic.exact() || !gone {
+		return record, nil
+	}
+	return store.MarkCleanupClean(record.JobID, *record.ProcessClaim)
+}
+
+func (s *Server) observeRecordedProcessGroup(claim *jobstore.ProcessClaim) (bool, processClaimDiagnostic) {
+	if diagnostic := s.claimScopeDiagnostic(claim); !diagnostic.exact() {
+		return false, diagnostic
+	}
+	gone, err := s.processGroupGone(claim.PGID)
+	if err != nil {
+		return false, processClaimDiagnostic{message: "orphan reaper: inspect process group: " + err.Error(), liveness: protocol.LivenessUnknown}
+	}
+	return gone, processClaimDiagnostic{}
+}
+
+func (s *Server) claimScopeDiagnostic(claim *jobstore.ProcessClaim) processClaimDiagnostic {
 	if claim == nil {
 		return processClaimDiagnostic{
 			message:  "orphan reaper: process claim is missing; no signal sent",
@@ -851,6 +886,19 @@ func (s *Server) exactClaimDiagnostic(claim *jobstore.ProcessClaim) processClaim
 	}
 	if claim.Scope.Validate() != nil || currentScope.Validate() != nil || claim.Scope != currentScope {
 		return processClaimDiagnostic{message: "orphan reaper: process scope mismatch; no signal sent", liveness: protocol.LivenessUnknown}
+	}
+	if claim.PGID <= 0 {
+		return processClaimDiagnostic{
+			message:  "orphan reaper: process group id is invalid; no signal sent",
+			liveness: protocol.LivenessUnknown,
+		}
+	}
+	return processClaimDiagnostic{}
+}
+
+func (s *Server) exactClaimDiagnostic(claim *jobstore.ProcessClaim) processClaimDiagnostic {
+	if diagnostic := s.claimScopeDiagnostic(claim); !diagnostic.exact() {
+		return diagnostic
 	}
 	if claim.PID <= 0 || claim.PGID != claim.PID || claim.StartToken == "" {
 		return processClaimDiagnostic{
