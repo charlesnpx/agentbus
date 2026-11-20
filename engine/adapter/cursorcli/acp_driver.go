@@ -548,35 +548,18 @@ func (c *acpRPC) awaitResponse(ctx context.Context, method, id string, observer 
 }
 
 func (c *acpRPC) nextFrame(ctx context.Context) (duplex.Frame, error) {
-	frames := c.conn.Frames()
-	decodeErrs := c.conn.DecodeErrors()
-	for frames != nil || decodeErrs != nil {
-		select {
-		case frame, ok := <-frames:
-			if !ok {
-				if err := pendingDecodeError(c.conn); err != nil {
-					return duplex.Frame{}, err
-				}
-				frames = nil
-				continue
-			}
-			if frame.Err != nil {
-				return duplex.Frame{}, cursorTransportReadError(frame.Err)
-			}
-			return frame, nil
-		case err, ok := <-decodeErrs:
-			if !ok {
-				decodeErrs = nil
-				continue
-			}
-			if err != nil {
-				return duplex.Frame{}, cursorTransportReadError(err)
-			}
-		case <-ctx.Done():
-			return duplex.Frame{}, ctx.Err()
+	select {
+	case frame, ok := <-c.conn.Frames():
+		if !ok {
+			return duplex.Frame{}, duplex.ErrBackendExitedBeforeTerminal
 		}
+		if frame.Err != nil {
+			return duplex.Frame{}, cursorTransportReadError(frame.Err)
+		}
+		return frame, nil
+	case <-ctx.Done():
+		return duplex.Frame{}, ctx.Err()
 	}
-	return duplex.Frame{}, duplex.ErrBackendExitedBeforeTerminal
 }
 
 func cursorTransportReadError(err error) error {
@@ -996,15 +979,4 @@ func requestIDKey(id any) string {
 		}
 	}
 	return fmt.Sprint(id)
-}
-
-func pendingDecodeError(conn *duplex.Conn) error {
-	select {
-	case err, ok := <-conn.DecodeErrors():
-		if ok {
-			return err
-		}
-	default:
-	}
-	return nil
 }

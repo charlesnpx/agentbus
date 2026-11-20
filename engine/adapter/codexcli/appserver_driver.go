@@ -534,17 +534,11 @@ func (c *appServerRPC) request(ctx context.Context, method string, params any, o
 }
 
 func (c *appServerRPC) nextFrame(ctx context.Context) (duplex.Frame, error) {
-	frames := c.conn.Frames()
-	decodeErrs := c.conn.DecodeErrors()
-	for frames != nil || decodeErrs != nil {
+	for {
 		select {
-		case frame, ok := <-frames:
+		case frame, ok := <-c.conn.Frames():
 			if !ok {
-				if err := pendingDecodeError(c.conn); err != nil {
-					return duplex.Frame{}, err
-				}
-				frames = nil
-				continue
+				return duplex.Frame{}, duplex.ErrBackendExitedBeforeTerminal
 			}
 			if frame.Err != nil {
 				var overlong *duplex.OverlongFrameError
@@ -557,19 +551,10 @@ func (c *appServerRPC) nextFrame(ctx context.Context) (duplex.Frame, error) {
 				return duplex.Frame{}, codexTransportReadError(frame.Err)
 			}
 			return frame, nil
-		case err, ok := <-decodeErrs:
-			if !ok {
-				decodeErrs = nil
-				continue
-			}
-			if err != nil {
-				return duplex.Frame{}, codexTransportReadError(err)
-			}
 		case <-ctx.Done():
 			return duplex.Frame{}, ctx.Err()
 		}
 	}
-	return duplex.Frame{}, duplex.ErrBackendExitedBeforeTerminal
 }
 
 func codexTransportReadError(err error) error {
@@ -792,20 +777,16 @@ func emitCodexSelection(model, effort string, emit duplex.EmitFunc) {
 
 type turnObserver struct {
 	emit               duplex.EmitFunc
-	agentItems         map[string]*agentItem
+	agentItems         map[string]bool // whether a streamed item has emitted a delta
 	latestAgentItem    string
+	latestAgentDelta   strings.Builder
+	latestCompleted    *string
+	inventoryText      *string
 	terminalText       *string
 	pendingToolItems   map[string]pendingToolItem
 	pendingToolItemIDs []string
 	emittedToolItemIDs map[string]struct{}
 	completion         *turnCompletion
-}
-
-type agentItem struct {
-	delta         strings.Builder
-	deltaSeen     bool
-	completedText string
-	completed     bool
 }
 
 type pendingToolItem struct {
@@ -848,11 +829,15 @@ func (o *turnObserver) handleItem(method string, payload map[string]any, metadat
 	kind := normalizeKind(firstString(item, "type"))
 	switch kind {
 	case "agentmessage", "assistantmessage", "message":
-		entry := o.observeAgentItem(agentDeltaItemIDOrDefault(payload))
+		itemID := agentDeltaItemIDOrDefault(payload)
+		o.observeAgentItem(itemID)
 		if method == "item/completed" {
 			if text, present := agentMessageText(item); present {
-				entry.completed, entry.completedText = true, text
-				if !entry.deltaSeen && text != "" {
+				if itemID == o.latestAgentItem {
+					o.latestAgentDelta.Reset()
+					o.latestCompleted = &text
+				}
+				if !o.agentItems[itemID] && text != "" {
 					o.emitEvent(engine.Event{Type: engine.EventAgentText, Text: text, Metadata: metadata})
 				}
 			}
@@ -950,15 +935,18 @@ func (o *turnObserver) emitToolItem(item map[string]any, metadata map[string]any
 func (o *turnObserver) complete(payload map[string]any) {
 	turn, _ := firstMap(payload, "turn")
 	if turn != nil {
-		for _, raw := range anySlice(turn["items"]) {
-			item, ok := raw.(map[string]any)
+		// The terminal inventory is ordered independently of streamed arrival.
+		items := anySlice(turn["items"])
+		for i := len(items) - 1; i >= 0; i-- {
+			item, ok := items[i].(map[string]any)
 			if !ok || normalizeKind(firstString(item, "type")) != "agentmessage" {
 				continue
 			}
-			entry := o.observeAgentItem(agentDeltaItemIDOrDefault(map[string]any{"item": item}))
 			if text, present := agentMessageText(item); present {
-				entry.completed, entry.completedText = true, text
+				o.inventoryText = &text
 			}
+			// If the final assistant item has no text, use the streamed fallback.
+			break
 		}
 	}
 	for _, key := range []string{"last_agent_message", "lastAgentMessage"} {
@@ -1017,36 +1005,38 @@ func (o *turnObserver) emitEvent(ev engine.Event) {
 
 const defaultAgentDeltaItemID = "\x00agent-delta-default"
 
-func (o *turnObserver) observeAgentItem(itemID string) *agentItem {
+func (o *turnObserver) observeAgentItem(itemID string) {
 	if o.agentItems == nil {
-		o.agentItems = make(map[string]*agentItem)
+		o.agentItems = make(map[string]bool)
 	}
-	item := o.agentItems[itemID]
-	if item == nil {
-		item = &agentItem{}
-		o.agentItems[itemID] = item
+	if _, seen := o.agentItems[itemID]; !seen {
+		o.agentItems[itemID] = false
 		o.latestAgentItem = itemID
+		o.latestAgentDelta.Reset()
+		o.latestCompleted = nil
 	}
-	return item
 }
 
 func (o *turnObserver) appendAgentDelta(payload map[string]any, text string) {
-	item := o.observeAgentItem(agentDeltaItemIDOrDefault(payload))
-	item.deltaSeen = true
-	item.delta.WriteString(text)
+	itemID := agentDeltaItemIDOrDefault(payload)
+	o.observeAgentItem(itemID)
+	o.agentItems[itemID] = true
+	if itemID == o.latestAgentItem && o.latestCompleted == nil {
+		o.latestAgentDelta.WriteString(text)
+	}
 }
 
 func (o *turnObserver) resultText() string {
 	if o.terminalText != nil {
 		return *o.terminalText
 	}
-	if item := o.agentItems[o.latestAgentItem]; item != nil {
-		if item.completed {
-			return item.completedText
-		}
-		return item.delta.String()
+	if o.inventoryText != nil {
+		return *o.inventoryText
 	}
-	return ""
+	if o.latestCompleted != nil {
+		return *o.latestCompleted
+	}
+	return o.latestAgentDelta.String()
 }
 
 func agentMessageText(item map[string]any) (string, bool) {
@@ -1426,17 +1416,6 @@ func requestIDKey(id any) string {
 		}
 	}
 	return fmt.Sprint(id)
-}
-
-func pendingDecodeError(conn *duplex.Conn) error {
-	select {
-	case err, ok := <-conn.DecodeErrors():
-		if ok {
-			return err
-		}
-	default:
-	}
-	return nil
 }
 
 func firstAny(obj map[string]any, keys ...string) any {
