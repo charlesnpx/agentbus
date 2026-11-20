@@ -504,7 +504,7 @@ func TestJobListProjectsActiveActivityAndLiveness(t *testing.T) {
 	if _, err := store.MarkStarting(submitted.JobID); err != nil {
 		t.Fatal(err)
 	}
-	claim := jobstore.ProcessClaim{PID: 7191, PGID: 7191, StartToken: "activity-token"}
+	claim := jobstore.ProcessClaim{PID: 7191, PGID: 7191, StartToken: "activity-token", Scope: testProcessScope()}
 	record, err := store.RecordProcessClaim(submitted.JobID, claim)
 	if err != nil {
 		t.Fatal(err)
@@ -527,8 +527,8 @@ func TestJobListProjectsActiveActivityAndLiveness(t *testing.T) {
 		table    summaryProcessTable
 		liveness protocol.Liveness
 	}{
-		{name: "matching claim", table: summaryProcessTable{info: engine.ProcessInfo{PID: claim.PID, StartTime: claim.StartToken}, alive: true}, liveness: protocol.LivenessAlive},
-		{name: "token mismatch", table: summaryProcessTable{info: engine.ProcessInfo{PID: claim.PID, StartTime: "recycled-token"}, alive: true}, liveness: protocol.LivenessGone},
+		{name: "matching claim", table: summaryProcessTable{info: engine.ProcessInfo{PID: claim.PID, PGID: claim.PGID, StartTime: claim.StartToken}, alive: true}, liveness: protocol.LivenessAlive},
+		{name: "token mismatch", table: summaryProcessTable{info: engine.ProcessInfo{PID: claim.PID, PGID: claim.PGID, StartTime: "recycled-token"}, alive: true}, liveness: protocol.LivenessGone},
 		{name: "unreadable claim", table: summaryProcessTable{err: errors.New("permission denied")}, liveness: protocol.LivenessUnknown},
 	} {
 		server.processTable = test.table
@@ -761,6 +761,7 @@ func TestJobCancelBetweenProcessStartAndClaimPersistenceKeepsClaim(t *testing.T)
 		return true, nil
 	}
 	run := newActiveExecution(record.JobID, backend)
+	run.claimScope = testProcessScope()
 	run.setSession(&executionFakeSession{})
 	run.beginTurn()
 	// This is the reachable state after OnProcessStart notes the identity and
@@ -831,10 +832,10 @@ func TestJobCancelDuringCorrectionPreservesRetiredTurnOutcome(t *testing.T) {
 					input.OnProcessStart(engine.ProcessRef{PID: 4113, PGID: 4113, StartTime: "initial-correction-token"}, 0)
 					return executionEvents(
 						engine.Event{Type: engine.EventResultMessage, Text: `{"wrong":true}`},
-						engine.Event{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{BackendSessionID: "thread-initial", CleanupFailed: true}},
+						engine.Event{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{BackendSessionID: "thread-initial"}},
 					), nil
 				case 2:
-					if input.Write {
+					if input.Intent != engine.IntentInspect {
 						t.Fatal("correction turn was write-enabled")
 					}
 					input.OnProcessStart(engine.ProcessRef{PID: 4114, PGID: 4114, StartTime: "correction-cancel-token"}, 0)
@@ -887,17 +888,8 @@ func TestJobCancelDuringCorrectionPreservesRetiredTurnOutcome(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored.State != protocol.PublicStateCanceled || stored.Cleanup != protocol.CleanupUncertain || stored.BackendSessionID != "thread-initial" {
-		t.Fatalf("canceled correction record = %#v, want canceled uncertain record with initial session", stored)
-	}
-	initialDiagnosticCount := 0
-	for _, diagnostic := range stored.Diagnostics {
-		if diagnostic == "backend reported uncertain cleanup" {
-			initialDiagnosticCount++
-		}
-	}
-	if initialDiagnosticCount != 1 {
-		t.Fatalf("canceled correction diagnostics = %#v, want one initial cleanup diagnostic", stored.Diagnostics)
+	if stored.State != protocol.PublicStateCanceled || stored.BackendSessionID != "thread-initial" {
+		t.Fatalf("canceled correction record = %#v, want canceled record with initial session", stored)
 	}
 }
 
@@ -1186,9 +1178,12 @@ func TestRestartDuringCorrectionPreservesRetiredSessionForResume(t *testing.T) {
 	if _, err := store.MarkStarting(submitted.JobID); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := store.AppendDiagnostic(submitted.JobID, "diagnostic before restart"); err != nil {
+		t.Fatal(err)
+	}
 	run := newActiveExecution(submitted.JobID, nil)
 	run.beginTurn()
-	if _, err := store.RecordProcessClaim(submitted.JobID, jobstore.ProcessClaim{PID: 2147483647, PGID: 2147483647, StartToken: "initial-turn-token"}); err != nil {
+	if _, err := store.RecordProcessClaim(submitted.JobID, jobstore.ProcessClaim{PID: 2147483647, PGID: 2147483647, StartToken: "initial-turn-token", Scope: testProcessScope()}); err != nil {
 		t.Fatal(err)
 	}
 	if retired := run.retireTurn(store, turnOutcome{backendSessionID: "thread-recovered", cleanup: protocol.CleanupClean}); retired.backendSessionID != "thread-recovered" {
@@ -1197,7 +1192,7 @@ func TestRestartDuringCorrectionPreservesRetiredSessionForResume(t *testing.T) {
 	// The initial turn has retired and its session write has committed before
 	// this second turn starts; restart reconciliation must retain that ID.
 	run.beginTurn()
-	if _, err := store.RecordProcessClaim(submitted.JobID, jobstore.ProcessClaim{PID: 2147483647, PGID: 2147483647, StartToken: "correction-turn-token"}); err != nil {
+	if _, err := store.RecordProcessClaim(submitted.JobID, jobstore.ProcessClaim{PID: 2147483647, PGID: 2147483647, StartToken: "correction-turn-token", Scope: testProcessScope()}); err != nil {
 		t.Fatal(err)
 	}
 	first.closeJobStore()
@@ -1216,6 +1211,9 @@ func TestRestartDuringCorrectionPreservesRetiredSessionForResume(t *testing.T) {
 	}
 	if stored.State != protocol.PublicStateUnknown || stored.Cleanup != protocol.CleanupUncertain || stored.BackendSessionID != "thread-recovered" {
 		t.Fatalf("reconciled running record = %#v", stored)
+	}
+	if !slices.Contains(stored.Diagnostics, "diagnostic before restart") {
+		t.Fatalf("reconciliation lost the existing diagnostic: %#v", stored.Diagnostics)
 	}
 	params := submissionParams("restart-resume-workspace", "restart-resume-request", "restart-running", t.TempDir(), "continue")
 	params.TaskSpec.ResumeJobID = submitted.JobID
@@ -1431,7 +1429,7 @@ func newOrphanReaperFixture() *orphanReaperFixture {
 }
 
 func (f *orphanReaperFixture) claim() jobstore.ProcessClaim {
-	return jobstore.ProcessClaim{PID: f.pid, PGID: f.pgid, StartToken: f.startToken}
+	return jobstore.ProcessClaim{PID: f.pid, PGID: f.pgid, StartToken: f.startToken, Scope: testProcessScope()}
 }
 
 func (f *orphanReaperFixture) Lookup(pid int) (engine.ProcessInfo, bool, error) {
@@ -1445,7 +1443,7 @@ func (f *orphanReaperFixture) Lookup(pid int) (engine.ProcessInfo, bool, error) 
 		startToken = f.lookupTokens[f.lookupIndex]
 	}
 	f.lookupIndex++
-	return engine.ProcessInfo{PID: f.pid, StartTime: startToken}, true, nil
+	return engine.ProcessInfo{PID: f.pid, PGID: f.pgid, StartTime: startToken}, true, nil
 }
 
 func (f *orphanReaperFixture) SignalProcessGroup(pgid int, signal syscall.Signal) error {
@@ -1564,7 +1562,7 @@ func startProcessGroup(t *testing.T, readyLine string, argv ...string) (*exec.Cm
 			t.Fatalf("TERM-ignore readiness = %q, want %q", line, readyLine)
 		}
 	}
-	return cmd, jobstore.ProcessClaim{PID: pid, PGID: pgid, StartToken: info.StartTime}
+	return cmd, jobstore.ProcessClaim{PID: pid, PGID: pgid, StartToken: info.StartTime, Scope: testProcessScope()}
 }
 
 func stopProcessGroupFixture(t *testing.T, cmd *exec.Cmd) {

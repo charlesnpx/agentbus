@@ -1,11 +1,13 @@
 # Agentbus ADR index
 
-ADR-14 is the sole normative decision record for the current release.
+ADR-15 supersedes the conflicting protocol, sandbox, and cache decisions in
+ADR-14. The remaining simplified-core decisions in ADR-14 continue to apply.
 
 ## Current
 
 | ADR | Decision |
 | --- | --- |
+| [ADR-15](ADR-15-protocol4-intent.md) | Protocol 4, format 2, explicit intent, one execution policy, and ordinary caches. |
 | [ADR-14](ADR-14-simplified-core.md) | Simplified core: one bbolt job service, four RPC methods, six public states, inline JSON Schema validation, and process-group supervision. |
 
 ## Historical

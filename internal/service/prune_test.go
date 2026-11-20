@@ -47,10 +47,6 @@ func TestPruneDryRunApplyEligibilityAndTranscriptMarker(t *testing.T) {
 	for _, record := range []jobstore.Record{retained, resumable, uncertain, queued, running, young} {
 		protectedLogs = append(protectedLogs, writePruneTestLogs(t, record, map[string]string{"stdout": "keep"})...)
 	}
-	completedHome, outsideFile := writePruneTestCodexArtifacts(t, server, completed)
-	if _, err := os.Stat(completedHome); err != nil {
-		t.Fatal(err)
-	}
 	resultPath := filepath.Join(root, "artifacts", "results", completed.JobID+".txt")
 	if err := os.MkdirAll(filepath.Dir(resultPath), 0o700); err != nil {
 		t.Fatal(err)
@@ -73,16 +69,13 @@ func TestPruneDryRunApplyEligibilityAndTranscriptMarker(t *testing.T) {
 	if !ok {
 		t.Fatalf("default prune dry-run result type = %T", dryRunOutcome.result)
 	}
-	if !dryRun.DryRun || dryRun.SuccessfulOlderThan != "168h0m0s" || dryRun.FailedOlderThan != "720h0m0s" || len(dryRun.WouldRemove) != 8 || dryRun.WouldRemoveBytes != 33 || len(dryRun.Removed) != 0 {
+	if !dryRun.DryRun || dryRun.SuccessfulOlderThan != "168h0m0s" || dryRun.FailedOlderThan != "720h0m0s" || len(dryRun.WouldRemove) != 6 || dryRun.WouldRemoveBytes != 24 || len(dryRun.Removed) != 0 {
 		t.Fatalf("dry-run selection = %d items, %d bytes, removed=%d: %+v", len(dryRun.WouldRemove), dryRun.WouldRemoveBytes, len(dryRun.Removed), dryRun)
 	}
 	for _, path := range append(append([]string(nil), completedLogs...), failedLogs...) {
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("dry-run changed %s: %v", path, err)
 		}
-	}
-	if _, err := os.Stat(filepath.Join(completedHome, "cache")); err != nil {
-		t.Fatalf("dry-run removed cache: %v", err)
 	}
 	if record, err := store.Get(completed.JobID); err != nil || record.LogsPruned {
 		t.Fatalf("dry-run changed log marker: record=%+v err=%v", record, err)
@@ -109,7 +102,7 @@ func TestPruneDryRunApplyEligibilityAndTranscriptMarker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(applied.Removed) != 8 || applied.RemovedBytes != 33 || len(applied.WouldRemove) != 0 {
+	if len(applied.Removed) != 6 || applied.RemovedBytes != 24 || len(applied.WouldRemove) != 0 {
 		t.Fatalf("apply result = %d items, %d bytes, would-remove=%d: %+v", len(applied.Removed), applied.RemovedBytes, len(applied.WouldRemove), applied)
 	}
 	for _, path := range append(append([]string(nil), completedLogs...), failedLogs...) {
@@ -121,14 +114,6 @@ func TestPruneDryRunApplyEligibilityAndTranscriptMarker(t *testing.T) {
 		if _, err := os.Stat(path); err != nil {
 			t.Errorf("apply removed ineligible log %s: %v", path, err)
 		}
-	}
-	for _, name := range []string{"cache", "tmp"} {
-		if _, err := os.Stat(filepath.Join(completedHome, name)); !errors.Is(err, os.ErrNotExist) {
-			t.Errorf("apply left %s: %v", name, err)
-		}
-	}
-	if _, err := os.Stat(outsideFile); err != nil {
-		t.Errorf("prune followed an owned-tree symlink: outside file stat = %v", err)
 	}
 	if got, err := os.ReadFile(resultPath); err != nil || string(got) != "authoritative result" {
 		t.Errorf("result artifact = %q, %v", got, err)
@@ -152,7 +137,7 @@ func TestAutomaticPruneSweepBoundsRecordWork(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	taskSpec, err := json.Marshal(protocol.TaskSpec{Backend: "fake"})
+	taskSpec, err := json.Marshal(protocol.TaskSpec{Intent: engine.IntentInspect, Backend: "fake"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +198,7 @@ func newPruneTestJob(t *testing.T, server *Server, requestID string, state proto
 		t.Fatal(err)
 	}
 	workspaceKey := engine.WorkspaceKey(canonicalCWD)
-	spec := protocol.TaskSpec{Backend: "codex", CWD: canonicalCWD, Prompt: "prune test", Write: true, RetainSession: retain}
+	spec := protocol.TaskSpec{Backend: "codex", CWD: canonicalCWD, Prompt: "prune test", Intent: engine.IntentEdit, RetainSession: retain}
 	raw, err := json.Marshal(spec)
 	if err != nil {
 		t.Fatal(err)
@@ -231,7 +216,7 @@ func newPruneTestJob(t *testing.T, server *Server, requestID string, state proto
 			BackendSessionID: sessionID,
 			RetainSession:    retain,
 			CWD:              canonicalCWD,
-			Write:            spec.Write,
+			Intent:           spec.Intent,
 			Cleanup:          cleanup,
 		}, nil
 	})
@@ -289,38 +274,4 @@ func writePruneTestLogs(t *testing.T, record jobstore.Record, content map[string
 		written = append(written, path)
 	}
 	return written
-}
-
-func writePruneTestCodexArtifacts(t *testing.T, server *Server, record jobstore.Record) (homePath, outsideFile string) {
-	t.Helper()
-	layout, err := engine.LayoutForWorkspace(server.stateRoot, record.CWD)
-	if err != nil {
-		t.Fatal(err)
-	}
-	home, err := createManagedCodexHome(layout, record.JobID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cache, managed, err := prepareJobCache(layout, record.JobID, home)
-	if err != nil {
-		home.close()
-		t.Fatal(err)
-	}
-	defer managed.close()
-	cacheFile := filepath.Join(cache.goBuild, "build-cache-entry")
-	tmpFile := filepath.Join(cache.tmp, "scratch")
-	if err := os.WriteFile(cacheFile, []byte("cache!"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(tmpFile, []byte("tmp"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	outsideFile = filepath.Join(t.TempDir(), "outside-data")
-	if err := os.WriteFile(outsideFile, []byte("must survive"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(filepath.Dir(outsideFile), filepath.Join(cache.goBuild, "outside-link")); err != nil {
-		t.Fatal(err)
-	}
-	return home.path, outsideFile
 }

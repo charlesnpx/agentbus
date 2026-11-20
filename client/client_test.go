@@ -113,7 +113,7 @@ func clientTestSkipOrFailBindDenied(t *testing.T, context string, detail any) {
 }
 
 func TestClientHelloParsesBackendMetadata(t *testing.T) {
-	hello := runClientHello(t, `{"protocolVersion":3,"backends":[{"backend":"codex","models":["gpt-5"],"efforts":["high"]}]}`)
+	hello := runClientHello(t, `{"protocolVersion":4,"backends":[{"backend":"codex","models":["gpt-5"],"efforts":["high"]}]}`)
 
 	if hello.ProtocolVersion != protocol.Version {
 		t.Fatalf("hello = %+v", hello)
@@ -136,7 +136,7 @@ func TestClientHelloRejectsProtocolVersionMismatch(t *testing.T) {
 	if !errors.As(err, &mismatch) || mismatch.Received != 1 {
 		t.Fatalf("clientHello mismatch = %#v, want server version 1", mismatch)
 	}
-	if !strings.Contains(err.Error(), "expected 3") || !strings.Contains(err.Error(), "received 1") {
+	if !strings.Contains(err.Error(), "expected 4") || !strings.Contains(err.Error(), "received 1") {
 		t.Fatalf("clientHello error message = %q, want expected and received versions", err.Error())
 	}
 }

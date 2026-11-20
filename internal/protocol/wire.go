@@ -9,7 +9,7 @@ import (
 
 const (
 	// Version is the protocol major version served by the simplified daemon.
-	Version = 3
+	Version = 4
 
 	// MethodJobGet retrieves one identified job.
 	MethodJobGet = "job.get"
@@ -27,13 +27,15 @@ const (
 // job.submit, job.get, job.list, job.transcript, job.cancel, job.steer, and
 // artifacts.prune may produce.
 const (
-	ErrorUnauthorized       = "unauthorized"
-	ErrorVersionMismatch    = "protocol_version_mismatch"
-	ErrorMethodNotFound     = "method_not_found"
-	ErrorBackendUnavailable = "backend_unavailable"
-	ErrorInvalidTaskSpec    = "invalid_task_spec"
-	ErrorQueueFull          = "queue_full"
-	ErrorUnknownJob         = "unknown_job"
+	ErrorUnauthorized          = "unauthorized"
+	ErrorVersionMismatch       = "protocol_version_mismatch"
+	ErrorMethodNotFound        = "method_not_found"
+	ErrorBackendUnavailable    = "backend_unavailable"
+	ErrorInvalidTaskSpec       = "invalid_task_spec"
+	ErrorQueueFull             = "queue_full"
+	ErrorUnknownJob            = "unknown_job"
+	ErrorDaemonDraining        = "daemon_draining"
+	ErrorSessionDiscardRefused = "session_discard_refused"
 )
 
 // InputMode determines whether a running task accepts follow-up instructions.
@@ -48,7 +50,7 @@ const (
 	InputModeSteerable InputMode = "steerable"
 )
 
-// EffectiveInputMode maps an omitted legacy value to the fail-closed default.
+// EffectiveInputMode maps an omitted value to the fail-closed default.
 func EffectiveInputMode(mode InputMode) InputMode {
 	if mode == "" {
 		return InputModeFixed
@@ -56,7 +58,7 @@ func EffectiveInputMode(mode InputMode) InputMode {
 	return mode
 }
 
-// PublicState is the stable job state exposed by protocol v3. The daemon
+// PublicState is the stable job state exposed by protocol v4. The daemon
 // persists an internal "starting" state to enforce the no-relaunch boundary,
 // but projects it on the wire as "running", so it has no constant here.
 type PublicState string
@@ -123,7 +125,7 @@ const (
 	FailureClassStorage        FailureClass = "storage"
 )
 
-// Valid reports whether class is one of the protocol v3 failure categories.
+// Valid reports whether class is one of the protocol v4 failure categories.
 func (class FailureClass) Valid() bool {
 	switch class {
 	case FailureClassBackendUnavailable,
@@ -153,7 +155,7 @@ const (
 	CleanupUncertain Cleanup = "uncertain"
 )
 
-// Valid reports whether cleanup is one of the protocol v3 cleanup values.
+// Valid reports whether cleanup is one of the protocol v4 cleanup values.
 func (cleanup Cleanup) Valid() bool {
 	switch cleanup {
 	case CleanupClean, CleanupUncertain:
@@ -179,21 +181,15 @@ type ContractVerdict struct {
 	Compliant bool `json:"compliant"`
 }
 
-// TaskSpec describes a job submitted through protocol v3.
+// TaskSpec describes a job submitted through protocol v4.
 type TaskSpec struct {
-	Backend string `json:"backend"`
-	CWD     string `json:"cwd"`
-	Prompt  string `json:"prompt"`
-	Write   bool   `json:"write"`
+	Backend string        `json:"backend"`
+	CWD     string        `json:"cwd"`
+	Prompt  string        `json:"prompt"`
+	Intent  engine.Intent `json:"intent"`
 	// InputMode is immutable request data and participates in replay hashing.
 	// Omission means fixed and, due to omitempty, preserves existing hashes.
 	InputMode InputMode `json:"inputMode,omitempty"`
-	// LocalIPC requests Codex local sockets in managed scratch and loopback TCP.
-	// It is immutable request data and omission preserves existing hashes.
-	LocalIPC bool `json:"localIPC,omitempty"`
-	// Verify requests execution from a daemon-created frozen copy. It is
-	// immutable request data and omission preserves existing hashes.
-	Verify bool `json:"verify,omitempty"`
 	// ResumeJobID names the prior job whose recorded backend session should be
 	// resumed for this new job. It is part of the immutable task specification
 	// and therefore participates in identified-replay hashing.
@@ -291,6 +287,7 @@ type JobSubmitParams struct {
 // JobSubmitResult is the result object for job.submit.
 type JobSubmitResult struct {
 	JobID        string                    `json:"jobId"`
+	Intent       engine.Intent             `json:"intent"`
 	State        PublicState               `json:"state"`
 	Deduplicated bool                      `json:"deduplicated"`
 	Timeout      *engine.TimeoutResolution `json:"timeout,omitempty"`
@@ -405,6 +402,30 @@ type ArtifactsPruneResult struct {
 	RemovedBytes        int64       `json:"removedBytes"`
 }
 
+// SessionDiscardParams names a job in the conversation to dispose.
+type SessionDiscardParams struct {
+	JobID string `json:"jobId"`
+}
+
+// SessionDiscardResult reports revocation and whole-home removal.
+type SessionDiscardResult struct {
+	RootJobID          string    `json:"rootJobId"`
+	SessionDiscardedAt time.Time `json:"sessionDiscardedAt"`
+	HomeRemoval        string    `json:"homeRemoval"`
+	Diagnostic         string    `json:"diagnostic,omitempty"`
+}
+
+const (
+	SessionDiscardUnsupportedBackend = "unsupported_backend"
+	SessionDiscardInvalidLineage     = "invalid_lineage"
+	SessionDiscardActiveLineage      = "active_lineage"
+	SessionDiscardCleanupUncertain   = "cleanup_uncertain"
+	SessionDiscarded                 = "session_discarded"
+	HomeRemovalRemoved               = "removed"
+	HomeRemovalAlreadyAbsent         = "already_absent"
+	HomeRemovalFailed                = "failed"
+)
+
 // JobCancelParams is the parameter object for job.cancel.
 type JobCancelParams struct {
 	JobID string `json:"jobId"`
@@ -418,8 +439,10 @@ type JobCancelResult struct {
 
 // HelloResult is the result object for protocol.hello.
 type HelloResult struct {
-	ProtocolVersion int           `json:"protocolVersion"`
-	BackendMetadata []BackendInfo `json:"backends"`
+	ProtocolVersion  int           `json:"protocolVersion"`
+	DaemonRelease    string        `json:"daemonRelease"`
+	DaemonExecutable string        `json:"daemonExecutable,omitempty"`
+	BackendMetadata  []BackendInfo `json:"backends"`
 }
 
 // JobRecordWire is the detailed response to job.get when JobID is provided.
@@ -450,7 +473,9 @@ type JobRecordWire struct {
 	LogPaths           *LogPathsWire             `json:"logPaths,omitempty"`
 	ModelReported      string                    `json:"modelReported,omitempty"`
 	EffortReported     string                    `json:"effortReported,omitempty"`
-	Execution          *ExecutionPosture         `json:"execution,omitempty"`
+	Intent             engine.Intent             `json:"intent"`
+	Selection          *InvocationSelection      `json:"selection,omitempty"`
+	SessionDiscardedAt *time.Time                `json:"sessionDiscardedAt,omitempty"`
 	Steers             []SteerSummaryWire        `json:"steers"`
 	CancellationReason CancellationReason        `json:"cancellationReason,omitempty"`
 	Queue              *QueueProjection          `json:"queue,omitempty"`
@@ -495,27 +520,10 @@ type JobSummaryWire struct {
 	Liveness Liveness `json:"liveness,omitempty"`
 }
 
-// ExecutionPosture records the requested source access and the backend
-// enforcement and scratch/cache paths selected when a job starts. It is
-// descriptive; it does not negotiate or expand backend capabilities.
-type ExecutionPosture struct {
-	Intent         string            `json:"intent"`
-	SourceWritable bool              `json:"sourceWritable"`
-	Scratch        string            `json:"scratch,omitempty"`
-	FrozenCopy     string            `json:"frozenCopy,omitempty"`
-	FrozenSource   *FrozenSource     `json:"frozenSource,omitempty"`
-	Caches         map[string]string `json:"caches,omitempty"`
-	Shell          string            `json:"shell"`
-	Network        string            `json:"network"`
-	LocalIPC       string            `json:"localIPC"`
-	GitMetadata    string            `json:"gitMetadata"`
-	Enforcement    string            `json:"enforcement"`
-}
-
-// FrozenSource identifies the submitted source revision captured for Verify.
-type FrozenSource struct {
-	Head  string `json:"head"`
-	Dirty bool   `json:"dirty"`
+// InvocationSelection is the immutable selection committed before launch.
+type InvocationSelection struct {
+	Model  string `json:"model,omitempty"`
+	Effort string `json:"effort,omitempty"`
 }
 
 // JobFailureWire records the public failure category and reason for a job.
@@ -573,7 +581,10 @@ type BackendInspectionWire struct {
 
 // BackendInspectResult is the response to backend.inspect.
 type BackendInspectResult struct {
-	Backends []BackendInspectionWire `json:"backends"`
+	DaemonRelease    string                  `json:"daemonRelease"`
+	DaemonExecutable string                  `json:"daemonExecutable,omitempty"`
+	ProtocolVersion  int                     `json:"protocolVersion"`
+	Backends         []BackendInspectionWire `json:"backends"`
 }
 
 // ResultInfoWire describes the authoritative spilled final result.

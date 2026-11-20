@@ -32,9 +32,18 @@ import (
 const (
 	cliJSONSchema = 1
 
+	cliExitSuccess              = 0
+	cliExitFailure              = 1
+	cliExitUsageOrRunning       = 2
+	cliExitContractNoncompliant = 3
+	cliExitJobFailed            = 4
+	cliExitJobTimeout           = 5
+	cliExitJobInterrupted       = 6
+	cliExitJobCanceled          = 7
 	cliExitUnknownJob           = 10
 	cliExitDaemonStartupFailure = 11
 	cliExitShutdownForced       = 13
+	cliExitUnknownOutcome       = 14
 	cliExitResultUnavailable    = 15
 	cliExitObservationTimeout   = 16
 	cliExitSteerRejected        = 17
@@ -142,8 +151,6 @@ func (a *app) run(ctx context.Context, args []string, stdin io.Reader, out, errO
 	switch command {
 	case "version":
 		return a.runVersion(args[1:], out, errOut)
-	case "__local-ipc-probe":
-		return runLocalIPCProbe(args[1:], errOut)
 	case "backends":
 		return a.runBackends(ctx, args[1:], out, errOut)
 	case "serve":
@@ -160,8 +167,6 @@ func (a *app) run(ctx context.Context, args []string, stdin io.Reader, out, errO
 		return a.runPrune(ctx, args[1:], out, errOut)
 	case "steer":
 		return a.runSteer(ctx, args[1:], stdin, out, errOut)
-	case "configure-codex-sandbox":
-		return runConfigureCodexSandbox(args[1:], out, errOut)
 	default:
 		return usageError(errOut, "unknown command %q", args[0])
 	}
@@ -169,7 +174,7 @@ func (a *app) run(ctx context.Context, args []string, stdin io.Reader, out, errO
 
 func knownCommand(command string) bool {
 	switch command {
-	case "version", "backends", "serve", "status", "transcript", "result", "cancel", "prune", "steer", "configure-codex-sandbox":
+	case "version", "backends", "serve", "status", "transcript", "result", "cancel", "prune", "steer":
 		return true
 	default:
 		return false
@@ -205,8 +210,6 @@ func printCommandHelp(out io.Writer, command string) {
 		fmt.Fprintln(out, "Usage: agentbus prune [--apply] [--successful-older-than 168h] [--failed-older-than 720h] [--json]")
 	case "steer":
 		fmt.Fprintln(out, "Usage: agentbus steer --job <id> --request-id <messageId> --message-file <path|-> [--json]")
-	case "configure-codex-sandbox":
-		fmt.Fprintln(out, "Usage: agentbus configure-codex-sandbox [--writable-root <absolute-path>]... [--json]")
 	default:
 		printRootHelp(out)
 	}
@@ -221,7 +224,7 @@ func (a *app) runBackends(ctx context.Context, args []string, out, errOut io.Wri
 	if fs.NArg() != 0 {
 		return usageError(errOut, "backends does not accept positional arguments")
 	}
-	client, err := a.connectProtocolClient(ctx)
+	client, err := a.connectProtocolClient(ctx, errOut)
 	if err != nil {
 		return protocolCommandError(errOut, "backends", err)
 	}
@@ -296,15 +299,18 @@ func (a *app) runServe(ctx context.Context, args []string, errOut io.Writer) int
 		}
 		return 0
 	}
-	codexHomeOverride, codexHomeInherit, codexAuthHome := codexHomeSettings()
+	defaults, err := configuredBackendDefaults()
+	if err != nil {
+		return serveCommandError(errOut, err)
+	}
+	codexAuthHome := os.Getenv("CODEX_HOME")
 	serveCtx, stopSignals := signal.NotifyContext(ctx, syscall.SIGTERM, syscall.SIGINT)
 	defer stopSignals()
-	err := agentbusserve.Serve(serveCtx, agentbusserve.Config{
+	err = agentbusserve.Serve(serveCtx, agentbusserve.Config{
+		Release:           a.version,
 		StateRoot:         a.stateRoot,
 		Backends:          append([]engine.Backend(nil), a.backends...),
-		BackendDefaults:   configuredBackendDefaults(),
-		CodexHomeOverride: codexHomeOverride,
-		CodexHomeInherit:  codexHomeInherit,
+		BackendDefaults:   defaults,
 		CodexAuthHome:     codexAuthHome,
 		MaxJobs:           *maxJobs,
 		MaxJobsPerBackend: *maxJobsPerBackend,
@@ -317,26 +323,24 @@ func (a *app) runServe(ctx context.Context, args []string, errOut io.Writer) int
 	return 0
 }
 
-func configuredBackendDefaults() map[string]agentbusserve.BackendDefaults {
+func configuredBackendDefaults() (map[string]agentbusserve.BackendDefaults, error) {
 	defaults := make(map[string]agentbusserve.BackendDefaults)
 	for _, backend := range []string{"codex", "claude", "cursor"} {
 		prefix := "AGENTBUS_" + strings.ToUpper(backend) + "_DEFAULT_"
+		for _, field := range []string{"MODEL", "EFFORT"} {
+			if value, set := os.LookupEnv(prefix + field); set && value == "" {
+				return nil, fmt.Errorf("%s%s must be nonempty when set", prefix, field)
+			}
+		}
 		selection := agentbusserve.BackendDefaults{
-			Model:  strings.TrimSpace(os.Getenv(prefix + "MODEL")),
-			Effort: strings.TrimSpace(os.Getenv(prefix + "EFFORT")),
+			Model:  os.Getenv(prefix + "MODEL"),
+			Effort: os.Getenv(prefix + "EFFORT"),
 		}
 		if selection.Model != "" || selection.Effort != "" {
 			defaults[backend] = selection
 		}
 	}
-	return defaults
-}
-
-// codexHomeSettings reads the daemon-owned home controls once at startup.
-func codexHomeSettings() (override string, inherit bool, authHome string) {
-	return strings.TrimSpace(os.Getenv("AGENTBUS_CODEX_HOME")),
-		strings.TrimSpace(os.Getenv("AGENTBUS_CODEX_HOME_INHERIT")) == "1",
-		strings.TrimSpace(os.Getenv("CODEX_HOME"))
+	return defaults, nil
 }
 
 func (a *app) startBackgroundDaemon(ctx context.Context, maxJobs, maxJobsPerBackend, maxQueued int, pruneInterval time.Duration) error {
@@ -509,7 +513,7 @@ func (a *app) runStatus(ctx context.Context, args []string, out, errOut io.Write
 			listParams.Cursor = *before
 		}
 	}
-	client, err := a.connectProtocolClient(ctx)
+	client, err := a.connectProtocolClient(ctx, errOut)
 	if err != nil {
 		return protocolCommandError(errOut, "status", err)
 	}
@@ -618,7 +622,7 @@ func (a *app) runTranscript(ctx context.Context, args []string, out, errOut io.W
 			return usageError(errOut, "--follow can be combined with --kind and --since-ordinal, but not --since, --last, or --limit")
 		}
 	}
-	client, err := a.connectProtocolClient(ctx)
+	client, err := a.connectProtocolClient(ctx, errOut)
 	if err != nil {
 		return protocolCommandError(errOut, "transcript", err)
 	}
@@ -860,7 +864,7 @@ func parseStateFilters(values []string) ([]protocol.PublicState, error) {
 
 func (a *app) runResult(ctx context.Context, args []string, out, errOut io.Writer) int {
 	fs := newCommandFlagSet("result", errOut)
-	jsonOut := fs.Bool("json", false, "emit the v3 job.get response")
+	jsonOut := fs.Bool("json", false, "emit the protocol job.get response")
 	jobID := fs.String("job", "", "job id")
 	wait := fs.Bool("wait", false, "observe the job until it is terminal or the timeout expires")
 	waitTimeoutValue := fs.String("wait-timeout", "30m", "maximum observation time (requires --wait; include a unit such as 30m)")
@@ -885,7 +889,7 @@ func (a *app) runResult(ctx context.Context, args []string, out, errOut io.Write
 	if waitTimeoutSet && !*wait {
 		return usageError(errOut, "--wait-timeout requires --wait")
 	}
-	client, err := a.connectProtocolClient(ctx)
+	client, err := a.connectProtocolClient(ctx, errOut)
 	if err != nil {
 		return protocolCommandError(errOut, "result", err)
 	}
@@ -1016,7 +1020,7 @@ func parseWaitDuration(value string) (time.Duration, error) {
 
 func (a *app) runCancel(ctx context.Context, args []string, out, errOut io.Writer) int {
 	fs := newCommandFlagSet("cancel", errOut)
-	jsonOut := fs.Bool("json", false, "emit the v3 job.cancel response")
+	jsonOut := fs.Bool("json", false, "emit the protocol job.cancel response")
 	jobID := fs.String("job", "", "job id")
 	if code, ok := parseFlags(fs, args); !ok {
 		return code
@@ -1027,7 +1031,7 @@ func (a *app) runCancel(ctx context.Context, args []string, out, errOut io.Write
 	if *jobID == "" {
 		return usageError(errOut, "cancel requires --job <id>")
 	}
-	client, err := a.connectProtocolClient(ctx)
+	client, err := a.connectProtocolClient(ctx, errOut)
 	if err != nil {
 		return protocolCommandError(errOut, "cancel", err)
 	}
@@ -1067,7 +1071,7 @@ func (a *app) runPrune(ctx context.Context, args []string, out, errOut io.Writer
 	if *successfulAge <= 0 || *failedAge <= 0 {
 		return usageError(errOut, "prune age thresholds must be greater than zero")
 	}
-	client, err := a.connectProtocolClient(ctx)
+	client, err := a.connectProtocolClient(ctx, errOut)
 	if err != nil {
 		return protocolCommandError(errOut, "prune", err)
 	}
@@ -1129,7 +1133,7 @@ func (a *app) runSteer(ctx context.Context, args []string, stdin io.Reader, out,
 	if err != nil {
 		return commandError(errOut, err)
 	}
-	client, err := a.connectProtocolClient(ctx)
+	client, err := a.connectProtocolClient(ctx, errOut)
 	if err != nil {
 		return protocolCommandError(errOut, "steer", err)
 	}
@@ -1195,7 +1199,7 @@ func readSteerMessage(path string, stdin io.Reader) (string, error) {
 	return string(message), nil
 }
 
-func (a *app) connectProtocolClient(ctx context.Context) (protocolClient, error) {
+func (a *app) connectProtocolClient(ctx context.Context, errOut io.Writer) (protocolClient, error) {
 	exe, err := os.Executable()
 	if err != nil {
 		return nil, err
@@ -1203,11 +1207,36 @@ func (a *app) connectProtocolClient(ctx context.Context) (protocolClient, error)
 	opts := agentclient.Options{
 		StateRoot:   a.stateRoot,
 		CommandPath: exe,
+		Release:     a.version,
 	}
+	var client protocolClient
 	if a.clientConnect != nil {
-		return a.clientConnect(ctx, opts)
+		client, err = a.clientConnect(ctx, opts)
+	} else {
+		client, err = agentclient.Connect(ctx, opts)
 	}
-	return agentclient.Connect(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	if source, ok := client.(interface {
+		HelloResult() agentclient.HelloResult
+	}); ok {
+		printReleaseNotice(errOut, a.version, source.HelloResult())
+	}
+	return client, nil
+}
+
+func printReleaseNotice(out io.Writer, clientRelease string, hello agentclient.HelloResult) {
+	if clientRelease == "" || clientRelease == "dev" {
+		clientRelease = "unknown"
+	}
+	daemonRelease := hello.DaemonRelease
+	if daemonRelease == "" || daemonRelease == "dev" {
+		daemonRelease = "unknown"
+	}
+	if clientRelease == "unknown" || daemonRelease == "unknown" || clientRelease != daemonRelease {
+		fmt.Fprintf(out, "agentbus: client release %s; daemon release %s (protocol %d, executable %s)\n", clientRelease, daemonRelease, hello.ProtocolVersion, hello.DaemonExecutable)
+	}
 }
 
 func printJobSummary(out io.Writer, jobID string, state protocol.PublicState, backend string, cleanup protocol.Cleanup, createdAt, queuedAt time.Time, failureClass protocol.FailureClass, contract *protocol.ContractVerdict, tags map[string]string, itemCount *int, lastItemAt, lastActivityAt *time.Time, liveness protocol.Liveness) {
@@ -1310,10 +1339,9 @@ func printJobRecordStatus(out io.Writer, record agentclient.JobGetResult) {
 		printLogPathTruncationStatus(out, "stdout", record.LogPaths.Stdout, record.LogPaths.StdoutTruncated)
 		printLogPathTruncationStatus(out, "stderr", record.LogPaths.Stderr, record.LogPaths.StderrTruncated)
 	}
-	if record.Execution != nil {
-		if encoded, err := json.Marshal(record.Execution); err == nil {
-			fmt.Fprintf(out, " execution=%s", encoded)
-		}
+	fmt.Fprintf(out, " intent=%s", record.Intent)
+	if record.Selection != nil {
+		fmt.Fprintf(out, " model.selected=%q effort.selected=%q", record.Selection.Model, record.Selection.Effort)
 	}
 	fmt.Fprintln(out)
 	for _, steer := range record.Steers {
@@ -1476,27 +1504,27 @@ func cliExitCodeForRecord(record agentclient.JobGetResult) int {
 	switch record.State {
 	case protocol.PublicStateCompleted:
 		if record.Contract != nil && record.Contract.Evaluated && !record.Contract.Compliant {
-			return 3
+			return cliExitContractNoncompliant
 		}
-		return 0
+		return cliExitSuccess
 	case protocol.PublicStateQueued, protocol.PublicStateRunning:
-		return 2
+		return cliExitUsageOrRunning
 	case protocol.PublicStateFailed:
 		if record.Failure != nil {
 			switch record.Failure.Class {
 			case protocol.FailureClassTimeout:
-				return 5
+				return cliExitJobTimeout
 			case protocol.FailureClassInterrupted:
-				return 6
+				return cliExitJobInterrupted
 			}
 		}
-		return 4
+		return cliExitJobFailed
 	case protocol.PublicStateCanceled:
-		return 7
+		return cliExitJobCanceled
 	case protocol.PublicStateUnknown:
-		return 14
+		return cliExitUnknownOutcome
 	default:
-		return 1
+		return cliExitFailure
 	}
 }
 
@@ -1523,7 +1551,7 @@ func parseFlags(fs *flag.FlagSet, args []string) (int, bool) {
 }
 
 func duplicateSingletonFlag(fs *flag.FlagSet, args []string) string {
-	repeatable := map[string]bool{"kind": true, "tag": true, "state": true, "writable-root": true}
+	repeatable := map[string]bool{"kind": true, "tag": true, "state": true}
 	counts := make(map[string]int)
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
@@ -1631,7 +1659,6 @@ func printRootHelp(out io.Writer) {
   agentbus cancel --job <id> [--json]
   agentbus prune [--apply] [--successful-older-than 168h] [--failed-older-than 720h] [--json]
   agentbus steer --job <id> --request-id <messageId> --message-file <path|-> [--json]
-  agentbus configure-codex-sandbox [--writable-root <absolute-path>]... [--json]
 
 status and result use the same job.get record for a selected job. Their JSON
 output is identical; status is the operator projection and result is pipeable.

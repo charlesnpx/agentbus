@@ -1,138 +1,29 @@
 # Agentbus operations
 
-This runbook covers Agentbus 0.14.0 and protocol version 3 on macOS and Linux.
-The daemon supervises backend process groups and records cleanup as a separate
-clean-or-uncertain value.
+This runbook covers Agentbus 0.18.0, protocol 4, and format 2 on macOS and
+Linux. Stop the previous daemon and select a fresh state root before upgrading;
+there is no migration or import of old jobs, bindings, results, or sessions.
+The default root is `$XDG_STATE_HOME/agentbus/v2`, or
+`~/.local/state/agentbus/v2` when XDG_STATE_HOME is unset. An explicit
+`AGENTBUS_STATE_ROOT` selects the exact root.
 
-## Required break before upgrading
+The root contains the owner-only token, socket, `jobs.db`, diagnostic logs,
+results under `artifacts`, and Codex homes under `sessions/codex/<root-job-id>`.
+The bbolt store has meta, requests, and jobs buckets. Its immutable `ownerRoot`
+records the canonical root path. A copied or moved database, unsupported or
+corrupt format, missing ownership metadata, or missing database alongside owned
+data stops startup without rebinding or deleting the data. Do not hand-edit a
+live store; inspect a stopped copy with offline tooling.
 
-0.13.0 cannot read any pre-0.13.0 state root. There is no compatibility shim
-and no state migration. Before using 0.13.0, stop any daemon using the old root,
-preserve anything you need outside it, and delete that pre-0.13.0 state root.
-Start 0.13.0 with a new empty root.
+Agentbus inherits ordinary environment settings and does not create job-private
+build caches or temporary trees. It uses the caller's selected workspace.
+Codex homes are private conversation state; `auth.json` and `config.toml` are
+linked from the daemon's `CODEX_HOME` or `~/.codex` when present. Provider
+state may grow while a conversation is retained.
 
-Do not point 0.13.0 at an old root expecting inspection, import, repair, or
-conversion. Old records are unreadable to this release.
-
-## State root
-
-Set AGENTBUS_STATE_ROOT to select a root. Without it, the default is
-$XDG_STATE_HOME/agentbus, or ~/.local/state/agentbus when XDG_STATE_HOME is
-unset. Go clients can instead set client.Options.StateRoot.
-
-The core layout is:
-
-~~~text
-<state-root>/
-  token
-  agentbus.sock
-  agentbus.pid
-  jobs.db
-  startup-diagnostic.log   # written when daemon autostart fails
-  artifacts/
-    logs/
-    results/
-~~~
-
-token authenticates protocol.hello. agentbus.sock exists while the daemon is
-serving. agentbus.pid is written for a successful background launch or
-client-autostart; do not rely on it for a foreground daemon. jobs.db is the
-single bbolt store, not SQLite. Do not inspect it with sqlite3; use
-`agentbus status` and `job.get` for job state and diagnostics. It has exactly
-the meta, requests, and jobs buckets. startup-diagnostic.log is written on a
-failed daemon autostart and contains the startup phase and bounded diagnostic.
-artifacts contains log and result sidecars. Automatic pruning is disabled by
-default. `agentbus prune` previews eligible
-cleanup by default; pass `--apply` to delete. Completed jobs use a default age
-threshold of 168 hours (7 days); failed, canceled, and unknown jobs use 720
-hours (30 days). Both are configurable proposals through
-`--successful-older-than` and `--failed-older-than`, using Go duration syntax.
-The command reports the selected or removed paths and byte totals, plus any
-jobs or paths it skipped and why.
-
-Pruning selects only raw log sidecars below `artifacts/logs` and disposable
-`cache`/`tmp` directories below a managed per-job Codex home. The job must be
-terminal, have `cleanup=clean`, and be older than the threshold for its state.
-Transcript responses and `job.get` report `pruned=true` or `logsPruned=true`
-after log sidecars have been removed, distinguishing deliberate pruning from a
-missing capture.
-
-`agentbus serve --prune-interval 24h` enables an automatic sweep when that
-invocation starts a daemon; it is off by default and uses the same 7-day and
-30-day thresholds. The daemon stays available while periodic pruning is
-enabled, even when it has no connected clients. Each sweep processes at most
-64 job records for cleanup and skips a managed cache tree with more than 10,000
-entries, so later sweeps can continue through larger stores.
-
-Pruning never deletes job records, request bindings or fingerprints, result
-artifacts, active or queued jobs, jobs with uncertain cleanup, retained
-sessions, failed/canceled/unknown jobs with a recorded resumable backend
-session, or a job targeted by a non-terminal resume request. It never deletes
-TaskSpec.cwd contents, Git worktrees, supplied artifact paths, or anything
-Agentbus did not create under its state root. It also never follows a symlink
-outside an owned directory. Delegate review-packet directories remain
-Delegate-owned.
-
-A job may create a managed private directory below
-workspaces/<workspace-hash>/codex/<job-id>. Codex uses it for its private home;
-writable jobs on all backends use it for job-private scratch and build-tool
-caches. It is separate from the shared job store.
-
-Writable jobs set `GOCACHE`, `TMPDIR`, `npm_config_cache`, `COREPACK_HOME`,
-`XDG_CACHE_HOME`, `npm_config_store_dir`, and `YARN_CACHE_FOLDER` to private
-directories there. Writable Codex jobs add that directory as an OS sandbox
-writable root. Inspect jobs get no private scratch or writable-cache
-environment: the current read-only backend profiles do not enforce a writable
-root outside the submitted workspace, and Agentbus does not weaken those
-profiles to add one. Codex may still receive the resolved host `GOMODCACHE` for
-reads.
-
-On macOS and Linux, Codex write and Verify jobs support the optional TaskSpec
-field `localIPC`. Agentbus gives the job a short, daemon-created private IPC
-directory as `TMPDIR`,
-`SCCACHE_SERVER_UDS=<ipc>/sccache.sock`, and
-`SCCACHE_DIR=<scratch>/cache/sccache`. Each sandboxed command starts its own
-sccache server, which exits with the command. The cache persists for the job.
-It is removed with the managed home when the job completes without
-`--retain-session`; failed, canceled and unknown jobs keep it with the
-resumable session until prune. Agentbus checks the longest
-expected sccache startup socket path under the resolved IPC directory,
-`<resolved-ipc>/sccacheXXXXXX/sock`, before launch. If its byte length exceeds
-107 bytes on Linux or 103 bytes on macOS,
-the job fails with `backend_unavailable`.
-
-On macOS, Unix sockets are limited to the private IPC directory and TCP
-loopback is shared with the host; the profile grants no Docker socket access or
-outbound domains. On Linux, the profile allows connections to any host Unix
-socket at a path the job can read, unless masked. The masks are
-`/run/user/<uid>`, `/run/docker.sock`, `/var/run/docker.sock`, the directory of
-`$SSH_AUTH_SOCK` (or the socket file when that directory is shared with a job
-writable path), and the Agentbus daemon socket and token file. Linux abstract
-sockets, host loopback TCP and external network connections remain blocked.
-Linux's Unix socket access is broader than macOS's private-directory access.
-
-Before launch on Linux, Agentbus checks that the Codex sandbox can bind a Unix
-socket with the job's profile. A failed check ends the job with
-`backend_unavailable` and a diagnostic beginning `local IPC is unsupported by
-the Codex sandbox on this host:`; there is no weaker fallback. Agentbus caches
-the probe result per Codex executable path and version. It removes the IPC
-directory on completion, cancellation, timeout and restart recovery. Agentbus
-does not run `sccache --stop-server`.
-
-Codex jobs use the daemon's effective Go module cache for reads. Agentbus
-resolves `GOMODCACHE` once at daemon startup, using the daemon environment first
-and otherwise `go env GOMODCACHE` with a two-second timeout. If neither gives a
-path, Agentbus leaves `GOMODCACHE` at its default. It never redirects this
-variable to an empty per-job directory. The Codex workspace-write sandbox
-keeps the host module cache readable and outside its writable roots on macOS
-and Linux; a cache miss cannot be filled because Codex network access is
-denied. Codex jobs set `GOPROXY=off`, which makes a missing module fail with
-Go's own offline lookup error instead of retrying DNS. `-mod=readonly` only
-restricts module-file changes; it is not a filesystem sandbox or a promise
-that a cache is writable.
-
-The root and token are owner-only. Do not hand-edit jobs.db, token, or
-artifacts while a daemon is using the root.
+Automatic diagnostic pruning is disabled by default. `agentbus prune` previews
+eligible cleanup, and `--apply` removes eligible logs; job records, request
+bindings, results, and conversation homes are preserved.
 
 ## Starting and selecting backends
 
@@ -165,14 +56,7 @@ records the start transition, so status shows both the waiting age and whether
 the job is queued or running. Steerable jobs with a finite effective timeout
 and backend steering support receive one warning steer at 90% of that timeout,
 measured from slot acquisition. The warning uses the reserved message ID
-`agentbus-deadline-warning` and is visible in the job's steer records. The
-public CLI commands are version, serve, status, transcript, result, cancel,
-prune, and configure-codex-sandbox.
-
-`agentbus configure-codex-sandbox` adds the Agentbus state root and cache root to
-Codex's `sandbox_workspace_write.writable_roots` array. It preserves existing
-TOML text and accepts repeatable `--writable-root` flags for additional absolute
-roots. Use `--json` for the action, config path, and resulting root list.
+`agentbus-deadline-warning` and is visible in the job's steer records.
 
 There is no standalone setup command or backend probe. Admission checks only
 that the requested backend name is registered in the daemon's backend map. A
@@ -193,9 +77,10 @@ Recovered work is never launched again:
 - A recovered running job becomes unknown.
 - A terminal record is preserved.
 
-For a recovered process claim, the daemon signals a process group only after
-the recorded start token exactly matches the live process. It records cleanup
-as uncertain when cleanup cannot be established. Cleanup uncertainty does not
+For a recovered process claim, the daemon checks boot ID, state-root device
+and inode, Linux PID namespace, and the exact live PID, start token, and
+process group before signaling. It repeats the checks before escalation. It
+records cleanup as uncertain when cleanup cannot be established. Cleanup uncertainty does not
 erase a recorded completed result.
 
 Replacing the Agentbus binary makes a running daemon finish active work and
@@ -229,27 +114,9 @@ projection omits result text, while `--json` emits the full job.get record.
 That JSON is byte-identical to `agentbus result --json` and deliberately
 includes inline result text when the record has it.
 
-The full record includes an `execution` object after the job starts. It records
-`intent` (`inspect`, `verify`, or `edit`), `sourceWritable`, `scratch`, a
-cache-path map, `shell`, `localIPC`, `network`, `gitMetadata`, and
-`enforcement`. Verify uses `intent: verify` and `sourceWritable: false`; its
-`frozenCopy` and `frozenSource` fields identify the disposable source snapshot.
-It has `gitMetadata: none` and `enforcement: os-sandbox`. These fields describe
-the selected posture, not a capability negotiation. Codex uses OS sandbox
-enforcement and denies job network access. Agentbus checks that the Codex
-sandbox can start before launching app-server; failure is `backend_unavailable`
-and does not weaken the sandbox. Trusted full-access Codex writes have no shell
-or IPC confinement. `localIPC` is `denied` by default, `all-unix-sockets` for
-Linux Codex write and Verify jobs using the local IPC profile, `private-dir`
-for macOS Codex write and Verify jobs using that profile, and `unenforced` for
-trusted full-access Codex writes and Claude/Cursor. Linux's
-`all-unix-sockets` posture is not equivalent to macOS's `private-dir` posture.
-On macOS, that profile allows Unix sockets under the private per-job IPC
-directory and TCP loopback, which is shared with the host. Cursor uses agent-mode permissions,
-which do not sandbox filesystem or network access at the OS level. Claude has
-no filesystem or network sandbox; its read-only shell tool list is restricted,
-while Claude write and Cursor shell execution are unenforced by Agentbus. The
-execution object is a start-time snapshot.
+The full record contains the task intent and, after the starting transition,
+an immutable `selection` of model and effort. Requested, selected, and reported
+values have distinct meanings; provider observations may be absent.
 
 agentbus result --job <id> reads the same full record. For a completed job it
 writes the authoritative result to standard output. It writes failure detail or
@@ -280,8 +147,8 @@ class, and schema compliance:
 | 15 | completed but the authoritative result artifact is missing, unreadable, or disagrees with its recorded digest |
 | 19 | submission rejected because the daemon's waiting queue is full |
 
-Codes 8, 9, and 12 are permanently retired. Codes 16–18 are reserved for other
-units. Do not reuse them.
+Code 16 is observation timeout; 17 and 18 are rejected and unknown steering
+receipts. Codes 8, 9, and 12 are not assigned.
 
 `agentbus steer` exits 17 for a rejected receipt and 18 for an unknown-delivery receipt.
 
@@ -316,7 +183,6 @@ until an operator removes them. Automatic pruning remains disabled unless
 
 Downstream pins are recorded in each consumer's own go.mod and are not restated
 here, because a version written into this runbook goes stale without warning.
-Convo Relay still needs two line edits to drop a removed option field.
 
 Admission validates only backend registration. An unusable backend binary is
 therefore discovered when a job runs, not when it is submitted.

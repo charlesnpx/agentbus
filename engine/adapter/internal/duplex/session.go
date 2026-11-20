@@ -74,12 +74,11 @@ type SessionConfig struct {
 
 // Session is one resumable duplex process session.
 type Session struct {
-	runner          command.Runner
-	driver          Driver
-	opts            engine.SessionOpts
-	envOverlay      []string
-	writeEnvOverlay []string
-	interruptGrace  time.Duration
+	runner         command.Runner
+	driver         Driver
+	opts           engine.SessionOpts
+	envOverlay     []string
+	interruptGrace time.Duration
 
 	mu sync.Mutex
 	// id is the provider-confirmed resume ID supplied to the next turn. It is
@@ -120,28 +119,22 @@ func NewSession(config SessionConfig) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	writeEnvOverlay, err := validatedEnvironmentOverlay(config.Options.WriteEnvOverlay)
-	if err != nil {
-		return nil, err
-	}
 
 	opts := config.Options
 	// The shared runtime owns the validated overlays and applies them after
 	// every driver ExecSpec. Drivers do not need the caller-owned maps.
 	opts.EnvOverlay = nil
-	opts.WriteEnvOverlay = nil
 	grace := config.InterruptGrace
 	if grace == 0 {
 		grace = DefaultInterruptGrace
 	}
 	return &Session{
-		runner:          config.Runner,
-		driver:          config.Driver,
-		opts:            opts,
-		envOverlay:      envOverlay,
-		writeEnvOverlay: writeEnvOverlay,
-		interruptGrace:  grace,
-		id:              config.ResumeID,
+		runner:         config.Runner,
+		driver:         config.Driver,
+		opts:           opts,
+		envOverlay:     envOverlay,
+		interruptGrace: grace,
+		id:             config.ResumeID,
 	}, nil
 }
 
@@ -242,12 +235,8 @@ func (s *Session) TurnWithRunner(ctx context.Context, input engine.TurnInput, ru
 	// Contract: driver ExecSpec.Env is an ADDITIVE layer over the full inherited
 	// process environment, not a replacement or isolation mechanism (no current
 	// driver sets it). The session overlay is applied last and wins. The private
-	// scratch overlay is available to write and Verify turns only.
-	if input.Write || s.opts.Verify {
-		spec.Env = normalizeEnvironment(runtime.GOOS, os.Environ(), spec.Env, s.envOverlay, s.writeEnvOverlay)
-	} else {
-		spec.Env = normalizeEnvironment(runtime.GOOS, os.Environ(), spec.Env, s.envOverlay)
-	}
+	// session overlay wins over inherited and adapter-provided values.
+	spec.Env = normalizeEnvironment(runtime.GOOS, os.Environ(), spec.Env, s.envOverlay)
 	running, err := runner.Start(turnCtx, spec)
 	if err != nil {
 		if stdoutLog != nil {

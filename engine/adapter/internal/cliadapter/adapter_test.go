@@ -82,7 +82,7 @@ func TestSessionTurnSurfacesMalformedStreamAsTerminalError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "go"})
+	events, err := session.Turn(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "go"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +109,7 @@ func TestSessionTurnSurfacesNonzeroExitAsTerminalError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "go"})
+	events, err := session.Turn(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "go"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +138,7 @@ func TestSessionTurnPreservesLargeStderrTail(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	events, err := session.Turn(ctx, engine.TurnInput{Prompt: "go"})
+	events, err := session.Turn(ctx, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "go"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,7 +170,7 @@ func TestSessionTurnInheritedStderrDoesNotHang(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	events, err := session.Turn(ctx, engine.TurnInput{Prompt: "go"})
+	events, err := session.Turn(ctx, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "go"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -248,7 +248,7 @@ func TestSessionTurnTimeoutKillsDescendantHoldingStdout(t *testing.T) {
 	defer cancel()
 	var processGroup int
 	started := time.Now()
-	events, err := session.Turn(ctx, engine.TurnInput{
+	events, err := session.Turn(ctx, engine.TurnInput{Intent: engine.IntentInspect,
 		Prompt: "go",
 		OnProcessStart: func(ref engine.ProcessRef, _ int) {
 			processGroup = ref.PGID
@@ -308,7 +308,7 @@ func TestSessionTurnUsesCommandRunnerExecSpec(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "hello"}, runner)
+	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -358,7 +358,7 @@ func TestOneShotBackendRunsThroughDuplexRuntime(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "hello prompt"}, runner)
+	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello prompt"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -377,7 +377,7 @@ func TestOneShotBackendRunsThroughDuplexRuntime(t *testing.T) {
 		t.Fatalf("session id = %q, want stream-session", session.ID())
 	}
 	written, closed := stdin.snapshot()
-	if written != "hello prompt" || !closed {
+	if !strings.HasSuffix(written, "\n\nhello prompt") || !closed {
 		t.Fatalf("stdin = %q closed=%v, want prompt write and close", written, closed)
 	}
 	if strings.Join(runner.spec.Argv, "\x00") != strings.Join([]string{"fake-bin", "run", "--json"}, "\x00") {
@@ -404,20 +404,20 @@ func TestBackendWithDriverRunsDuplexTurn(t *testing.T) {
 		t.Fatal("session does not implement TurnWithRunner")
 	}
 
-	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "hello"}, runner)
+	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
 	got := collectEventsWithTimeout(t, events, 2*time.Second)
 	got = withoutTurnFinal(got)
-	if len(got) != 2 || got[0].Type != engine.EventAgentText || got[0].Text != "duplex:hello" || got[1].Type != engine.EventResultMessage {
+	if len(got) != 2 || got[0].Type != engine.EventAgentText || !strings.HasSuffix(got[0].Text, "\n\nhello") || got[1].Type != engine.EventResultMessage {
 		t.Fatalf("events = %#v, want duplex agent text and result", got)
 	}
 	if session.ID() != "resume-1" {
 		t.Fatalf("session id = %q, want resume-1", session.ID())
 	}
 	spec := runner.lastSpec()
-	if strings.Join(spec.Argv, "\x00") != strings.Join([]string{"duplex-fake", "hello"}, "\x00") {
+	if len(spec.Argv) != 2 || spec.Argv[0] != "duplex-fake" || !strings.HasSuffix(spec.Argv[1], "\n\nhello") || strings.Count(spec.Argv[1], "Inspect the task and report your findings.") != 1 {
 		t.Fatalf("argv = %#v", spec.Argv)
 	}
 	if spec.Dir != "/tmp/work" {
@@ -434,12 +434,12 @@ func TestBackendWithDriverThreadsResumeIDAcrossTurns(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "first"}, runner)
+	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "first"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = collectEventsWithTimeout(t, events, 2*time.Second)
-	events, err = session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "second"}, runner)
+	events, err = session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "second"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -466,12 +466,12 @@ func TestBackendWithDriverInterruptForwardsToActiveDuplexTurn(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "hello"}, runner)
+	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
 	first := receiveEventWithTimeout(t, events, 2*time.Second)
-	if first.Type != engine.EventAgentText || first.Text != "duplex:hello" {
+	if first.Type != engine.EventAgentText || !strings.HasSuffix(first.Text, "\n\nhello") {
 		t.Fatalf("first event = %#v, want duplex start event", first)
 	}
 	if err := session.Interrupt(context.Background()); err != nil {
@@ -498,12 +498,12 @@ func TestBackendWithDriverNativeInterruptReportsSettlement(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "hello"}, runner)
+	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
 	first := receiveEventWithTimeout(t, events, 2*time.Second)
-	if first.Type != engine.EventAgentText || first.Text != "duplex:hello" {
+	if first.Type != engine.EventAgentText || !strings.HasSuffix(first.Text, "\n\nhello") {
 		t.Fatalf("first event = %#v, want duplex start event", first)
 	}
 	settled, err := session.(*Session).NativeInterrupt(context.Background())
@@ -531,15 +531,15 @@ func TestBackendWithDriverRejectsConcurrentTurn(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "first"}, runner)
+	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "first"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
 	first := receiveEventWithTimeout(t, events, 2*time.Second)
-	if first.Type != engine.EventAgentText || first.Text != "duplex:first" {
+	if first.Type != engine.EventAgentText || !strings.HasSuffix(first.Text, "\n\nfirst") {
 		t.Fatalf("first event = %#v, want duplex start event", first)
 	}
-	_, err = session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "second"}, runner)
+	_, err = session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "second"}, runner)
 	if err == nil || err.Error() != "session_busy" {
 		t.Fatalf("concurrent turn error = %v, want session_busy", err)
 	}
@@ -572,7 +572,7 @@ func TestSessionTurnSurfacesOutputTruncationAsTerminalError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "hello"}, runner)
+	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -77,7 +77,7 @@ func newRunningSteerTestJob(t *testing.T, mode protocol.InputMode, session engin
 	if _, err := store.MarkStarting(submitted.JobID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.RecordProcessClaim(submitted.JobID, jobstore.ProcessClaim{PID: 42, PGID: 42, StartToken: "test-start-token"}); err != nil {
+	if _, err := store.RecordProcessClaim(submitted.JobID, jobstore.ProcessClaim{PID: 42, PGID: 42, StartToken: "test-start-token", Scope: testProcessScope()}); err != nil {
 		t.Fatal(err)
 	}
 	run := newActiveExecution(submitted.JobID, nil)

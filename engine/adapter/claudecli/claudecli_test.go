@@ -36,7 +36,7 @@ func TestClaudeStreamJSONArgvAndPermissionProfiles(t *testing.T) {
 	)
 
 	session := startFakeClaudeSession(t, engine.SessionOpts{CWD: cwd, Model: "sonnet", Effort: "max"})
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "inspect"}, runner)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "inspect"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,18 +51,17 @@ func TestClaudeStreamJSONArgvAndPermissionProfiles(t *testing.T) {
 	assertContainsArg(t, readOnlySpec.Argv, "--verbose")
 	assertArgValue(t, readOnlySpec.Argv, "--model", "sonnet")
 	assertArgValue(t, readOnlySpec.Argv, "--effort", "max")
-	assertArgValue(t, readOnlySpec.Argv, "--allowedTools", strings.Join(readOnlyAllowedTools, ","))
-	assertArgValue(t, readOnlySpec.Argv, "--disallowedTools", strings.Join(readOnlyDeniedTools, ","))
-	assertContainsArg(t, readOnlySpec.Argv, "--strict-mcp-config")
-	assertArgValue(t, readOnlySpec.Argv, "--mcp-config", `{"mcpServers":{}}`)
-	assertArgValue(t, readOnlySpec.Argv, "--permission-mode", "dontAsk")
+	assertNotContainsArg(t, readOnlySpec.Argv, "--allowedTools")
+	assertNotContainsArg(t, readOnlySpec.Argv, "--disallowedTools")
+	assertNotContainsArg(t, readOnlySpec.Argv, "--strict-mcp-config")
+	assertNotContainsArg(t, readOnlySpec.Argv, "--permission-mode")
 	assertNotContainsArg(t, readOnlySpec.Argv, "--cwd")
 	assertNotContainsArg(t, readOnlySpec.Argv, "--replay-user-messages")
 	assertContainsArg(t, readOnlySpec.Argv, "--include-partial-messages")
-	assertNotContainsArg(t, readOnlySpec.Argv, "--dangerously-skip-permissions")
+	assertContainsArg(t, readOnlySpec.Argv, "--dangerously-skip-permissions")
 
 	session = startFakeClaudeSession(t, engine.SessionOpts{CWD: cwd})
-	events, err = turnWithRunner(t, session, engine.TurnInput{Prompt: "repair", Write: true}, runner)
+	events, err = turnWithRunner(t, session, engine.TurnInput{Prompt: "repair", Intent: engine.IntentEdit}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +93,7 @@ func TestClaudeInitializeOrderingAndTimeoutFailure(t *testing.T) {
 		})
 
 		session := startFakeClaudeSession(t, engine.SessionOpts{})
-		events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+		events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -116,7 +115,7 @@ func TestClaudeInitializeOrderingAndTimeoutFailure(t *testing.T) {
 		})
 
 		session := startFakeClaudeSession(t, engine.SessionOpts{})
-		events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+		events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -164,7 +163,7 @@ func TestClaudeInitializeOrderingAndTimeoutFailure(t *testing.T) {
 		})
 
 		session := startFakeClaudeSession(t, engine.SessionOpts{})
-		events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+		events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -192,7 +191,7 @@ func TestClaudeInitializeOrderingAndTimeoutFailure(t *testing.T) {
 		})
 
 		session := startFakeClaudeSession(t, engine.SessionOpts{})
-		events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+		events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -217,7 +216,7 @@ func TestClaudeInitializeOrderingAndTimeoutFailure(t *testing.T) {
 		})
 
 		session := startFakeClaudeSession(t, engine.SessionOpts{})
-		events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+		events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -246,7 +245,7 @@ func TestClaudeInitializeOrderingAndTimeoutFailure(t *testing.T) {
 		})
 
 		session := startFakeClaudeSessionWithInitializeTimeout(t, 15*time.Millisecond, engine.SessionOpts{})
-		events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+		events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -280,7 +279,7 @@ func TestClaudeSteerInterruptContinueKeepsOneLogicalTurn(t *testing.T) {
 		peer.emitResult("success", false, "resumed final")
 	})
 	session := startFakeClaudeSession(t, engine.SessionOpts{})
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "initial prompt"}, runner)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "initial prompt"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -361,7 +360,7 @@ func TestClaudeSteerHandlesResultBeforeInterruptAcknowledgement(t *testing.T) {
 			peer.expectNoClientFrame(2 * time.Second)
 		})
 		session := startFakeClaudeSession(t, engine.SessionOpts{})
-		events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "initial prompt"}, runner)
+		events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "initial prompt"}, runner)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -412,7 +411,7 @@ func TestClaudeSteerHandlesResultBeforeInterruptAcknowledgement(t *testing.T) {
 			peer.expectNoClientFrame(2 * time.Second)
 		})
 		session := startFakeClaudeSession(t, engine.SessionOpts{})
-		events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "initial prompt"}, runner)
+		events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "initial prompt"}, runner)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -468,7 +467,7 @@ func TestClaudeExplicitInterruptAbandonsPendingSteer(t *testing.T) {
 		peer.expectNoClientFrame(2 * time.Second)
 	})
 	session := startFakeClaudeSession(t, engine.SessionOpts{})
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "initial prompt"}, runner)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "initial prompt"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -548,7 +547,7 @@ func TestClaudeSteerRejectedInterruptDoesNotSendFollowup(t *testing.T) {
 		peer.emitResult("success", false, "original completed result")
 	})
 	session := startFakeClaudeSession(t, engine.SessionOpts{})
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "initial prompt"}, runner)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "initial prompt"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -586,7 +585,7 @@ func TestClaudeSteerMissingAcknowledgementDoesNotSendFollowup(t *testing.T) {
 		peer.expectNoClientFrame(2 * time.Second)
 	})
 	session := startFakeClaudeSession(t, engine.SessionOpts{})
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "initial prompt"}, runner)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "initial prompt"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -647,7 +646,7 @@ func TestClaudeCancelWhileSteerPendingDropsContinuation(t *testing.T) {
 	if !ok {
 		t.Fatal("Claude session does not support TurnWithRunner")
 	}
-	events, err := turner.TurnWithRunner(turnCtx, engine.TurnInput{Prompt: "initial prompt"}, runner)
+	events, err := turner.TurnWithRunner(turnCtx, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "initial prompt"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -759,7 +758,7 @@ func TestClaudeResultStatusMapping(t *testing.T) {
 			})
 
 			session := startFakeClaudeSession(t, engine.SessionOpts{})
-			events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+			events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -792,7 +791,7 @@ func TestClaudeStructuredRateLimitCarriesProviderEvidence(t *testing.T) {
 		})
 	})
 	session := startFakeClaudeSession(t, engine.SessionOpts{})
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "quota"}, runner)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "quota"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -834,7 +833,7 @@ func TestClaudeAuthenticationFailureSurvivesResultAndProcessExit(t *testing.T) {
 	})
 
 	session := startFakeClaudeSession(t, engine.SessionOpts{})
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "authenticate"}, runner)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "authenticate"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -880,7 +879,7 @@ func TestClaudeAuthenticationAssistantFrameWaitsForErrorResult(t *testing.T) {
 	})
 
 	session := startFakeClaudeSession(t, engine.SessionOpts{})
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "authenticate"}, runner)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "authenticate"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -908,7 +907,7 @@ func TestClaudeAssistantModelObservationReplacesSystemModel(t *testing.T) {
 	})
 
 	session := startFakeClaudeSession(t, engine.SessionOpts{})
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "observe model"}, runner)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "observe model"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -934,7 +933,7 @@ func TestClaudePermissionErrorWith403IsNotAuthentication(t *testing.T) {
 	})
 
 	session := startFakeClaudeSession(t, engine.SessionOpts{})
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "permission denied"}, runner)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "permission denied"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -970,7 +969,7 @@ func TestClaudeSessionIDCapturedAndResumed(t *testing.T) {
 	)
 
 	session := startFakeClaudeSession(t, engine.SessionOpts{})
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "first"}, runner)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "first"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -979,7 +978,7 @@ func TestClaudeSessionIDCapturedAndResumed(t *testing.T) {
 		t.Fatalf("session id = %q, want claude-session-1", session.ID())
 	}
 
-	events, err = turnWithRunner(t, session, engine.TurnInput{Prompt: "second"}, runner)
+	events, err = turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "second"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1034,13 +1033,13 @@ func TestClaudeResumeIgnoresOriginResultUntilTurnResult(t *testing.T) {
 	)
 
 	session := startFakeClaudeSession(t, engine.SessionOpts{})
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "first turn"}, runner)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "first turn"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = collectEventsWithTimeout(t, events, 2*time.Second)
 
-	events, err = turnWithRunner(t, session, engine.TurnInput{Prompt: "resumed turn"}, runner)
+	events, err = turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "resumed turn"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1093,7 +1092,7 @@ func TestClaudeAnswersControlRequestsAndMapsAssistantEvents(t *testing.T) {
 	})
 
 	session := startFakeClaudeSession(t, engine.SessionOpts{})
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "use tool"}, runner)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "use tool"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1140,7 +1139,7 @@ func TestClaudeFileWritingToolUsesAreTextFreeWorkspaceWrites(t *testing.T) {
 			})
 
 			session := startFakeClaudeSession(t, engine.SessionOpts{})
-			events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "write a file", Write: true}, runner)
+			events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "write a file", Intent: engine.IntentEdit}, runner)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1192,7 +1191,7 @@ func TestClaudePartialAssistantTextEmitsExactlyOnce(t *testing.T) {
 	})
 
 	session := startFakeClaudeSession(t, engine.SessionOpts{})
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "stream"}, runner)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "stream"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1250,7 +1249,7 @@ func TestClaudeIdentifiedPartialsWithIDlessCompletedAssistantEmitExactlyOnce(t *
 	})
 
 	session := startFakeClaudeSession(t, engine.SessionOpts{})
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "identified partials"}, runner)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "identified partials"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1308,7 +1307,7 @@ func TestClaudeUnidentifiedPartialsEmitExactlyOnce(t *testing.T) {
 	})
 
 	session := startFakeClaudeSession(t, engine.SessionOpts{})
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "unidentified partials"}, runner)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "unidentified partials"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1338,7 +1337,7 @@ func TestClaudeThinkingFramesEmitRateLimitedProgress(t *testing.T) {
 	})
 
 	session := startFakeClaudeSession(t, engine.SessionOpts{})
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "think"}, runner)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "think"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1377,7 +1376,7 @@ func TestClaudeAssistantThinkingBlockEmitsProgress(t *testing.T) {
 	})
 
 	session := startFakeClaudeSession(t, engine.SessionOpts{})
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "think"}, runner)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "think"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1398,7 +1397,7 @@ func TestClaudeUnknownFramesRetainAgentTextHandling(t *testing.T) {
 	})
 
 	session := startFakeClaudeSession(t, engine.SessionOpts{})
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "unknown"}, runner)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "unknown"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1681,7 +1680,7 @@ func (p *claudePeer) assertUser(frame map[string]any, prompt string) {
 	if got := firstString(message, "role"); got != "user" {
 		p.t.Fatalf("message role = %q, want user in %#v", got, frame)
 	}
-	if got := firstString(message, "content"); got != prompt {
+	if got := firstString(message, "content"); got != prompt && !strings.HasSuffix(got, "\n\n"+prompt) {
 		p.t.Fatalf("message content = %q, want %q in %#v", got, prompt, frame)
 	}
 }

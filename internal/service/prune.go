@@ -22,7 +22,6 @@ const (
 	defaultSuccessfulPruneAge = 7 * 24 * time.Hour
 	defaultFailedPruneAge     = 30 * 24 * time.Hour
 	autoPruneMaxJobsPerSweep  = 64
-	maxPruneArtifactEntries   = 10_000
 )
 
 func (s *Server) handleArtifactsPrune(raw json.RawMessage) requestOutcome {
@@ -175,9 +174,6 @@ func (s *Server) pruneArtifactRecords(store *jobstore.Store, root string, record
 				Reason: "open owned log directory: " + logsErr.Error(),
 			})
 		}
-		if record.Backend == "codex" && (record.Write || recordUsesVerify(record)) {
-			s.pruneJobCodexArtifacts(root, record, dryRun, &result)
-		}
 	}
 	return result, nil
 }
@@ -296,71 +292,5 @@ func (s *Server) pruneJobLogs(store *jobstore.Store, root string, logsFD int, re
 		item := protocol.PruneItem{JobID: record.JobID, Kind: sidecar.kind, Path: sidecar.path, Bytes: removedBytes}
 		result.Removed = append(result.Removed, item)
 		result.RemovedBytes += removedBytes
-	}
-}
-
-func (s *Server) pruneJobCodexArtifacts(root string, record jobstore.Record, dryRun bool, result *protocol.ArtifactsPruneResult) {
-	if strings.TrimSpace(record.CWD) == "" {
-		result.Skipped = append(result.Skipped, protocol.PruneSkip{JobID: record.JobID, Reason: "recorded workspace path is unavailable"})
-		return
-	}
-	workspaceKey := engine.WorkspaceKey(record.CWD)
-	layout := engine.WorkspaceLayout{Root: root, Key: workspaceKey}
-	parentFD, err := openExistingManagedCodexHomeParent(layout)
-	if errors.Is(err, unix.ENOENT) {
-		return
-	}
-	if err != nil {
-		result.Skipped = append(result.Skipped, protocol.PruneSkip{JobID: record.JobID, Path: filepath.Join(root, "workspaces", workspaceKey, "codex"), Reason: "open managed Codex home root: " + err.Error()})
-		return
-	}
-	defer unix.Close(parentFD)
-	homeFD, err := openManagedDirectoryAt(parentFD, record.JobID)
-	if errors.Is(err, unix.ENOENT) {
-		return
-	}
-	if err != nil {
-		result.Skipped = append(result.Skipped, protocol.PruneSkip{JobID: record.JobID, Path: filepath.Join(root, "workspaces", workspaceKey, "codex", record.JobID), Reason: "managed Codex home is not an owned directory: " + err.Error()})
-		return
-	}
-	defer unix.Close(homeFD)
-	for _, name := range []string{"cache", "tmp", "src"} {
-		path := filepath.Join(root, "workspaces", workspaceKey, "codex", record.JobID, name)
-		var stat unix.Stat_t
-		if err := unix.Fstatat(homeFD, name, &stat, unix.AT_SYMLINK_NOFOLLOW); errors.Is(err, unix.ENOENT) {
-			continue
-		} else if err != nil {
-			result.Skipped = append(result.Skipped, protocol.PruneSkip{JobID: record.JobID, Path: path, Reason: err.Error()})
-			continue
-		}
-		if stat.Mode&unix.S_IFMT != unix.S_IFDIR {
-			result.Skipped = append(result.Skipped, protocol.PruneSkip{JobID: record.JobID, Path: path, Reason: "managed artifact path is not a real directory"})
-			continue
-		}
-		directoryFD, err := openManagedDirectoryAt(homeFD, name)
-		if err != nil {
-			result.Skipped = append(result.Skipped, protocol.PruneSkip{JobID: record.JobID, Path: path, Reason: "open managed cache directory: " + err.Error()})
-			continue
-		}
-		remaining := maxPruneArtifactEntries
-		size, measureErr := measureManagedCodexHomeContents(directoryFD, &remaining)
-		closeErr := unix.Close(directoryFD)
-		if measureErr != nil || closeErr != nil {
-			reason := errors.Join(measureErr, closeErr)
-			result.Skipped = append(result.Skipped, protocol.PruneSkip{JobID: record.JobID, Path: path, Reason: "measure managed cache directory: " + reason.Error()})
-			continue
-		}
-		item := protocol.PruneItem{JobID: record.JobID, Kind: name, Path: path, Bytes: size}
-		if dryRun {
-			result.WouldRemove = append(result.WouldRemove, item)
-			result.WouldRemoveBytes += size
-			continue
-		}
-		if err := removeManagedCodexHomeChild(homeFD, name); err != nil {
-			result.Skipped = append(result.Skipped, protocol.PruneSkip{JobID: record.JobID, Path: path, Reason: err.Error()})
-			continue
-		}
-		result.Removed = append(result.Removed, item)
-		result.RemovedBytes += size
 	}
 }

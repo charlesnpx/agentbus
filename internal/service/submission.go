@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
-	"runtime"
 	"strings"
 
 	"github.com/charlesnpx/agentbus/engine"
@@ -21,8 +20,6 @@ const jobStoreFilename = "jobs.db"
 
 var errQueueFull = errors.New("agentbus submission queue is full")
 
-var localIPCGOOS = runtime.GOOS
-
 type jobSubmitInput struct {
 	key               jobstore.RequestKey
 	taskSpec          map[string]json.RawMessage
@@ -30,7 +27,7 @@ type jobSubmitInput struct {
 }
 
 // resumeTargetError identifies a resume target that makes a new task invalid.
-// It remains an invalid_task_spec protocol error because protocol v3 has no
+// It remains an invalid_task_spec protocol error because the protocol has no
 // separate resume error code, while retaining the target job ID in ErrorData.
 type resumeTargetError struct {
 	jobID string
@@ -117,10 +114,8 @@ func (s *Server) handleJobSubmit(raw json.RawMessage) requestOutcome {
 			RequestID:     input.key.RequestID,
 			Backend:       spec.Backend,
 			InputMode:     protocol.EffectiveInputMode(spec.InputMode),
-			Model:         taskSpecOptionalString(spec.Model),
 			CWD:           canonicalCWD,
-			Write:         spec.Write,
-			Effort:        taskSpecOptionalString(spec.Effort),
+			Intent:        spec.Intent,
 			RetainSession: spec.RetainSession,
 		}, nil
 	})
@@ -216,7 +211,7 @@ func parseJobSubmitInput(raw json.RawMessage) (jobSubmitInput, error) {
 	}
 	for name := range input.taskSpec {
 		switch name {
-		case "backend", "cwd", "write", "prompt", "inputMode", "localIPC", "verify", "resumeJobId", "retainSession", "model", "effort", "outputSchema", "tags", "timeoutMs":
+		case "backend", "cwd", "intent", "prompt", "inputMode", "resumeJobId", "retainSession", "model", "effort", "outputSchema", "tags", "timeoutMs":
 		default:
 			return jobSubmitInput{}, fmt.Errorf("json: unknown field %q", name)
 		}
@@ -234,30 +229,27 @@ func decodeTaskSpec(raw json.RawMessage) (protocol.TaskSpec, error) {
 }
 
 func validateNewTaskSpec(spec protocol.TaskSpec, raw map[string]json.RawMessage) error {
-	if err := validateVerifyTaskSpec(spec); err != nil {
-		return err
-	}
-	if err := validateLocalIPCSpec(spec); err != nil {
-		return err
-	}
-	for _, required := range []string{"backend", "cwd", "write", "prompt"} {
+	for _, required := range []string{"backend", "cwd", "intent", "prompt"} {
 		value, present := raw[required]
 		if !present || string(value) == "null" {
 			return fmt.Errorf("taskSpec missing required field %s", required)
 		}
 	}
-	for _, optional := range []string{"inputMode", "localIPC", "verify", "resumeJobId", "retainSession", "model", "effort", "outputSchema", "tags", "timeoutMs"} {
+	for _, optional := range []string{"inputMode", "resumeJobId", "retainSession", "model", "effort", "outputSchema", "tags", "timeoutMs"} {
 		value, present := raw[optional]
 		if present && string(value) == "null" {
 			return fmt.Errorf("taskSpec.%s cannot be null", optional)
 		}
 	}
 	if spec.Backend == "" || spec.CWD == "" || !filepath.IsAbs(spec.CWD) || spec.Prompt == "" {
-		return fmt.Errorf("taskSpec requires backend, absolute cwd, write, and prompt")
+		return fmt.Errorf("taskSpec requires backend, absolute cwd, intent, and prompt")
 	}
-	if spec.Verify {
-		if err := requireGitWorkTree(spec.CWD); err != nil {
-			return err
+	if !spec.Intent.Valid() {
+		return fmt.Errorf("taskSpec.intent must be inspect or edit")
+	}
+	for name, value := range map[string]*string{"model": spec.Model, "effort": spec.Effort} {
+		if value != nil && !validSelectionValue(*value) {
+			return fmt.Errorf("taskSpec.%s must be nonempty valid UTF-8 without control characters", name)
 		}
 	}
 	if _, supplied := raw["inputMode"]; supplied && spec.InputMode != protocol.InputModeFixed && spec.InputMode != protocol.InputModeSteerable {
@@ -265,6 +257,17 @@ func validateNewTaskSpec(spec protocol.TaskSpec, raw map[string]json.RawMessage)
 	}
 	if _, supplied := raw["resumeJobId"]; supplied && strings.TrimSpace(spec.ResumeJobID) == "" {
 		return errors.New("taskSpec.resumeJobId must name a job")
+	}
+	if tags, supplied := raw["tags"]; supplied {
+		var values map[string]json.RawMessage
+		if err := json.Unmarshal(tags, &values); err != nil || values == nil {
+			return errors.New("taskSpec.tags must be an object with string values")
+		}
+		for _, value := range values {
+			if len(value) == 0 || value[0] != '"' {
+				return errors.New("taskSpec.tags must contain only string values")
+			}
+		}
 	}
 	if _, errObj := timeoutFromMillis(spec.TimeoutMS); errObj != nil {
 		return errors.New(errObj.Message)
@@ -281,39 +284,6 @@ func validateNewTaskSpec(spec protocol.TaskSpec, raw map[string]json.RawMessage)
 	return nil
 }
 
-func validateVerifyTaskSpec(spec protocol.TaskSpec) error {
-	if !spec.Verify {
-		return nil
-	}
-	if spec.Write {
-		return errors.New("taskSpec.verify requires write: false")
-	}
-	if spec.Backend != "codex" {
-		return errors.New("taskSpec.verify is Codex-only; Claude and Cursor do not enforce the required read-only boundary")
-	}
-	if spec.ResumeJobID != "" {
-		return errors.New("taskSpec.verify cannot be combined with resumeJobId")
-	}
-	if spec.RetainSession {
-		return errors.New("taskSpec.verify cannot retain a session")
-	}
-	return nil
-}
-
-func validateLocalIPCSpec(spec protocol.TaskSpec) error {
-	if !spec.LocalIPC {
-		return nil
-	}
-	if !spec.Write && !spec.Verify {
-		return errors.New("taskSpec.localIPC requires write: true or verify: true")
-	}
-	switch spec.Backend {
-	case "claude", "cursor":
-		return fmt.Errorf("taskSpec.localIPC is not supported by backend %q", spec.Backend)
-	}
-	return nil
-}
-
 func (s *Server) resumeTargetFromLookup(spec protocol.TaskSpec, lookup jobstore.RecordLookup) (jobstore.Record, error) {
 	if lookup == nil {
 		return jobstore.Record{}, &resumeTargetError{jobID: spec.ResumeJobID, cause: errors.New("resume lookup is unavailable")}
@@ -324,11 +294,6 @@ func (s *Server) resumeTargetFromLookup(spec protocol.TaskSpec, lookup jobstore.
 	}
 	if err := validateResumeTarget(spec, target); err != nil {
 		return jobstore.Record{}, &resumeTargetError{jobID: spec.ResumeJobID, cause: err}
-	}
-	if spec.Backend == "codex" {
-		if err := s.validateCodexResumeHome(); err != nil {
-			return jobstore.Record{}, &resumeTargetError{jobID: spec.ResumeJobID, cause: err}
-		}
 	}
 	return target, nil
 }
@@ -364,8 +329,8 @@ func resumeTargetIneligibilityReason(spec protocol.TaskSpec, target jobstore.Rec
 	return ""
 }
 
-// taskSpecOptionalString supplies Record's summary fields. Presence remains
-// authoritative in the canonical task bytes that SubmitTx persists unchanged.
+// taskSpecOptionalString selects a submitted optional value without adding it
+// to the canonical task bytes.
 func taskSpecOptionalString(value *string) string {
 	if value == nil {
 		return ""
@@ -376,6 +341,7 @@ func taskSpecOptionalString(value *string) string {
 func jobSubmitResult(record jobstore.Record, deduplicated bool, timeout *engine.TimeoutResolution) protocol.JobSubmitResult {
 	return protocol.JobSubmitResult{
 		JobID:        record.JobID,
+		Intent:       record.Intent,
 		State:        record.State,
 		Deduplicated: deduplicated,
 		Timeout:      engine.CloneTimeoutResolution(timeout),
@@ -400,7 +366,7 @@ func (s *Server) jobSubmitConflict(submitErr error) requestOutcome {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, submitErr.Error(), protocol.ErrorData{})}
 	}
 	data := protocol.ErrorData{JobID: conflict.ExistingJobID}
-	// protocol v3 has no distinct conflict error code. Keep the typed store
+	// The protocol has no distinct conflict error code. Keep the typed store
 	// conflict visible as an invalid-task response without violating JSON-RPC's
 	// result XOR error response invariant.
 	return requestOutcome{

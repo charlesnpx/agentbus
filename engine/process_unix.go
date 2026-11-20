@@ -28,7 +28,16 @@ func (NativeProcessTable) Lookup(pid int) (ProcessInfo, bool, error) {
 		}
 		return ProcessInfo{}, false, err
 	}
-	return nativeProcessInfo(pid)
+	info, alive, err := nativeProcessInfo(pid)
+	if err != nil || !alive {
+		return info, alive, err
+	}
+	pgid, err := syscall.Getpgid(pid)
+	if err != nil {
+		return ProcessInfo{}, false, err
+	}
+	info.PGID = pgid
+	return info, true, nil
 }
 
 func errorsIsProcessMissing(err error) bool {

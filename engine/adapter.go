@@ -90,35 +90,30 @@ type Health struct {
 	Warning      string
 }
 
-// SessionOpts configures a backend session default.
+// Intent describes the work requested for a turn. It is an instruction, not a security boundary.
+type Intent string
+
+const (
+	IntentInspect Intent = "inspect"
+	IntentEdit    Intent = "edit"
+)
+
+// Valid reports whether intent is supported.
+func (intent Intent) Valid() bool { return intent == IntentInspect || intent == IntentEdit }
+
+// SessionOpts configures a backend session.
 type SessionOpts struct {
 	CWD        string
 	EnvOverlay map[string]string
-	// WriteEnvOverlay is merged after EnvOverlay for write and Verify turns.
-	WriteEnvOverlay map[string]string
-	// WriteSandboxRoot is added to workspaceWrite sandbox policies for write
-	// and Verify turns. Trusted and Inspect policies do not use it.
-	WriteSandboxRoot string
-	// LocalIPC selects the Codex local-IPC permission profile for this job.
-	LocalIPC bool
-	// Verify permits workspace writes only to the disposable frozen copy and
-	// managed scratch. It does not change the submitted write intent.
-	Verify bool
-	// LocalIPCRoot is the private short temp directory granted for local IPC.
-	LocalIPCRoot string
-	// LocalIPCDenyPaths are host socket paths hidden from Linux local-IPC jobs.
-	// Other platforms ignore them.
-	LocalIPCDenyPaths []string
-	Write             bool
-	Model             string
-	Effort            string
-	Timeout           time.Duration
+	Model      string
+	Effort     string
+	Timeout    time.Duration
 }
 
 // TurnInput is the effective input for one backend turn.
 type TurnInput struct {
 	Prompt         string
-	Write          bool
+	Intent         Intent
 	Timeout        time.Duration
 	LogPaths       LogPaths
 	OnProcessStart func(ProcessRef, int)

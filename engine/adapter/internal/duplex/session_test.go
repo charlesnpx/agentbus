@@ -55,7 +55,7 @@ func TestFixtureDriverHappyPath(t *testing.T) {
 		proc.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
 	}()
 
-	events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "hello"})
+	events, err := session.Turn(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +173,7 @@ func TestSessionSteerForwardsWithoutTakingStreamReader(t *testing.T) {
 		proc.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
 	}()
 
-	events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "original"})
+	events, err := session.Turn(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "original"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,7 +235,7 @@ func TestSessionWithoutSteerDriverReportsUnsupportedWhileActive(t *testing.T) {
 		proc.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
 	}()
 
-	events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "original"})
+	events, err := session.Turn(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "original"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -278,7 +278,7 @@ func TestTurnCapturesBackendStdoutAndStderrLogs(t *testing.T) {
 		proc.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
 	}()
 
-	events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "hello", LogPaths: logs})
+	events, err := session.Turn(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello", LogPaths: logs})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -434,7 +434,7 @@ func TestTurnFinalObservationAcrossTerminalShapes(t *testing.T) {
 				proc.finish(test.observation.Exit, nil)
 			}()
 
-			events, err := session.Turn(ctx, engine.TurnInput{Prompt: "turn"})
+			events, err := session.Turn(ctx, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "turn"})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -519,7 +519,7 @@ func TestTurnTeardownBoundsRetirementAndPreservesDriverOutcome(t *testing.T) {
 			runner := &fakeRunner{running: proc}
 			session := newSessionWithDriver(t, runner, test.driver, 0, "")
 
-			events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "terminal"})
+			events, err := session.Turn(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "terminal"})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -574,7 +574,7 @@ func TestTurnFinalKeepsCompletedResumeIDWhenFinalSendBackpressures(t *testing.T)
 	runner := &fakeRunner{running: firstObserved}
 	session := newSessionWithDriver(t, runner, backpressuredFinalTestDriver{}, 0, "resume-before-first")
 
-	firstEvents, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "first"})
+	firstEvents, err := session.Turn(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "first"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -592,7 +592,7 @@ func TestTurnFinalKeepsCompletedResumeIDWhenFinalSendBackpressures(t *testing.T)
 		Exit: command.ExitObservation{Exited: true, Code: 0},
 	}, nil)
 	runner.running = secondObserved
-	secondEvents, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "second"})
+	secondEvents, err := session.Turn(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "second"})
 	if err != nil {
 		t.Fatalf("second turn error = %v", err)
 	}
@@ -642,7 +642,7 @@ func TestTurnFinalKeepsSettlementDispositionWhenDeadlineExpiresDuringTeardown(t 
 	runner := &fakeRunner{running: observed}
 	session := newSessionWithDriver(t, runner, finalObservationTestDriver{resumeID: "resume-settled"}, 0, "resume-before-turn")
 
-	events, err := session.Turn(ctx, engine.TurnInput{Prompt: "turn"})
+	events, err := session.Turn(ctx, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "turn"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -701,7 +701,7 @@ func TestTurnKeepsDriverErrorWhenDeadlineExpiresDuringRetirement(t *testing.T) {
 		err:      driverErr,
 	}, 0, "")
 
-	events, err := session.Turn(ctx, engine.TurnInput{Prompt: "turn"})
+	events, err := session.Turn(ctx, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "turn"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -775,7 +775,7 @@ func TestTurnWithRunnerUsesInjectedRunnerWithoutDefault(t *testing.T) {
 		proc.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
 	}()
 
-	events, err := session.TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "hello"}, runner)
+	events, err := session.TurnWithRunner(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -802,7 +802,7 @@ func TestTurnWithRunnerRequiresRunner(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = session.TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "hello"}, nil)
+	_, err = session.TurnWithRunner(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, nil)
 	if err == nil || !strings.Contains(err.Error(), "command runner is required") {
 		t.Fatalf("TurnWithRunner error = %v, want command runner required", err)
 	}
@@ -847,7 +847,7 @@ func TestSessionEnvOverlayIsClonedAndMergedBeforeRunnerStart(t *testing.T) {
 		proc.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
 	}()
 
-	events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "hello"})
+	events, err := session.Turn(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -958,7 +958,7 @@ func TestMalformedStdoutSurfacesDecodeError(t *testing.T) {
 		proc.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
 	}()
 
-	events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "hello"})
+	events, err := session.Turn(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1109,7 +1109,7 @@ func TestSessionRetainsProviderResumeIDAfterTerminalError(t *testing.T) {
 		proc.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
 	}()
 
-	events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "terminal"})
+	events, err := session.Turn(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "terminal"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1151,7 +1151,7 @@ func TestSessionRetainsProviderResumeIDAfterTerminalError(t *testing.T) {
 		proc.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
 	}()
 
-	events, err = session.Turn(context.Background(), engine.TurnInput{Prompt: "continue"})
+	events, err = session.Turn(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "continue"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1185,7 +1185,7 @@ func TestProcessExitBeforeSemanticTerminalSplitsCleanupAndExecutionAxes(t *testi
 		proc.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
 	}()
 
-	events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "hello"})
+	events, err := session.Turn(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1231,7 +1231,7 @@ func TestBufferedTerminalFrameSurvivesImmediateRetirement(t *testing.T) {
 				proc.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
 			}()
 
-			events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "hello"})
+			events, err := session.Turn(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1281,7 +1281,7 @@ func TestTrailingFramesAfterTerminalDoNotWedgeSession(t *testing.T) {
 		proc.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
 	}()
 
-	events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "hello"})
+	events, err := session.Turn(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1305,7 +1305,7 @@ func TestTrailingFramesAfterTerminalDoNotWedgeSession(t *testing.T) {
 		_ = proc2.stderrW.Close()
 		proc2.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
 	}()
-	events, err = session.Turn(context.Background(), engine.TurnInput{Prompt: "again"})
+	events, err = session.Turn(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "again"})
 	if err != nil {
 		t.Fatalf("second turn error = %v, want no session_busy", err)
 	}
@@ -1335,7 +1335,7 @@ func TestNativeInterruptWritesFrameThenFallsBackToProcessInterrupt(t *testing.T)
 		}
 	}()
 
-	events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "hello"})
+	events, err := session.Turn(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1372,7 +1372,7 @@ func TestNativeInterruptDoesNotCallProcessInterrupt(t *testing.T) {
 		session := newFixtureSession(t, runner, 0, "")
 		promptSeen, interruptSeen, scanDone := startInterruptFrameScanner(t, proc)
 
-		events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "hello"})
+		events, err := session.Turn(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1426,7 +1426,7 @@ func TestNativeInterruptDoesNotCallProcessInterrupt(t *testing.T) {
 		session := newFixtureSession(t, runner, 0, "")
 		promptSeen, interruptSeen, scanDone := startInterruptFrameScanner(t, proc)
 
-		events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "hello"})
+		events, err := session.Turn(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1485,7 +1485,7 @@ func TestNativeInterruptWriteErrorDoesNotMaskRetirement(t *testing.T) {
 	session := newSessionWithDriver(t, runner, driver, 0, "")
 	promptSeen, interruptSeen, scanDone := startInterruptFrameScanner(t, proc)
 
-	events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "hello"})
+	events, err := session.Turn(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1557,7 +1557,7 @@ func TestInterruptFallsBackWhenNativeInterruptBlocks(t *testing.T) {
 		}
 	}()
 
-	events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "hello"})
+	events, err := session.Turn(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1613,7 +1613,7 @@ func TestInterruptWithExpiredContextUsesFreshFallbackContext(t *testing.T) {
 		}
 	}()
 
-	events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "hello"})
+	events, err := session.Turn(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1670,7 +1670,7 @@ func TestConcurrentInterruptsShareSingleSequence(t *testing.T) {
 		}
 	}()
 
-	events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "hello"})
+	events, err := session.Turn(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1869,7 +1869,7 @@ func (d *delayedFrameConsumerDriver) RunTurn(ctx context.Context, conn *Conn, re
 	prompt := map[string]any{
 		"type":   "prompt",
 		"prompt": input.Prompt,
-		"write":  input.Write,
+		"intent": input.Intent,
 	}
 	if resumeID != "" {
 		prompt["resumeId"] = resumeID

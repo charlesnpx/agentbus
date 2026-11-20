@@ -154,12 +154,14 @@ func (s *Server) handleHello(connection *connection, raw json.RawMessage) reques
 		return requestOutcome{err: protocol.NewError(protocol.ErrorUnauthorized, "missing or invalid hello token", protocol.ErrorData{})}
 	}
 	if params.ClientProtocolVersion != ProtocolVersion {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorVersionMismatch, "protocol major version mismatch", protocol.ErrorData{ServerProtocolVersion: ProtocolVersion})}
+		return requestOutcome{err: protocol.NewError(protocol.ErrorVersionMismatch, "protocol version mismatch", protocol.ErrorData{ServerProtocolVersion: ProtocolVersion, ClientProtocolVersion: params.ClientProtocolVersion, ClientRelease: releaseName(params.ClientRelease), DaemonRelease: releaseName(s.release), DaemonExecutable: s.daemonExecutable()})}
 	}
 	connection.hello = true
 	return requestOutcome{result: protocol.HelloResult{
-		ProtocolVersion: ProtocolVersion,
-		BackendMetadata: s.backendMetadata(),
+		ProtocolVersion:  ProtocolVersion,
+		DaemonRelease:    releaseName(s.release),
+		DaemonExecutable: s.daemonExecutable(),
+		BackendMetadata:  s.backendMetadata(),
 	}}
 }
 
@@ -174,10 +176,11 @@ func ensureStateRoot(root string) (string, error) {
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return "", err
 	}
-	if err := os.Chmod(root, 0o700); err != nil {
+	abs, err := filepath.Abs(root)
+	if err != nil {
 		return "", err
 	}
-	return root, nil
+	return filepath.EvalSymlinks(abs)
 }
 
 func ensureToken(path, configured string) (string, error) {
@@ -515,4 +518,20 @@ func decodeStrict(raw json.RawMessage, dst any) error {
 
 func invalidParams(err error) requestOutcome {
 	return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
+}
+
+func releaseName(value string) string {
+	if value == "" || value == "dev" {
+		return "unknown"
+	}
+	return value
+}
+func (s *Server) daemonExecutable() string {
+	s.mu.Lock()
+	path := s.executablePath
+	s.mu.Unlock()
+	if path == "" {
+		path, _ = os.Executable()
+	}
+	return path
 }

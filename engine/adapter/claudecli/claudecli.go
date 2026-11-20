@@ -16,63 +16,6 @@ const (
 	StreamSchema            = "claude-streamjson-v2"
 )
 
-var readOnlyAllowedTools = []string{
-	"Read",
-	"Grep",
-	"Glob",
-	"Bash(git diff*)",
-	"Bash(git log*)",
-	"Bash(git show*)",
-	"Bash(git status*)",
-	"Bash(cat*)",
-	"Bash(rg*)",
-	"Bash(grep*)",
-	"Bash(ls*)",
-	"Bash(head*)",
-	"Bash(tail*)",
-	"Bash(wc*)",
-}
-
-var readOnlyDeniedTools = []string{
-	"Edit",
-	"Write",
-	"NotebookEdit",
-	"mcp__*",
-	"Bash(*&&*)",
-	"Bash(*&*)",
-	"Bash(*;*)",
-	"Bash(*|*)",
-	"Bash(*$(*)",
-	"Bash(*`*)",
-	"Bash(*<(*)",
-	"Bash(*>*)",
-	"Bash(*>>*)",
-	"Bash(sed -i*)",
-	"Bash(tee*)",
-	"Bash(find*)",
-	"Bash(rm*)",
-	"Bash(mv*)",
-	"Bash(cp*)",
-	"Bash(git -c*)",
-	"Bash(git --config-env*)",
-	"Bash(git --paginate*)",
-	"Bash(git -p*)",
-	"Bash(git *--help*)",
-	"Bash(*--output*)",
-	"Bash(*--ext-diff*)",
-	"Bash(*--textconv*)",
-	"Bash(*--pre*)",
-	"Bash(*--hostname-bin*)",
-	"Bash(*--search-zip*)",
-	"Bash(* -z*)",
-	"Bash(git commit*)",
-	"Bash(git push*)",
-	"Bash(git checkout*)",
-	"Bash(chmod*)",
-	"Bash(curl*)",
-	"Bash(wget*)",
-}
-
 type Options struct {
 	Binary           string
 	SupportedModels  []string

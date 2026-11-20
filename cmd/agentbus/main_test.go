@@ -26,7 +26,7 @@ func TestVersionReportsBothVersions(t *testing.T) {
 	if code != 0 || stderr != "" {
 		t.Fatalf("version exit=%d stderr=%q", code, stderr)
 	}
-	if stdout != "agentbus test protocol 3\n" {
+	if stdout != "agentbus test protocol 4\n" {
 		t.Fatalf("human version output = %q", stdout)
 	}
 
@@ -38,6 +38,27 @@ func TestVersionReportsBothVersions(t *testing.T) {
 	decodeJSON(t, stdout, &got)
 	if got.Version != "test" || got.Schema != cliJSONSchema || got.ProtocolVersion != protocol.Version {
 		t.Fatalf("version output = %+v", got)
+	}
+}
+
+func TestReleaseNoticeAndEmptyConfiguredDefault(t *testing.T) {
+	var out bytes.Buffer
+	printReleaseNotice(&out, "0.18.0", agentclient.HelloResult{ProtocolVersion: 4, DaemonRelease: "0.18.0", DaemonExecutable: "/agentbus"})
+	if out.Len() != 0 {
+		t.Fatalf("matching release notice: %q", out.String())
+	}
+	printReleaseNotice(&out, "0.18.0", agentclient.HelloResult{ProtocolVersion: 4, DaemonRelease: "0.18.1", DaemonExecutable: "/agentbus"})
+	if !strings.Contains(out.String(), "0.18.0") || !strings.Contains(out.String(), "0.18.1") || !strings.Contains(out.String(), "/agentbus") {
+		t.Fatalf("release notice: %q", out.String())
+	}
+	out.Reset()
+	printReleaseNotice(&out, "dev", agentclient.HelloResult{ProtocolVersion: 4, DaemonRelease: "unknown"})
+	if !strings.Contains(out.String(), "unknown") {
+		t.Fatalf("unknown release notice: %q", out.String())
+	}
+	t.Setenv("AGENTBUS_CODEX_DEFAULT_MODEL", "")
+	if _, err := configuredBackendDefaults(); err == nil {
+		t.Fatal("empty configured model was accepted")
 	}
 }
 
@@ -300,9 +321,8 @@ func TestStatusHumanProjectionIncludesOperatorFieldsAndNeverResultText(t *testin
 	record.Failure = &protocol.JobFailureWire{Class: protocol.FailureClassBackendError, Reason: "provider stopped"}
 	record.Contract = &protocol.ContractResult{Evaluated: true, Compliant: false}
 	record.LogPaths = &protocol.LogPathsWire{Stdout: "/logs/out", Stderr: "/logs/err"}
-	record.Execution = &protocol.ExecutionPosture{
-		Intent: "inspect", Shell: "sandboxed", Network: "denied", LocalIPC: "denied", GitMetadata: "read-only", Enforcement: "os-sandbox",
-	}
+	record.Intent = engine.IntentInspect
+	record.Selection = &protocol.InvocationSelection{Model: "gpt-5", Effort: "high"}
 	record.Steers = []protocol.SteerSummaryWire{{
 		MessageID: "message-1", Status: protocol.SteerStatusDelivered,
 		Mechanism: "native", Time: finished.Add(time.Minute),
@@ -325,7 +345,7 @@ func TestStatusHumanProjectionIncludesOperatorFieldsAndNeverResultText(t *testin
 		"failure.class=backend_error failure.reason=provider stopped",
 		"contract.evaluated=true contract.compliant=false",
 		"logPaths.stdout=/logs/out logPaths.stderr=/logs/err",
-		`execution={"intent":"inspect","sourceWritable":false,"shell":"sandboxed","network":"denied","localIPC":"denied","gitMetadata":"read-only","enforcement":"os-sandbox"}`,
+		`intent=inspect`,
 		"steer.messageId=message-1 status=delivered mechanism=native time=2026-01-02T03:07:05Z",
 	} {
 		if !strings.Contains(stdout, want) {
@@ -918,16 +938,6 @@ func TestServeConcurrencyFlagsReachBackgroundDaemon(t *testing.T) {
 	code, stdout, stderr := runTestCLI(t, a, []string{"serve", "--max-jobs", "3", "--max-jobs-per-backend", "1", "--max-queued", "9"})
 	if code != 0 || stdout != "" || stderr != "" {
 		t.Fatalf("serve = (%d, %q, %q), want successful background start", code, stdout, stderr)
-	}
-}
-
-func TestCodexHomeSettingsPreferInheritance(t *testing.T) {
-	t.Setenv("AGENTBUS_CODEX_HOME", "/override")
-	t.Setenv("AGENTBUS_CODEX_HOME_INHERIT", "1")
-	t.Setenv("CODEX_HOME", "/auth")
-	override, inherit, authHome := codexHomeSettings()
-	if override != "/override" || !inherit || authHome != "/auth" {
-		t.Fatalf("settings=(%q,%t,%q)", override, inherit, authHome)
 	}
 }
 

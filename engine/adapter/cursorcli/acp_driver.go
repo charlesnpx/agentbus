@@ -32,7 +32,6 @@ type acpDriver struct {
 type activeACPTurn struct {
 	mu                 sync.Mutex
 	sessionID          string
-	write              bool
 	promptActive       bool
 	interruptRequested bool
 	jobCancelled       bool
@@ -270,7 +269,7 @@ func (d *acpDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resumeID str
 		return resumeID, err
 	}
 
-	active := &activeACPTurn{sessionID: info.sessionID, write: input.Write}
+	active := &activeACPTurn{sessionID: info.sessionID}
 	d.setActive(conn, active)
 	defer func() {
 		active.finish()
@@ -279,15 +278,15 @@ func (d *acpDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resumeID str
 
 	model := info.currentModel()
 	if opts.Model != "" {
-		model = resolveModelID(opts.Model, anySlice(info.models["availableModels"]))
-		if err := rpc.setModel(ctx, info.sessionID, model); err != nil {
+		model = ""
+		if err := rpc.setModel(ctx, info.sessionID, opts.Model); err != nil {
 			return info.sessionID, fmt.Errorf("could not select Cursor model: %w", err)
 		}
 	}
 	if model != "" && emit != nil {
 		emit(engine.Event{Type: engine.EventModelReported, ModelReported: model})
 	}
-	if err := rpc.setMode(ctx, info.sessionID, cursorMode(input.Write)); err != nil {
+	if err := rpc.setMode(ctx, info.sessionID, "agent"); err != nil {
 		return info.sessionID, fmt.Errorf("could not verify Cursor mode: %w", err)
 	}
 
@@ -633,9 +632,6 @@ func (c *acpRPC) handlePermissionRequest(id any, params map[string]any) error {
 	}
 
 	wantKind := "allow_once"
-	if !active.write {
-		wantKind = "reject_once"
-	}
 	for _, raw := range anySlice(params["options"]) {
 		option, ok := raw.(map[string]any)
 		if !ok || firstString(option, "kind") != wantKind {
@@ -699,31 +695,6 @@ func parseSessionInfo(result any) (acpSessionInfo, error) {
 
 func (i acpSessionInfo) currentModel() string {
 	return firstString(i.models, "currentModelId")
-}
-
-func resolveModelID(requested string, availableModels []any) string {
-	for _, raw := range availableModels {
-		model, ok := raw.(map[string]any)
-		if !ok {
-			continue
-		}
-		name, _ := model["name"].(string)
-		modelID, _ := model["modelId"].(string)
-		if name == requested && modelID != "" {
-			return modelID
-		}
-	}
-	for _, raw := range availableModels {
-		model, ok := raw.(map[string]any)
-		if !ok {
-			continue
-		}
-		modelID, _ := model["modelId"].(string)
-		if modelID == requested {
-			return modelID
-		}
-	}
-	return requested
 }
 
 type acpTurnObserver struct {
@@ -885,13 +856,6 @@ func absoluteCWD(cwd string) (string, error) {
 		}
 	}
 	return filepath.Abs(cwd)
-}
-
-func cursorMode(write bool) string {
-	if write {
-		return "agent"
-	}
-	return "plan"
 }
 
 func sessionUpdate(params map[string]any) map[string]any {
