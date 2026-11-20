@@ -34,8 +34,6 @@ type StaticBackendDescriptor struct {
 	Binary                 string
 	MinimumVersion         string
 	StreamSchema           string
-	AllowedModels          map[string]struct{}
-	AllowedEfforts         map[string]struct{}
 	DiscoveredModels       []string
 	DiscoveredEfforts      []string
 	DiscoverySource        string
@@ -119,13 +117,6 @@ func (b *Backend) Resume(ctx context.Context, id string, opts engine.SessionOpts
 }
 
 func (b *Backend) newSession(id string, opts engine.SessionOpts) (engine.Session, error) {
-	if opts.EnvOverlay != nil {
-		cloned := make(map[string]string, len(opts.EnvOverlay))
-		for key, value := range opts.EnvOverlay {
-			cloned[key] = value
-		}
-		opts.EnvOverlay = cloned
-	}
 	session := &Session{}
 	driver := b.Driver
 	if driver == nil {
@@ -171,8 +162,6 @@ func (b *Backend) staticDescriptor() StaticBackendDescriptor {
 		Binary:           b.binary(),
 		MinimumVersion:   b.MinimumVersion,
 		StreamSchema:     b.StreamSchema,
-		AllowedModels:    cloneStringSet(b.AllowedModels),
-		AllowedEfforts:   cloneStringSet(b.AllowedEfforts),
 		VersionTransform: b.VersionTransform,
 		Discover:         b.Discover,
 	}
@@ -260,17 +249,6 @@ func (b *Backend) validateOptions(opts engine.SessionOpts) error {
 		}
 	}
 	return nil
-}
-
-func cloneStringSet(in map[string]struct{}) map[string]struct{} {
-	if in == nil {
-		return nil
-	}
-	out := make(map[string]struct{}, len(in))
-	for value := range in {
-		out[value] = struct{}{}
-	}
-	return out
 }
 
 func sortedStringSet(values map[string]struct{}) []string {
