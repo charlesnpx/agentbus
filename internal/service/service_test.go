@@ -426,19 +426,29 @@ func TestStaleBinaryDrainsActiveJobThenStopsAfterAcceptSettles(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	listener := &drainTestListener{closed: make(chan struct{})}
-	acceptSettled := make(chan struct{})
+	lifecycle := &serveLifecycle{
+		listener: listener, cancel: cancel,
+		acceptSettled: make(chan struct{}), serveDone: make(chan struct{}),
+		shutdownDone: make(chan struct{}), connections: make(map[net.Conn]struct{}),
+		pruneCancel: func() {},
+	}
+	if err := server.registerLifecycle(lifecycle); err != nil {
+		t.Fatal(err)
+	}
 	idleDone := make(chan struct{})
 	go func() {
 		_, _ = listener.Accept()
-		close(acceptSettled)
+		lifecycle.settleAccept()
 	}()
 	go func() {
-		server.idleLoop(ctx, cancel, listener, socketFileIdentity{}, acceptSettled)
+		server.idleLoop(ctx)
 		close(idleDone)
 	}()
 	t.Cleanup(func() {
 		cancel()
 		_ = listener.Close()
+		lifecycle.settleAccept()
+		server.clearLifecycle(lifecycle)
 		select {
 		case <-idleDone:
 		case <-time.After(time.Second):
@@ -483,9 +493,22 @@ func TestStaleBinaryDrainsActiveJobThenStopsAfterAcceptSettles(t *testing.T) {
 		t.Fatal("stale daemon did not close its listener after the job ended")
 	}
 	select {
+	case <-lifecycle.acceptSettled:
+	case <-time.After(idleCheckInterval / 2):
+		t.Fatal("stale daemon did not wait for its accept loop to settle")
+	}
+	select {
 	case <-ctx.Done():
 	case <-time.After(idleCheckInterval / 2):
-		t.Fatal("stale daemon waited for another idle-check interval after its accept loop settled")
+		t.Fatal("stale daemon did not finish shutdown after its accept loop settled")
+	}
+	select {
+	case <-lifecycle.shutdownDone:
+		if lifecycle.shutdownErr != nil {
+			t.Fatalf("stale daemon shutdown error = %v", lifecycle.shutdownErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stale daemon shutdown did not complete")
 	}
 	select {
 	case <-idleDone:

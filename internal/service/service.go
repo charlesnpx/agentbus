@@ -416,7 +416,7 @@ func (s *Server) serve(ctx, startupCtx context.Context) error {
 		case <-lifecycle.shutdownDone:
 		}
 	}()
-	go s.idleLoop(serveCtx, cancel, listener, socketIdentity, lifecycle.acceptSettled)
+	go s.idleLoop(serveCtx)
 	var acceptErr error
 	for {
 		conn, err := listener.Accept()
@@ -646,7 +646,7 @@ func (s *Server) listen() (net.Listener, socketFileIdentity, error) {
 	return listener, identity, nil
 }
 
-func (s *Server) idleLoop(ctx context.Context, cancel context.CancelFunc, listener net.Listener, socketIdentity socketFileIdentity, acceptSettled <-chan struct{}) {
+func (s *Server) idleLoop(ctx context.Context) {
 	ticker := time.NewTicker(s.idleCheckInterval)
 	defer ticker.Stop()
 	stale := false
@@ -677,21 +677,10 @@ func (s *Server) idleLoop(ctx context.Context, cancel context.CancelFunc, listen
 		s.lifecycleMu.Lock()
 		lifecycle := s.lifecycle
 		s.lifecycleMu.Unlock()
-		if lifecycle != nil {
-			if s.startShutdown(lifecycle, true) {
-				return
-			}
-			continue
+		if lifecycle == nil {
+			return
 		}
-		// The standalone idle-loop test supplies its own listener.
-		if s.activeJobs.Load() == 0 && s.clients.Load() == 0 && s.accepting.Load() == 0 {
-			_ = listener.Close()
-			select {
-			case <-acceptSettled:
-			case <-ctx.Done():
-				return
-			}
-			cancel()
+		if s.startShutdown(lifecycle, true) {
 			return
 		}
 	}
