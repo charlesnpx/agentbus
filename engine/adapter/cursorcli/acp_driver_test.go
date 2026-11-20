@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -593,7 +594,7 @@ func TestACPCancelDropsPendingSteer(t *testing.T) {
 		}
 		close(permissionAnswered)
 		<-finishCancelledPrompt
-		peer.respond(prompt, map[string]any{"stopReason": "cancelled"})
+		peer.respondAfterCancellation(prompt, map[string]any{"stopReason": "cancelled"})
 		peer.expectStdinClose()
 	})
 
@@ -679,7 +680,7 @@ func TestACPCancelEmptyResultDoesNotReusePartialText(t *testing.T) {
 		peer.expectNotification("session/cancel")
 		close(cancelSeen)
 		<-finishCancelledPrompt
-		peer.respond(prompt, map[string]any{"stopReason": "cancelled"})
+		peer.respondAfterCancellation(prompt, map[string]any{"stopReason": "cancelled"})
 		peer.expectStdinClose()
 	})
 
@@ -1208,6 +1209,18 @@ func (p *acpPeer) respond(request map[string]any, result any) {
 	p.write(map[string]any{"jsonrpc": "2.0", "id": request["id"], "result": result})
 }
 
+// Cancellation can close the local output reader before the provider replies.
+func (p *acpPeer) respondAfterCancellation(request map[string]any, result any) {
+	p.t.Helper()
+	payload, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": request["id"], "result": result})
+	if err != nil {
+		p.t.Fatal(err)
+	}
+	if _, err := p.proc.stdoutW.Write(append(payload, '\n')); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+		p.t.Fatalf("write cancelled server response: %v", err)
+	}
+}
+
 func (p *acpPeer) notify(method string, params map[string]any) {
 	p.write(map[string]any{"jsonrpc": "2.0", "method": method, "params": params})
 }
@@ -1278,4 +1291,43 @@ func nestedString(object map[string]any, path ...string) string {
 		current = next
 	}
 	return ""
+}
+
+func TestACPVersionedNestedModelRejectionRetainsEvidence(t *testing.T) {
+	fixture, err := os.ReadFile("testdata/invalid-model-2026.09.18.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response map[string]any
+	if err := json.Unmarshal(fixture, &response); err != nil {
+		t.Fatal(err)
+	}
+	runner := newFakeACPRunner(t, func(t *testing.T, proc *fakeACPProcess, _ command.ExecSpec) {
+		peer := newACPPeer(t, proc)
+		peer.handshake(false)
+		newSession := peer.expectRequest("session/new")
+		peer.respond(newSession, acpSessionResult("session-rejected", "previous"))
+		setModel := peer.expectRequest("session/set_model")
+		if got := nestedString(setModel, "params", "modelId"); got != "definitely-not-a-model" {
+			t.Fatalf("model = %q", got)
+		}
+		response["id"] = setModel["id"]
+		peer.write(response)
+		peer.expectStdinClose()
+	})
+	session := startFakeCursorSession(t, engine.SessionOpts{CWD: t.TempDir(), Model: "definitely-not-a-model"})
+	events, err := turnWithFakeRunner(t, session, engine.TurnInput{Prompt: "must not run", Intent: engine.IntentInspect}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEvents(t, events, 2*time.Second)
+	terminal := eventsOfType(got, engine.EventTerminalError)
+	if len(terminal) != 1 {
+		t.Fatalf("terminal events: %#v", terminal)
+	}
+	var failure *engine.ProviderFailureError
+	if !errors.As(terminal[0].Err, &failure) || failure.Evidence.Code != "-32602" || failure.Evidence.Message != "Invalid params: Invalid model value: definitely-not-a-model" {
+		t.Fatalf("provider evidence: %#v", terminal[0].Err)
+	}
+	runner.assertRetired(t)
 }

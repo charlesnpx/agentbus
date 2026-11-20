@@ -22,12 +22,9 @@ type DirectCommandRunner struct {
 	CancelGrace time.Duration
 }
 
-var ErrOutputTruncated = errors.New("command output truncated")
-
-const (
-	directOutputBufferLimit = 16 << 20
-	directStderrDrainGrace  = 200 * time.Millisecond
-)
+// ErrOutputDrainExpired means a descendant held an output pipe open beyond
+// the single post-leader-exit drain deadline.
+var ErrOutputDrainExpired = errors.New("incomplete backend transport: output drain deadline expired")
 
 func (r DirectCommandRunner) Start(ctx context.Context, spec ExecSpec) (RunningCommand, error) {
 	if ctx == nil {
@@ -58,13 +55,9 @@ func (r DirectCommandRunner) Start(ctx context.Context, spec ExecSpec) (RunningC
 	if err != nil {
 		return nil, err
 	}
-	stdout := newDirectOutputBuffer(directOutputBufferLimit)
-	stderr := newDirectOutputBuffer(directOutputBufferLimit)
 	stdoutReader, stdoutWriter, err := os.Pipe()
 	if err != nil {
 		_ = stdin.Close()
-		stdout.closeWriter(err)
-		stderr.closeWriter(err)
 		return nil, err
 	}
 	stderrReader, stderrWriter, err := os.Pipe()
@@ -72,8 +65,6 @@ func (r DirectCommandRunner) Start(ctx context.Context, spec ExecSpec) (RunningC
 		_ = stdin.Close()
 		_ = stdoutReader.Close()
 		_ = stdoutWriter.Close()
-		stdout.closeWriter(err)
-		stderr.closeWriter(err)
 		return nil, err
 	}
 	terminator.pipes = []*os.File{stdoutReader, stderrReader}
@@ -85,15 +76,13 @@ func (r DirectCommandRunner) Start(ctx context.Context, spec ExecSpec) (RunningC
 		_ = stdoutWriter.Close()
 		_ = stderrReader.Close()
 		_ = stderrWriter.Close()
-		stdout.closeWriter(err)
-		stderr.closeWriter(err)
 		return nil, err
 	}
 	terminator.captureProcessRef()
 	_ = stdoutWriter.Close()
 	_ = stderrWriter.Close()
-	stdoutDrain := drainDirectOutput(stdoutReader, stdout)
-	stderrDrain := drainDirectOutput(stderrReader, stderr)
+	stdout := newOwnedOutputReader(stdoutReader)
+	stderr := newOwnedOutputReader(stderrReader)
 	running := &directRunningCommand{
 		cmd:              cmd,
 		stdin:            stdin,
@@ -101,38 +90,42 @@ func (r DirectCommandRunner) Start(ctx context.Context, spec ExecSpec) (RunningC
 		stderr:           stderr,
 		cancelGrace:      grace,
 		terminator:       terminator,
-		stdoutDrain:      stdoutDrain,
-		stderrDrain:      stderrDrain,
 		stdoutPipe:       stdoutReader,
 		stderrPipe:       stderrReader,
 		startContextStop: make(chan struct{}),
 		startContextDone: make(chan struct{}),
 		cleanupDone:      make(chan struct{}),
+		drainExpired:     make(chan struct{}),
 	}
 	running.watchStartContext(ctx)
+	running.startWait()
 	return running, nil
 }
 
 type directRunningCommand struct {
 	cmd              *exec.Cmd
 	stdin            io.WriteCloser
-	stdout           *directOutputBuffer
-	stderr           *directOutputBuffer
+	stdout           *ownedOutputReader
+	stderr           *ownedOutputReader
 	cancelGrace      time.Duration
 	terminator       *directTerminator
-	stdoutDrain      <-chan struct{}
-	stderrDrain      <-chan struct{}
 	stdoutPipe       *os.File
 	stderrPipe       *os.File
 	startContextStop chan struct{}
 	startContextDone chan struct{}
 	cleanupOnce      sync.Once
 	cleanupDone      chan struct{}
+	drainExpired     chan struct{}
 	cleanupErr       error
 	waitOnce         sync.Once
 	waitDone         chan struct{}
 	waitExit         ExitObservation
 	waitErr          error
+}
+
+// OutputDrainExpired closes when the post-leader-exit reader deadline expires.
+func (r *directRunningCommand) OutputDrainExpired() <-chan struct{} {
+	return r.drainExpired
 }
 
 func (r *directRunningCommand) Stdin() io.WriteCloser {
@@ -236,24 +229,13 @@ func (r *directRunningCommand) waitForExit() {
 	if r.terminator != nil {
 		r.terminator.markLeaderReaped()
 	}
+	// The deadline starts at leader exit, independently of any decoder. Each
+	// reader may finish naturally while buffered pipe data is consumed.
+	if r.stdout != nil && r.stderr != nil {
+		deadline := time.Now().Add(r.cancelGrace)
+		go expireOutputReaders(deadline, r.stdout, r.stderr, r.drainExpired)
+	}
 	r.stopStartContext()
-	if r.stdoutDrain != nil {
-		// Stdout is the live-leader stream boundary. Once the leader has
-		// exited, descendants retaining stdout get only the runner cancel
-		// grace before the local read end is closed.
-		if !waitDirectDrain(r.stdoutDrain, r.cancelGrace) && r.stdoutPipe != nil {
-			r.closeOutputPipes()
-		}
-		<-r.stdoutDrain
-	}
-	if r.stderrDrain != nil {
-		if !waitDirectDrain(r.stderrDrain, directStderrDrainGrace) && r.stderrPipe != nil {
-			r.closeOutputPipes()
-		}
-		<-r.stderrDrain
-	}
-	r.stdout.closeWriter(nil)
-	r.stderr.closeWriter(nil)
 	r.waitExit = exitObservationForCmd(r.cmd)
 	r.waitErr = err
 }
@@ -450,115 +432,82 @@ func (t *directTerminator) closePipes() {
 	})
 }
 
-func drainDirectOutput(src *os.File, dst *directOutputBuffer) <-chan struct{} {
-	done := make(chan struct{})
-	go func() {
-		_, _ = io.Copy(dst, src)
-		_ = src.Close()
-		dst.closeWriter(nil)
-		close(done)
-	}()
-	return done
+// ownedOutputReader keeps one consumer and makes forced closure observable.
+// It does not buffer: the operating system pipe supplies backpressure.
+type ownedOutputReader struct {
+	file     *os.File
+	mu       sync.Mutex
+	cause    error
+	finished bool
+	closed   bool
+	done     chan struct{}
 }
 
-func waitDirectDrain(done <-chan struct{}, timeout time.Duration) bool {
-	if done == nil {
-		return true
-	}
-	if timeout <= 0 {
-		select {
-		case <-done:
-			return true
-		default:
-			return false
+func newOwnedOutputReader(file *os.File) *ownedOutputReader {
+	return &ownedOutputReader{file: file, done: make(chan struct{})}
+}
+
+func (r *ownedOutputReader) Read(p []byte) (int, error) {
+	n, err := r.file.Read(p)
+	if err != nil {
+		r.mu.Lock()
+		if r.cause != nil {
+			err = r.cause
 		}
+		r.finishLocked()
+		r.mu.Unlock()
 	}
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	select {
-	case <-done:
-		return true
-	case <-timer.C:
+	return n, err
+}
+
+func (r *ownedOutputReader) finishLocked() {
+	if !r.finished {
+		r.finished = true
+		close(r.done)
+	}
+}
+
+func (r *ownedOutputReader) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nil
+	}
+	r.closed = true
+	r.finishLocked()
+	return r.file.Close()
+}
+
+func (r *ownedOutputReader) expire() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.finished {
 		return false
 	}
+	r.cause = ErrOutputDrainExpired
+	r.closed = true
+	r.finishLocked()
+	_ = r.file.Close()
+	return true
 }
 
-type directOutputBuffer struct {
-	mu           sync.Mutex
-	cond         *sync.Cond
-	buf          []byte
-	limit        int
-	writerClosed bool
-	readerClosed bool
-	truncated    bool
-	err          error
-}
-
-func newDirectOutputBuffer(limit int) *directOutputBuffer {
-	b := &directOutputBuffer{limit: limit}
-	b.cond = sync.NewCond(&b.mu)
-	return b
-}
-
-func (b *directOutputBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.writerClosed || b.readerClosed || b.limit <= 0 {
-		return len(p), nil
-	}
-	b.buf = append(b.buf, p...)
-	if overflow := len(b.buf) - b.limit; overflow > 0 {
-		copy(b.buf, b.buf[overflow:])
-		b.buf = b.buf[:b.limit]
-		b.truncated = true
-	}
-	b.cond.Broadcast()
-	return len(p), nil
-}
-
-func (b *directOutputBuffer) Read(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	for len(b.buf) == 0 && !b.writerClosed && !b.readerClosed {
-		if b.truncated {
-			return 0, ErrOutputTruncated
+func expireOutputReaders(deadline time.Time, stdout, stderr *ownedOutputReader, expired chan<- struct{}) {
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	stdoutDone, stderrDone := stdout.done, stderr.done
+	for stdoutDone != nil || stderrDone != nil {
+		select {
+		case <-stdoutDone:
+			stdoutDone = nil
+		case <-stderrDone:
+			stderrDone = nil
+		case <-timer.C:
+			stdoutExpired := stdout.expire()
+			stderrExpired := stderr.expire()
+			if stdoutExpired || stderrExpired {
+				close(expired)
+			}
+			return
 		}
-		b.cond.Wait()
 	}
-	if b.readerClosed {
-		return 0, io.ErrClosedPipe
-	}
-	if len(b.buf) > 0 {
-		n := copy(p, b.buf)
-		copy(b.buf, b.buf[n:])
-		b.buf = b.buf[:len(b.buf)-n]
-		return n, nil
-	}
-	if b.truncated {
-		return 0, ErrOutputTruncated
-	}
-	if b.err != nil {
-		return 0, b.err
-	}
-	return 0, io.EOF
-}
-
-func (b *directOutputBuffer) Close() error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.readerClosed = true
-	b.buf = nil
-	b.cond.Broadcast()
-	return nil
-}
-
-func (b *directOutputBuffer) closeWriter(err error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.writerClosed {
-		return
-	}
-	b.writerClosed = true
-	b.err = err
-	b.cond.Broadcast()
 }

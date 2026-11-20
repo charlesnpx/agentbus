@@ -337,3 +337,21 @@ func intentFromWriteForTest(write bool) engine.Intent {
 	}
 	return engine.IntentInspect
 }
+
+func TestCursorModelRejectionClassification(t *testing.T) {
+	tests := []struct {
+		message string
+		want    protocol.FailureClass
+	}{
+		{"Invalid model value: missing", protocol.FailureClassModelUnavailable},
+		{"Invalid params: Invalid model value: missing", protocol.FailureClassModelUnavailable},
+		{"Invalid params", protocol.FailureClassBackendError},
+		{"Invalid model value: missing; content policy violation", protocol.FailureClassContentPolicy},
+	}
+	for _, test := range tests {
+		err := &engine.ProviderFailureError{Evidence: engine.ProviderFailureEvidence{Code: "-32602", Message: test.message}, Cause: errors.New(test.message)}
+		if got := classifyExecutionFailure(err); got != test.want {
+			t.Errorf("%q: got %q, want %q", test.message, got, test.want)
+		}
+	}
+}

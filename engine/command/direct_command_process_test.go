@@ -387,9 +387,8 @@ wait
 		t.Fatalf("leader exit code = %d, want clean TERM exit", code)
 	}
 	assertProcessRunning(t, childPID)
-	if _, err := command.stdoutPipe.Stat(); err != nil {
-		t.Fatalf("stdout pipe closed after partial termination: %v", err)
-	}
+	// Local reader closure after the shared drain deadline does not imply the
+	// surviving descendant was terminated. Cleanup remains uncertain above.
 }
 
 func TestDirectCommandRunnerPermissionDeniedReportsCleanupFailure(t *testing.T) {

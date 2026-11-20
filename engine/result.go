@@ -4,6 +4,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 )
@@ -14,7 +17,7 @@ const (
 	// A measured Codex app-server stream writes 163 KB/min; over the four-hour
 	// maximum timeout that is about 39 MB, so 64 MiB leaves headroom while
 	// retaining a bounded log.
-	defaultCappedLogCapBytes int64 = 64 * 1024 * 1024
+	DefaultCappedLogCapBytes int64 = 64 * 1024 * 1024
 )
 
 // EventText is text prepared for a streaming event.
@@ -153,62 +156,112 @@ func capEventMetadataString(s string, capBytes int) string {
 	return text.Text
 }
 
-// NewCappedLogWriter opens a protocol-mode capped log file.
+// NewCappedLogWriter appends to a job's single-owner raw log, preserving
+// evidence from prior turns and applying one cumulative cap. Callers must not
+// share a path concurrently between sessions.
 func NewCappedLogWriter(path string, capBytes int64) (*CappedLogWriter, error) {
 	if capBytes <= 0 {
-		capBytes = defaultCappedLogCapBytes
+		capBytes = DefaultCappedLogCapBytes
+	}
+	marker := TruncationMarker()
+	if capBytes < int64(len(marker)) {
+		return nil, errors.New("raw log cap is smaller than the truncation marker")
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, err
 	}
-	if err := f.Chmod(0o600); err != nil {
+	fail := func(err error) (*CappedLogWriter, error) {
 		_ = f.Close()
 		return nil, err
 	}
-	return &CappedLogWriter{file: f, cap: capBytes}, nil
+	info, err := f.Stat()
+	if err != nil {
+		return fail(err)
+	}
+	if !info.Mode().IsRegular() {
+		return fail(errors.New("raw log is not a regular file"))
+	}
+	size := info.Size()
+	payloadCap := capBytes - int64(len(marker))
+	truncated := false
+	if size == capBytes {
+		tail := make([]byte, len(marker))
+		if _, err := f.ReadAt(tail, size-int64(len(marker))); err != nil {
+			return fail(err)
+		}
+		truncated = string(tail) == marker
+	}
+	if !truncated && size > payloadCap {
+		return fail(fmt.Errorf("inconsistent raw log size %d for cap %d", size, capBytes))
+	}
+	if err := f.Chmod(0o600); err != nil {
+		return fail(err)
+	}
+	written := size
+	if truncated {
+		written = payloadCap
+	}
+	return &CappedLogWriter{file: f, cap: capBytes, written: written, truncated: truncated}, nil
 }
 
-// CappedLogWriter writes at most cap bytes and appends a truncation marker.
+type cappedLogFile interface {
+	Write([]byte) (int, error)
+	Sync() error
+	Close() error
+}
+
+// CappedLogWriter reserves marker space within the cap.
 type CappedLogWriter struct {
-	file      *os.File
+	file      cappedLogFile
 	cap       int64
 	written   int64
 	truncated bool
+	disabled  bool
 }
 
-// Write implements io.Writer.
+// Write implements io.Writer. Once a sink fails, it is never written again.
 func (w *CappedLogWriter) Write(p []byte) (int, error) {
-	if w.truncated {
+	if len(p) == 0 || w.truncated {
 		return len(p), nil
 	}
-	marker := TruncationMarker()
-	payloadCap := w.cap - int64(len(marker))
-	if payloadCap < 0 {
-		payloadCap = 0
+	if w.disabled {
+		return 0, errors.New("raw log sink disabled")
 	}
-	remaining := payloadCap - w.written
-	if remaining <= 0 {
-		if err := w.markTruncated(); err != nil {
-			return 0, err
+	remaining := w.cap - int64(len(TruncationMarker())) - w.written
+	toWrite := len(p)
+	if int64(toWrite) > remaining {
+		toWrite = int(remaining)
+	}
+	if toWrite > 0 {
+		n, err := w.file.Write(p[:toWrite])
+		if n < 0 || n > toWrite {
+			w.disabled = true
+			return 0, errors.New("invalid raw log write count")
 		}
-		return len(p), nil
-	}
-	if int64(len(p)) <= remaining {
-		n, err := w.file.Write(p)
 		w.written += int64(n)
-		return n, err
+		if err == nil && n != toWrite {
+			err = io.ErrShortWrite
+		}
+		if err != nil {
+			w.disabled = true
+			return n, err
+		}
 	}
-	n, err := w.file.Write(p[:remaining])
-	w.written += int64(n)
-	if err != nil {
-		return n, err
-	}
-	if err := w.markTruncated(); err != nil {
-		return n, err
+	if toWrite < len(p) {
+		marker := []byte(TruncationMarker())
+		n, err := w.file.Write(marker)
+		if err == nil && n != len(marker) {
+			err = io.ErrShortWrite
+		}
+		if err != nil {
+			w.disabled = true
+			return toWrite, err
+		}
+		w.truncated = true
 	}
 	return len(p), nil
 }
@@ -222,26 +275,12 @@ func (w *CappedLogWriter) Close() error {
 	return w.file.Close()
 }
 
-// CapturedBytes reports the provider payload bytes successfully written before
-// the log cap. It is intended for bounded capture diagnostics.
+// CapturedBytes reports cumulative provider payload bytes retained by the log.
 func (w *CappedLogWriter) CapturedBytes() int64 {
 	if w == nil {
 		return 0
 	}
 	return w.written
-}
-
-func (w *CappedLogWriter) markTruncated() error {
-	if w.truncated {
-		return nil
-	}
-	marker := TruncationMarker()
-	if int64(len(marker)) > w.cap {
-		marker = marker[:int(w.cap)]
-	}
-	_, err := w.file.WriteString(marker)
-	w.truncated = true
-	return err
 }
 
 // TruncationMarker is appended once when a capped log reaches its limit.

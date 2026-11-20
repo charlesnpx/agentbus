@@ -417,3 +417,54 @@ func TestJobTimeoutDeadlineStartsAtSlotReservation(t *testing.T) {
 }
 
 func ptrString(value string) *string { return &value }
+
+func TestExecutionRemainsRegisteredUntilCaptureCloses(t *testing.T) {
+	events := make(chan engine.Event)
+	var closeOnce sync.Once
+	release := func() { closeOnce.Do(func() { close(events) }) }
+	started := make(chan struct{})
+	backend := &executionFakeBackend{name: "late-capture"}
+	backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) {
+		return &executionFakeSession{turn: func(_ context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
+			input.OnProcessStart(engine.ProcessRef{PID: 4213, PGID: 4213, StartTime: "late-capture-token"}, 0)
+			close(started)
+			return events, nil
+		}, interrupt: func(context.Context) error { return nil }}, nil
+	}
+	server := concurrencyTestServer(t, 1, 1, 1, backend)
+	t.Cleanup(release)
+	server.processGroupGoneFn = func(int) (bool, error) { return true, nil }
+	server.turnDrainGrace = 25 * time.Millisecond
+	receipt := submitConcurrencyJob(t, server, backend.Name(), "capture-fence")
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("turn did not start")
+	}
+	outcome := server.handleJobCancel(mustJSON(t, protocol.JobCancelParams{JobID: receipt.JobID}))
+	if outcome.err != nil {
+		t.Fatalf("cancel: %#v", outcome.err)
+	}
+	server.executionMu.Lock()
+	_, active := server.executions[receipt.JobID]
+	server.executionMu.Unlock()
+	if !active {
+		t.Fatal("execution retired while capture stream remained open")
+	}
+	release()
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	for {
+		server.executionMu.Lock()
+		_, active = server.executions[receipt.JobID]
+		server.executionMu.Unlock()
+		if !active {
+			break
+		}
+		select {
+		case <-deadline.C:
+			t.Fatal("execution remained registered after capture closed")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
