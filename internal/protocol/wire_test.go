@@ -279,11 +279,11 @@ func TestWireGoldenJSONRoundTrip(t *testing.T) {
 		{
 			name: "HelloResult",
 			value: HelloResult{
-				ProtocolVersion: 3,
+				ProtocolVersion: Version,
 				BackendMetadata: []BackendInfo{{Name: "codex", Models: []string{"gpt-5"}, Efforts: []string{"high"}}},
 			},
 			new:  func() any { return new(HelloResult) },
-			want: `{"protocolVersion":3,"daemonRelease":"","backends":[{"backend":"codex","models":["gpt-5"],"efforts":["high"]}]}`,
+			want: `{"protocolVersion":4,"daemonRelease":"","backends":[{"backend":"codex","models":["gpt-5"],"efforts":["high"]}]}`,
 		},
 		{
 			name:  "JobFailureWire",

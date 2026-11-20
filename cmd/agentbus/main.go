@@ -143,12 +143,7 @@ func (a *app) run(ctx context.Context, args []string, stdin io.Reader, out, errO
 			return 0
 		}
 	}
-	// These are spellings of version, not additional commands.
-	command := args[0]
-	if command == "--version" || command == "-version" || command == "-V" {
-		command = "version"
-	}
-	switch command {
+	switch args[0] {
 	case "version":
 		return a.runVersion(args[1:], out, errOut)
 	case "backends":
@@ -1702,7 +1697,7 @@ func writeJSON(out io.Writer, v any) error {
 func printRootHelp(out io.Writer) {
 	fmt.Fprint(out, `Usage:
   agentbus --help | -h | help
-  agentbus version [--json] (aliases: --version, -version, -V)
+  agentbus version [--json]
   agentbus backends [--json]
   agentbus serve [--foreground] [--max-jobs <n>] [--max-jobs-per-backend <n>] [--max-queued <n>] [--prune-interval 24h]
   agentbus status [<job-id>] [--workspace-key <key>] [--tag <key=value>] [--state <state>] [--limit <n>] [--before <cursor> | --all] [--json]
@@ -1730,6 +1725,10 @@ Status and transcript reads exit zero when successful. Result and cancel exit co
 Steering exit codes: rejected=17, delivery-unknown=18.
 Session discard permanently revokes resume for the whole Codex conversation.
 Set AGENTBUS_NO_AUTOSTART=1 to prevent clients from starting a daemon.
+Submit tasks through Delegate or the typed client. Inspect and edit share one
+host execution policy; inspect is an instruction, not a permissions boundary.
+Inspect can use ordinary build/test artifacts, caches, temporary files, and
+local services.
 `)
 }
 

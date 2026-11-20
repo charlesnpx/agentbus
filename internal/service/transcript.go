@@ -229,16 +229,11 @@ func readTranscriptSidecar(path string, params protocol.JobTranscriptParams) tra
 	}
 
 	captureComplete := false
-	stopLine := transcriptItemStopLine[:len(transcriptItemStopLine)-1]
 	completeLine := transcriptItemCompleteLine[:len(transcriptItemCompleteLine)-1]
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 0, 8*1024), maxTranscriptSidecarLine)
 	for scanner.Scan() {
 		line := scanner.Bytes()
-		if bytes.Equal(line, stopLine) {
-			result.Gap = true
-			continue
-		}
 		if bytes.Equal(line, completeLine) {
 			if captureComplete {
 				result.Gap = true
@@ -252,9 +247,8 @@ func readTranscriptSidecar(path string, params protocol.JobTranscriptParams) tra
 		}
 		var control map[string]json.RawMessage
 		if err := json.Unmarshal(line, &control); err == nil {
-			_, hasAppendStopped := control["appendStopped"]
 			_, hasCaptureComplete := control["captureComplete"]
-			if hasAppendStopped || hasCaptureComplete {
+			if hasCaptureComplete {
 				finishItems()
 				result.Gap = true
 				return transcriptSidecarRead{JobTranscriptResult: result}
@@ -263,6 +257,11 @@ func readTranscriptSidecar(path string, params protocol.JobTranscriptParams) tra
 
 		var item protocol.TranscriptItem
 		if err := json.Unmarshal(line, &item); err != nil {
+			finishItems()
+			result.Gap = true
+			return transcriptSidecarRead{JobTranscriptResult: result}
+		}
+		if _, ok := transcriptKinds[item.Kind]; !ok || item.Ordinal <= 0 || item.At.IsZero() {
 			finishItems()
 			result.Gap = true
 			return transcriptSidecarRead{JobTranscriptResult: result}

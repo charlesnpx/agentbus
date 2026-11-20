@@ -260,10 +260,14 @@ func TestDuplicateSingletonFlagIsUsageError(t *testing.T) {
 }
 
 func TestDeletedCommandIsUnknown(t *testing.T) {
-	a := testApp(t)
-	code, _, stderr := runTestCLI(t, a, []string{"setup"})
-	if code != 2 || !strings.Contains(stderr, "unknown command") {
-		t.Fatalf("exit=%d stderr=%q, want unknown-command usage error", code, stderr)
+	for _, command := range []string{"setup", "--version", "-version", "-V"} {
+		t.Run(command, func(t *testing.T) {
+			a := testApp(t)
+			code, stdout, stderr := runTestCLI(t, a, []string{command})
+			if code != 2 || stdout != "" || !strings.Contains(stderr, "unknown command") {
+				t.Fatalf("exit=%d stdout=%q stderr=%q, want unknown-command usage error", code, stdout, stderr)
+			}
+		})
 	}
 }
 

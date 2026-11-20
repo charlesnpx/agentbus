@@ -24,8 +24,8 @@ const (
 )
 
 // The protocol error codes are the only codes protocol.hello, backend.inspect,
-// job.submit, job.get, job.list, job.transcript, job.cancel, job.steer, and
-// artifacts.prune may produce.
+// job.submit, job.get, job.list, job.transcript, job.cancel, job.steer,
+// artifacts.prune, and session.discard may produce.
 const (
 	ErrorUnauthorized          = "unauthorized"
 	ErrorVersionMismatch       = "protocol_version_mismatch"
@@ -39,8 +39,8 @@ const (
 )
 
 // InputMode determines whether a running task accepts follow-up instructions.
-// The empty value is the wire-compatible spelling of fixed; callers should
-// omit it when submitting fixed-input work. Unknown values are invalid.
+// The Go zero value represents an omitted field, which defaults to fixed.
+// Explicitly supplied wire values must be fixed or steerable.
 type InputMode string
 
 const (

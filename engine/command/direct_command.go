@@ -17,7 +17,7 @@ import (
 	"github.com/charlesnpx/agentbus/engine"
 )
 
-// DirectCommandRunner preserves the legacy subprocess launch path.
+// DirectCommandRunner starts and supervises subprocesses with owned pipes.
 type DirectCommandRunner struct {
 	CancelGrace time.Duration
 }

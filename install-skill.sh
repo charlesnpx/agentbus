@@ -183,19 +183,6 @@ build_agentbus() {
     return
   fi
 
-  # Air-gapped installs resolve through a pre-populated Go module cache. Keep
-  # this fallback only for source trees that still carry a vendor/ directory.
-  if [[ -d "$REPO_ROOT/vendor" ]]; then
-    add_warning "go build -mod=readonly failed; used legacy -mod=vendor fallback; air-gapped installs should pre-populate GOMODCACHE"
-    if (
-      cd -- "$REPO_ROOT"
-      go build -mod=vendor -trimpath -ldflags "-X main.version=$VERSION" -o "$output" ./cmd/agentbus
-    ) 2>>"$err_file"; then
-      rm -f -- "$err_file"
-      return
-    fi
-  fi
-
   printf 'agentbus installer: go build failed\n' >&2
   sed 's/^/go build: /' "$err_file" >&2
   rm -f -- "$err_file"

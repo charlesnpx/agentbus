@@ -16,22 +16,22 @@ import (
 	"github.com/charlesnpx/agentbus/engine/command"
 )
 
-func TestClaudeStreamJSONArgvAndPermissionProfiles(t *testing.T) {
+func TestClaudeStreamJSONArgvForBothIntents(t *testing.T) {
 	cwd := t.TempDir()
 	runner := newFakeClaudeRunner(t,
 		func(t *testing.T, proc *fakeClaudeProcess, spec command.ExecSpec) {
 			peer := newClaudePeer(t, proc)
 			peer.handshake()
 			peer.expectUser("inspect")
-			peer.emitSystem("session-readonly", "claude-sonnet")
-			peer.emitResult("success", false, "readonly done")
+			peer.emitSystem("session-inspect", "claude-sonnet")
+			peer.emitResult("success", false, "inspect done")
 		},
 		func(t *testing.T, proc *fakeClaudeProcess, spec command.ExecSpec) {
 			peer := newClaudePeer(t, proc)
 			peer.handshake()
 			peer.expectUser("repair")
-			peer.emitSystem("session-write", "claude-sonnet")
-			peer.emitResult("success", false, "write done")
+			peer.emitSystem("session-edit", "claude-sonnet")
+			peer.emitResult("success", false, "edit done")
 		},
 	)
 
@@ -41,24 +41,24 @@ func TestClaudeStreamJSONArgvAndPermissionProfiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = collectEventsWithTimeout(t, events, 2*time.Second)
-	readOnlySpec := runner.specAt(0)
-	if readOnlySpec.Dir != cwd {
-		t.Fatalf("dir = %q, want %q", readOnlySpec.Dir, cwd)
+	inspectSpec := runner.specAt(0)
+	if inspectSpec.Dir != cwd {
+		t.Fatalf("dir = %q, want %q", inspectSpec.Dir, cwd)
 	}
-	assertContainsArg(t, readOnlySpec.Argv, "-p")
-	assertArgValue(t, readOnlySpec.Argv, "--input-format", "stream-json")
-	assertArgValue(t, readOnlySpec.Argv, "--output-format", "stream-json")
-	assertContainsArg(t, readOnlySpec.Argv, "--verbose")
-	assertArgValue(t, readOnlySpec.Argv, "--model", "sonnet")
-	assertArgValue(t, readOnlySpec.Argv, "--effort", "max")
-	assertNotContainsArg(t, readOnlySpec.Argv, "--allowedTools")
-	assertNotContainsArg(t, readOnlySpec.Argv, "--disallowedTools")
-	assertNotContainsArg(t, readOnlySpec.Argv, "--strict-mcp-config")
-	assertNotContainsArg(t, readOnlySpec.Argv, "--permission-mode")
-	assertNotContainsArg(t, readOnlySpec.Argv, "--cwd")
-	assertNotContainsArg(t, readOnlySpec.Argv, "--replay-user-messages")
-	assertContainsArg(t, readOnlySpec.Argv, "--include-partial-messages")
-	assertContainsArg(t, readOnlySpec.Argv, "--dangerously-skip-permissions")
+	assertContainsArg(t, inspectSpec.Argv, "-p")
+	assertArgValue(t, inspectSpec.Argv, "--input-format", "stream-json")
+	assertArgValue(t, inspectSpec.Argv, "--output-format", "stream-json")
+	assertContainsArg(t, inspectSpec.Argv, "--verbose")
+	assertArgValue(t, inspectSpec.Argv, "--model", "sonnet")
+	assertArgValue(t, inspectSpec.Argv, "--effort", "max")
+	assertNotContainsArg(t, inspectSpec.Argv, "--allowedTools")
+	assertNotContainsArg(t, inspectSpec.Argv, "--disallowedTools")
+	assertNotContainsArg(t, inspectSpec.Argv, "--strict-mcp-config")
+	assertNotContainsArg(t, inspectSpec.Argv, "--permission-mode")
+	assertNotContainsArg(t, inspectSpec.Argv, "--cwd")
+	assertNotContainsArg(t, inspectSpec.Argv, "--replay-user-messages")
+	assertContainsArg(t, inspectSpec.Argv, "--include-partial-messages")
+	assertContainsArg(t, inspectSpec.Argv, "--dangerously-skip-permissions")
 
 	session = startFakeClaudeSession(t, engine.SessionOpts{CWD: cwd})
 	events, err = turnWithRunner(t, session, engine.TurnInput{Prompt: "repair", Intent: engine.IntentEdit}, runner)
@@ -66,11 +66,11 @@ func TestClaudeStreamJSONArgvAndPermissionProfiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = collectEventsWithTimeout(t, events, 2*time.Second)
-	writeSpec := runner.specAt(1)
-	assertContainsArg(t, writeSpec.Argv, "--dangerously-skip-permissions")
-	assertNotContainsArg(t, writeSpec.Argv, "--allowedTools")
-	assertNotContainsArg(t, writeSpec.Argv, "--disallowedTools")
-	assertNotContainsArg(t, writeSpec.Argv, "--permission-mode")
+	editSpec := runner.specAt(1)
+	assertContainsArg(t, editSpec.Argv, "--dangerously-skip-permissions")
+	assertNotContainsArg(t, editSpec.Argv, "--allowedTools")
+	assertNotContainsArg(t, editSpec.Argv, "--disallowedTools")
+	assertNotContainsArg(t, editSpec.Argv, "--permission-mode")
 }
 
 func TestClaudeInitializeOrderingAndTimeoutFailure(t *testing.T) {

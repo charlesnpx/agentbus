@@ -279,7 +279,7 @@ func TestACPTurnFlushesToolCallWithoutTerminalUpdate(t *testing.T) {
 	runner.assertRetired(t)
 }
 
-func TestACPLoadedReadOnlyTurnCancellation(t *testing.T) {
+func TestACPLoadedInspectTurnCancellation(t *testing.T) {
 	cwd := t.TempDir()
 	promptPending := make(chan struct{})
 	runner := newFakeACPRunner(t, func(t *testing.T, proc *fakeACPProcess, spec command.ExecSpec) {
@@ -316,7 +316,7 @@ func TestACPLoadedReadOnlyTurnCancellation(t *testing.T) {
 		})
 		permission := peer.expectResponse("permission-read")
 		if got := nestedString(permission, "result", "outcome", "optionId"); got != "allow-once" {
-			t.Fatalf("read-only permission response = %#v", permission)
+			t.Fatalf("inspect permission response = %#v", permission)
 		}
 		close(promptPending)
 
@@ -367,7 +367,7 @@ func TestACPLoadedReadOnlyTurnCancellation(t *testing.T) {
 	}
 	runner.assertRetired(t)
 	if process := runner.lastProcess(); process == nil || !process.stdinClosed.Load() {
-		t.Fatal("read-only ACP process did not retire after cancellation")
+		t.Fatal("inspect ACP process did not retire after cancellation")
 	}
 }
 
