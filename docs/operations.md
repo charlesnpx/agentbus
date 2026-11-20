@@ -21,9 +21,21 @@ Codex homes are private conversation state; `auth.json` and `config.toml` are
 linked from the daemon's `CODEX_HOME` or `~/.codex` when present. Provider
 state may grow while a conversation is retained.
 
-Automatic diagnostic pruning is disabled by default. `agentbus prune` previews
-eligible cleanup, and `--apply` removes eligible logs; job records, request
-bindings, results, and conversation homes are preserved.
+Automatic diagnostic pruning runs once after readiness and every 24 hours by
+default. `serve --prune-interval 0` disables both automatic passes. The
+`agentbus prune` command previews eligible cleanup, and `--apply` removes eligible logs and
+transcripts; job records, request bindings, results, and conversation homes are
+preserved. Completed-job diagnostics expire after seven days and failed,
+canceled, or unknown-job diagnostics after 30 days by default. Retained sessions
+and uncertain process cleanup do not protect diagnostics after local writers
+have retired. Prune marks them unavailable before unlinking, and a later pass
+retries any incomplete removal.
+
+To reclaim an inactive owned Codex conversation, run
+`agentbus session discard <job-id>`. It durably revokes continuation for the entire lineage before
+removing the root home. Active or cleanup-uncertain lineages are refused.
+Repeated calls can retry a failed removal; job history, results, and observed
+provider IDs remain. Retained provider data has no automatic expiry.
 
 ## Starting and selecting backends
 
@@ -44,7 +56,7 @@ entry. When the bound is reached, a new job.submit returns the typed
 before it can start a provider. Job lookup, listing, transcript, and queued
 cancellation remain available while all execution slots are occupied.
 For a queued job still in the daemon's in-memory queue, `job.submit` and
-`status --job <id>` report its one-based position among jobs for the same
+`status <job-id>` report its one-based position among jobs for the same
 backend, along with occupied backend and total slots and their limits. Human
 status prints a line such as `queue: position 3 for backend claude (12/12
 running for claude; 12/12 total)`. The projection disappears when the job
@@ -53,9 +65,10 @@ starts or is no longer in the daemon's queue.
 The timeout is execution time: it begins when the daemon reserves a slot, not
 when job.submit is accepted. `queuedAt` records queue entry and `startedAt`
 records the start transition, so status shows both the waiting age and whether
-the job is queued or running. Steerable jobs with a finite effective timeout
-and backend steering support receive one warning steer at 90% of that timeout,
-measured from slot acquisition. The warning uses the reserved message ID
+the job is queued or running. Both intents default to two hours; explicit zero
+means no deadline, and positive values are limited to four hours. Fixed and
+steerable jobs with a finite effective timeout and backend steering support may
+receive one best-effort warning at 90%, measured from slot acquisition. The warning uses the reserved message ID
 `agentbus-deadline-warning` and is visible in the job's steer records.
 
 There is no standalone setup command or backend probe. Admission checks only
@@ -83,9 +96,13 @@ process group before signaling. It repeats the checks before escalation. It
 records cleanup as uncertain when cleanup cannot be established. Cleanup uncertainty does not
 erase a recorded completed result.
 
-Replacing the Agentbus binary makes a running daemon finish active work and
-restart on the new binary once it has no clients or active jobs; installs do
-not signal the daemon. A manual SIGTERM initiates graceful connection shutdown
+Replacing the Agentbus binary makes a stale daemon finish accepted work and
+exit after active work and admission handling settle; installs do not signal it.
+The next ordinary client can start its selected executable. Set
+`AGENTBUS_NO_AUTOSTART=1` to prevent client autostart, including reconnects;
+empty or `0` enables it. An explicit `serve` is unaffected. During drain the
+endpoint returns `daemon_draining` until admitted store users retire and the
+store closes, then the listener and owned socket retire. A manual SIGTERM initiates shutdown
 and then cancels the service context; any jobs still running at cancellation
 are interrupted and recorded as failed with
 `cancellationReason: daemon_shutdown`.
@@ -109,7 +126,7 @@ available when their writes succeeded.
 
 ## Reading jobs and results
 
-agentbus status lists compact job summaries. With --job, its human-readable
+agentbus status lists compact job summaries. With a job ID, its human-readable
 projection omits result text, while `--json` emits the full job.get record.
 That JSON is byte-identical to `agentbus result --json` and deliberately
 includes inline result text when the record has it.
@@ -118,18 +135,19 @@ The full record contains the task intent and, after the starting transition,
 an immutable `selection` of model and effort. Requested, selected, and reported
 values have distinct meanings; provider observations may be absent.
 
-agentbus result --job <id> reads the same full record. For a completed job it
+agentbus result <job-id> reads the same full record. For a completed job it
 writes the authoritative result to standard output. It writes failure detail or
 the absence of a result to standard error for other states. When it must read a
 result artifact, it verifies both its byte count and recorded digest.
 
-agentbus cancel --job <id> sends job.cancel, then reads the full record to
+agentbus cancel <job-id> sends job.cancel, then reads the full record to
 choose the appropriate exit status.
 
 ## Exit codes
 
-For a selected job, the documented exit status is computed from state, failure
-class, and schema compliance:
+Successful status and transcript reads exit zero regardless of stored state.
+Result and cancellation status is computed from state, failure class, and
+schema compliance:
 
 | Code | Condition |
 | --- | --- |
@@ -177,9 +195,8 @@ marks recovered running work unknown and never relaunches it; the reaper signals
 a recorded process group only when its live start token exactly matches the
 recorded token. This is the deliberate trade-off for preventing duplicate work.
 
-Result artifacts and all artifacts outside the first retention policy remain
-until an operator removes them. Automatic pruning remains disabled unless
-`serve --prune-interval` is set.
+Result artifacts and conversation homes remain until deliberately removed;
+diagnostic pruning does not reclaim provider or tool caches.
 
 Downstream pins are recorded in each consumer's own go.mod and are not restated
 here, because a version written into this runbook goes stale without warning.

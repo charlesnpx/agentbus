@@ -429,3 +429,41 @@ func TestSteerAfterCompletionOrCancelIsNotRunning(t *testing.T) {
 		})
 	}
 }
+
+func TestFixedTerminalSteeringAndReservedWarningID(t *testing.T) {
+	session := &testSteerSession{onCall: func() { t.Error("caller steer reached fixed provider") }}
+	server, store, run, jobID := newRunningSteerTestJob(t, protocol.InputModeFixed, session, false)
+	reserved := server.handleJobSteer(mustJSON(t, protocol.JobSteerParams{JobID: jobID, MessageID: deadlineWarningMessageID, Text: "caller text"}))
+	if reserved.err == nil || reserved.err.Data.Code != protocol.ErrorInvalidTaskSpec {
+		t.Fatalf("reserved ID = %#v", reserved.err)
+	}
+	run.retireTurn(store, turnOutcome{cleanup: protocol.CleanupClean})
+	server.markTerminal(store, jobID, jobstore.TerminalUpdate{State: protocol.PublicStateCompleted, Cleanup: protocol.CleanupClean})
+	receipt := steerForTest(t, server, protocol.JobSteerParams{JobID: jobID, MessageID: "after-completion", Text: "new evidence"})
+	if receipt.Status != protocol.SteerStatusRejected || receipt.Reason != protocol.SteerReasonNotSteerable {
+		t.Fatalf("fixed terminal receipt = %#v", receipt)
+	}
+}
+
+func TestDeadlineNoticeSkipsUnlimitedCorrectionAndRetiredTurns(t *testing.T) {
+	for _, condition := range []string{"unlimited", "correction", "retired"} {
+		t.Run(condition, func(t *testing.T) {
+			session := &testSteerSession{onCall: func() { t.Error("notice reached an ineligible turn") }}
+			server, store, run, jobID := newRunningSteerTestJob(t, protocol.InputModeFixed, session, true)
+			switch condition {
+			case "unlimited":
+				server.startDeadlineWarning(jobID, run, session, context.Background(), time.Now(), 0, protocol.InputModeFixed)
+			case "correction":
+				run.setSchemaCorrectionActive(true)
+				server.recordDeadlineWarning(context.Background(), run, jobID, "finish soon")
+			case "retired":
+				run.retireTurn(store, turnOutcome{cleanup: protocol.CleanupClean})
+				server.recordDeadlineWarning(context.Background(), run, jobID, "finish soon")
+			}
+			record, err := store.Get(jobID)
+			if err != nil || session.calls.Load() != 0 || len(record.Steers) != 0 {
+				t.Fatalf("ineligible warning: calls=%d steers=%#v err=%v", session.calls.Load(), record.Steers, err)
+			}
+		})
+	}
+}

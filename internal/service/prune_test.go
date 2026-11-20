@@ -43,8 +43,12 @@ func TestPruneDryRunApplyEligibilityAndTranscriptMarker(t *testing.T) {
 		"stderr": "ferr",
 		"items":  "fi",
 	})
+	eligibleLogs := make([]string, 0)
+	for _, record := range []jobstore.Record{retained, resumable, uncertain} {
+		eligibleLogs = append(eligibleLogs, writePruneTestLogs(t, record, map[string]string{"stdout": "keep"})...)
+	}
 	protectedLogs := make([]string, 0)
-	for _, record := range []jobstore.Record{retained, resumable, uncertain, queued, running, young} {
+	for _, record := range []jobstore.Record{queued, running, young} {
 		protectedLogs = append(protectedLogs, writePruneTestLogs(t, record, map[string]string{"stdout": "keep"})...)
 	}
 	resultPath := filepath.Join(root, "artifacts", "results", completed.JobID+".txt")
@@ -69,7 +73,7 @@ func TestPruneDryRunApplyEligibilityAndTranscriptMarker(t *testing.T) {
 	if !ok {
 		t.Fatalf("default prune dry-run result type = %T", dryRunOutcome.result)
 	}
-	if !dryRun.DryRun || dryRun.SuccessfulOlderThan != "168h0m0s" || dryRun.FailedOlderThan != "720h0m0s" || len(dryRun.WouldRemove) != 6 || dryRun.WouldRemoveBytes != 24 || len(dryRun.Removed) != 0 {
+	if !dryRun.DryRun || dryRun.SuccessfulOlderThan != "168h0m0s" || dryRun.FailedOlderThan != "720h0m0s" || len(dryRun.WouldRemove) != 9 || dryRun.WouldRemoveBytes != 36 || len(dryRun.Removed) != 0 {
 		t.Fatalf("dry-run selection = %d items, %d bytes, removed=%d: %+v", len(dryRun.WouldRemove), dryRun.WouldRemoveBytes, len(dryRun.Removed), dryRun)
 	}
 	for _, path := range append(append([]string(nil), completedLogs...), failedLogs...) {
@@ -86,12 +90,9 @@ func TestPruneDryRunApplyEligibilityAndTranscriptMarker(t *testing.T) {
 		reasonByJob[skipped.JobID] = skipped.Reason
 	}
 	for jobID, want := range map[string]string{
-		retained.JobID:  "session is retained",
-		resumable.JobID: "backend session is resumable",
-		uncertain.JobID: "cleanup is uncertain",
-		queued.JobID:    "job is active or queued",
-		running.JobID:   "job is active or queued",
-		young.JobID:     "job is younger than the 168h0m0s retention threshold",
+		queued.JobID:  "job is active or queued",
+		running.JobID: "job is active or queued",
+		young.JobID:   "job is younger than the 168h0m0s retention threshold",
 	} {
 		if reasonByJob[jobID] != want {
 			t.Errorf("skip reason for %s = %q, want %q", jobID, reasonByJob[jobID], want)
@@ -102,12 +103,17 @@ func TestPruneDryRunApplyEligibilityAndTranscriptMarker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(applied.Removed) != 6 || applied.RemovedBytes != 24 || len(applied.WouldRemove) != 0 {
+	if len(applied.Removed) != 9 || applied.RemovedBytes != 36 || len(applied.WouldRemove) != 0 {
 		t.Fatalf("apply result = %d items, %d bytes, would-remove=%d: %+v", len(applied.Removed), applied.RemovedBytes, len(applied.WouldRemove), applied)
 	}
 	for _, path := range append(append([]string(nil), completedLogs...), failedLogs...) {
 		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 			t.Errorf("apply left log %s: %v", path, err)
+		}
+	}
+	for _, path := range eligibleLogs {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("apply left eligible retained or uncertain log %s: %v", path, err)
 		}
 	}
 	for _, path := range protectedLogs {
@@ -131,7 +137,7 @@ func TestPruneDryRunApplyEligibilityAndTranscriptMarker(t *testing.T) {
 	}
 }
 
-func TestAutomaticPruneSweepBoundsRecordWork(t *testing.T) {
+func TestAutomaticPruneSweepVisitsAllRecordsAndBoundsDetails(t *testing.T) {
 	server := newTestServer(t, t.TempDir(), Config{})
 	store, err := server.ensureJobStore()
 	if err != nil {
@@ -141,7 +147,7 @@ func TestAutomaticPruneSweepBoundsRecordWork(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := range 70 {
+	for i := range 140 {
 		requestID := fmt.Sprintf("automatic-%02d", i)
 		if _, _, err := store.SubmitTx(jobstore.RequestKey{WorkspaceKey: "automatic-prune", RequestID: requestID}, taskSpec, func(string) (jobstore.Record, error) {
 			return jobstore.Record{Backend: "fake"}, nil
@@ -150,13 +156,9 @@ func TestAutomaticPruneSweepBoundsRecordWork(t *testing.T) {
 		}
 	}
 
-	firstSweep, err := server.automaticPruneSweep(store)
-	if err != nil || len(firstSweep.Skipped) != autoPruneMaxJobsPerSweep || server.pruneApplyCursor == "" {
-		t.Fatalf("first sweep skipped=%d cursor=%q err=%v", len(firstSweep.Skipped), server.pruneApplyCursor, err)
-	}
-	lastSweep, err := server.automaticPruneSweep(store)
-	if err != nil || len(lastSweep.Skipped) != 6 || server.pruneApplyCursor != "" {
-		t.Fatalf("last sweep skipped=%d cursor=%q err=%v", len(lastSweep.Skipped), server.pruneApplyCursor, err)
+	sweep, err := server.automaticPruneSweep(store)
+	if err != nil || len(sweep.Skipped) != maxPruneDetails || sweep.SkippedCount != 140 || !sweep.DetailsTruncated {
+		t.Fatalf("sweep skipped=%d count=%d truncated=%t err=%v, want all 140 records and bounded details", len(sweep.Skipped), sweep.SkippedCount, sweep.DetailsTruncated, err)
 	}
 }
 
@@ -187,6 +189,40 @@ func TestAutomaticPruneSweepRetriesMarkedLogSidecars(t *testing.T) {
 		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 			t.Errorf("sweep left marked sidecar %s: %v", path, err)
 		}
+	}
+}
+
+func TestPruneWaitsForTerminalExecutionCaptureToRetire(t *testing.T) {
+	server := newTestServer(t, t.TempDir(), Config{})
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := newPruneTestJob(t, server, "terminal-with-capture", protocol.PublicStateCompleted, protocol.CleanupUncertain, false, "")
+	paths := writePruneTestLogs(t, record, map[string]string{"stdout": "still draining"})
+	server.executionMu.Lock()
+	server.executions = map[string]*activeExecution{record.JobID: {jobID: record.JobID}}
+	server.executionMu.Unlock()
+	result, err := server.pruneArtifacts(store, false, defaultSuccessfulPruneAge, defaultFailedPruneAge)
+	if err != nil || result.SkippedCount != 1 || len(result.Skipped) != 1 || result.Skipped[0].Reason != "job still has an active execution" {
+		t.Fatalf("prune while capture active = %#v, %v", result, err)
+	}
+	if stored, err := store.Get(record.JobID); err != nil || stored.LogsPruned {
+		t.Fatalf("active capture was marked pruned: %#v, %v", stored, err)
+	}
+	if _, err := os.Stat(paths[0]); err != nil {
+		t.Fatalf("active capture file was removed: %v", err)
+	}
+	server.executionMu.Lock()
+	delete(server.executions, record.JobID)
+	server.executionMu.Unlock()
+	result, err = server.pruneArtifacts(store, false, defaultSuccessfulPruneAge, defaultFailedPruneAge)
+	if err != nil || result.RemovedCount != 1 {
+		t.Fatalf("prune after capture retirement = %#v, %v", result, err)
+	}
+	stored, err := store.Get(record.JobID)
+	if err != nil || !stored.LogsPruned || stored.Cleanup != protocol.CleanupUncertain {
+		t.Fatalf("retired capture marker = %#v, %v", stored, err)
 	}
 }
 

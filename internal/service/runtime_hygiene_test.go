@@ -294,9 +294,9 @@ func TestManagedCodexHomeIdentityMismatchIsRetained(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cleanup, _ := finalizeManagedCodexHome(home, jobstore.Record{State: protocol.PublicStateCompleted}, protocol.CleanupClean, nil)
-	if cleanup != protocol.CleanupUncertain {
-		t.Fatalf("cleanup = %q, want %q", cleanup, protocol.CleanupUncertain)
+	cleanup, diagnostics := finalizeManagedCodexHome(home, jobstore.Record{State: protocol.PublicStateCompleted}, protocol.CleanupClean, nil)
+	if cleanup != protocol.CleanupClean || len(diagnostics) == 0 {
+		t.Fatalf("cleanup = %q diagnostics=%v, want clean with deletion diagnostic", cleanup, diagnostics)
 	}
 	if _, err := os.Stat(marker); err != nil {
 		t.Fatalf("replacement managed home marker stat = %v, want retained", err)

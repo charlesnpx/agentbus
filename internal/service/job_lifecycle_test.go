@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -182,16 +183,25 @@ func TestResumableProjectionExplainsRetentionBasis(t *testing.T) {
 			want:  "backend session is recorded and was kept because the job ended unknown; failed, canceled, and unknown jobs keep their session",
 		},
 	}
-	server := &Server{}
+	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "fake"}}})
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			projection := server.resumableProjection(jobstore.Record{
-				JobID:            "resume-target",
-				Backend:          "fake",
-				BackendSessionID: backendSessionID,
-				RetainSession:    test.retain,
-				State:            test.state,
-			})
+			params := submissionParams("projection-"+strings.ReplaceAll(test.name, " ", "-"), "request", "fake", t.TempDir(), "task")
+			params.TaskSpec.RetainSession = test.retain
+			submitted := submitResultForTest(t, submitForTest(t, server, params))
+			update := jobstore.TerminalUpdate{State: test.state, Cleanup: protocol.CleanupClean, BackendSessionID: backendSessionID}
+			if test.state == protocol.PublicStateFailed {
+				update.FailureClass = protocol.FailureClassInternal
+			}
+			record, err := store.MarkTerminal(submitted.JobID, update)
+			if err != nil {
+				t.Fatal(err)
+			}
+			projection := server.resumableProjection(record)
 			if !projection.Eligible || projection.Reason != test.want {
 				t.Fatalf("resumability = %#v, want eligible reason %q", projection, test.want)
 			}
@@ -1217,9 +1227,9 @@ func TestRestartDuringCorrectionPreservesRetiredSessionForResume(t *testing.T) {
 	}
 	params := submissionParams("restart-resume-workspace", "restart-resume-request", "restart-running", t.TempDir(), "continue")
 	params.TaskSpec.ResumeJobID = submitted.JobID
-	resumed := submitResultForTest(t, submitForTest(t, restarted, params))
-	if resumed.State != protocol.PublicStateQueued {
-		t.Fatalf("resume after restart reconciliation = %#v, want queued job", resumed)
+	outcome := submitForTest(t, restarted, params)
+	if outcome.err == nil || outcome.err.Data.Code != protocol.ErrorInvalidTaskSpec || !strings.Contains(outcome.err.Message, "cleanup_uncertain") {
+		t.Fatalf("resume after uncertain recovery = %#v, want refusal", outcome.err)
 	}
 }
 

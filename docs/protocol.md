@@ -4,7 +4,7 @@ Agentbus protocol version 4 is a JSON-RPC 2.0 service over a local,
 newline-delimited Unix socket. Each frame is one JSON object followed by a
 newline. The daemon accepts only protocol version 4.
 
-The wire surface has nine methods:
+The wire surface has ten methods:
 
 | Method | Purpose |
 | --- | --- |
@@ -17,6 +17,7 @@ The wire surface has nine methods:
 | job.cancel | Request cancellation of one job. |
 | artifacts.prune | Preview or remove eligible Agentbus-owned diagnostic artifacts. |
 | job.steer | Submit one bounded follow-up instruction to an active steerable job. |
+| session.discard | Revoke continuation for an inactive owned Codex conversation and remove its home. |
 
 A client must call protocol.hello successfully before any other method on the
 connection. A second hello on the same connection is invalid. Unknown methods
@@ -63,6 +64,8 @@ Agentbus errors. The stable data.code values are:
 | invalid_task_spec | Parameters, identity, task specification, or inline schema are invalid. |
 | queue_full | The new submission would exceed the daemon's bounded waiting queue. |
 | unknown_job | No job has the requested jobId. |
+| daemon_draining | The daemon has stopped admitting methods and is releasing its store. |
+| session_discard_refused | The conversation cannot be discarded; data.reason identifies why. |
 
 jobId is included when the error relates to a known or requested job. Clients
 should branch on data.code, not on message text.
@@ -184,8 +187,13 @@ Omitted and explicitly supplied defaults have different canonical requests.
 
 `resumeJobId` names a prior job with a recorded provider session. A resumed
 Codex job uses the root conversation home under
-`<state-root>/sessions/codex/<root-job-id>`; a missing home is not recreated.
-The caller must serialize access to a shared conversation.
+`<state-root>/sessions/codex/<root-job-id>`; a missing or symlinked home is not
+recreated. Agentbus rejects a new continuation if any member of the lineage is
+queued, running, still locally active, or has uncertain cleanup. A completed
+target must have requested retention; an unsuccessful target may be resumed
+when its provider session ID is known and the lineage is clean. Matching replay
+is resolved before these availability checks. Embedded callers must serialize
+their own separate Session objects that share a conversation.
 
 The result always includes the resolved timeout:
 
@@ -301,7 +309,7 @@ reason, log paths, or process claims.
 Workspace filtering is scoping, not ownership. The local Unix socket has no
 stable authenticated caller identity, so Agentbus cannot enforce who owns a
 job. workspaceKey is an opaque, submitter-chosen namespace, and Agentbus
-cannot derive another tool's key. Therefore, status without --job sends no
+cannot derive another tool's key. Therefore, status without a job ID sends no
 workspace filter and lists every workspace; a caller that knows a key can use
 --workspace-key <key> to filter the list.
 
@@ -410,8 +418,32 @@ Thresholds use Go duration syntax and default to `168h` for completed jobs and
 
 The result contains `wouldRemove` and `wouldRemoveBytes` for a dry run,
 `removed` and `removedBytes` for an apply pass, and `skipped` entries with a
-job ID and reason. Diagnostic pruning preserves durable records, request
-bindings, results, and conversation homes.
+job ID and reason. The corresponding `wouldRemoveCount`, `removedCount`, and
+`skippedCount` cover the full pass. Each detail list is limited to 128 entries;
+`detailsTruncated` is true when entries were omitted. Diagnostic pruning
+preserves durable records, request bindings, results, and conversation homes.
+Retained sessions and uncertain process cleanup do not prevent pruning after
+local capture writers have retired. Automatic passes run after readiness and
+every 24 hours unless `serve --prune-interval 0` disables them.
+
+## session.discard
+
+`session.discard` takes `{"jobId":"string"}` naming any member of an owned
+Codex conversation. Under the same admission lock as resume, the daemon refuses
+an active or cleanup-uncertain lineage and commits one root
+`sessionDiscardedAt` timestamp before attempting home removal. A new resume
+then fails with `invalid_task_spec` and `data.reason: session_discarded`;
+matching request replay still returns the original job. Detailed records for
+all members project the root timestamp without modifying their history,
+results, terminal timestamps, or observed provider session IDs.
+
+The result is `{rootJobId, sessionDiscardedAt, homeRemoval}`, where
+`homeRemoval` is `removed`, `already_absent`, or `failed`; failures include a
+bounded `diagnostic` and can be retried without changing the timestamp. Unknown
+jobs return `unknown_job`. Other refusals use `session_discard_refused` and a
+`data.reason` of `unsupported_backend`, `invalid_lineage`, `active_lineage`, or
+`cleanup_uncertain`, with a blocking job ID when applicable. This operation
+never removes Claude or Cursor homes, source credentials, or normal tool caches.
 
 ## job.get
 
@@ -491,8 +523,9 @@ promise that the provider will accept the resume. Eligibility requires a
 recorded backend session ID, which is not exposed on the job record. The
 human-readable `reason` explains which retention rule applied; clients should
 not depend on its exact wording. deadline and remainingMs are present for a
-running job with a finite effective timeout. deadline is derived from startedAt
-plus timeout.effective; remainingMs is the current time left, clamped at zero.
+running job with a finite effective timeout. The deadline is measured from
+execution-slot acquisition; remainingMs is the current time left, clamped at
+zero.
 
 modelRequested and effortRequested preserve only values in the submitted
 TaskSpec, so they may be absent when a configured daemon default was applied.
@@ -551,7 +584,7 @@ The result reports the durable public state after the cancellation request:
 
 If the job is already terminal, cancellation returns that existing state. A
 race with completion also returns the first terminal state recorded by the
-daemon. Read job.get or `agentbus status --job <id>` for the persisted
+daemon. Read job.get or `agentbus status <job-id>` for the persisted
 cancellationReason.
 
 ## job.steer
@@ -600,14 +633,16 @@ return `backend_unsupported`.
 restart, an admitted steer without a recorded outcome becomes
 `unknown`/`delivery_unconfirmed`; it is never sent again automatically.
 Deduplication is client-request identity, not provider exactly-once delivery.
-For a steerable job with a finite effective timeout, a session that supports
-steering receives one daemon warning steer when 90% of the timeout has elapsed
+For a fixed or steerable job with a finite effective timeout, a session that supports
+steering may receive one daemon warning steer when 90% of the timeout has elapsed
 since slot acquisition. It uses the reserved message ID
 `agentbus-deadline-warning` and appears in the job's `steers` records like any
 other steer. Client requests that could collide with this reserved ID are
-rejected with invalid params. No warning is recorded for fixed-mode jobs, jobs
-without a timeout, or sessions without steering support. If 90% has elapsed
-before the provider turn becomes active, the warning is not sent.
+rejected with invalid params in either mode. No warning is sent for unlimited
+jobs, sessions without steering support, or during correction or retirement.
+If initialization crosses the threshold and time remains when the initial turn
+accepts control, the warning is sent immediately. Delivery is best effort and
+does not change the deadline or add review evidence.
 The daemon does not promise simultaneous interruption across backends, provider
 compliance with the new instruction, a stable provider turn ID across an
 interrupt-and-continue, rollback of already-started tools, a fresh-session

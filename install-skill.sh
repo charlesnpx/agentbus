@@ -230,7 +230,7 @@ report_live_daemon_upgrade() {
       continue
     fi
     matched=1
-    add_warning "running agentbus daemon (pid $pid) will restart on the new binary once it has no clients or active jobs; in-flight jobs are not interrupted"
+    add_warning "running agentbus daemon (pid $pid) will drain accepted work and exit when its binary becomes stale; the next ordinary client can start the selected binary"
   done
   if [[ $matched -eq 0 ]]; then
     add_warning "no matching running agentbus daemon found at $TOOL_PATH"

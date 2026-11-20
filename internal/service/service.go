@@ -1,6 +1,6 @@
 //go:build darwin || linux
 
-// Package service exposes the transport and lifecycle for the version-3
+// Package service exposes the transport and lifecycle for the version-4
 // agentbus daemon, including its complete job wire surface.
 package service
 
@@ -122,10 +122,13 @@ type serveLifecycle struct {
 
 	acceptSettleOnce sync.Once
 	clients          sync.WaitGroup
-
-	shutdownMu   sync.Mutex
-	shutdownDone chan struct{}
-	shutdownErr  error
+	connectionsMu    sync.Mutex
+	connections      map[net.Conn]struct{}
+	pruneCancel      context.CancelFunc
+	pruneWG          sync.WaitGroup
+	shutdownOnce     sync.Once
+	shutdownDone     chan struct{}
+	shutdownErr      error
 }
 
 func (lifecycle *serveLifecycle) settleAccept() {
@@ -148,12 +151,12 @@ type Server struct {
 	codexHomesMu      sync.Mutex
 	managedCodexHomes map[string]*managedCodexHome
 
-	jobStoreMu sync.Mutex
-	jobStore   *jobstore.Store
+	jobStoreMu   sync.Mutex
+	jobStore     *jobstore.Store
+	storeRetired bool
 
-	pruneMu          sync.Mutex
-	pruneInterval    time.Duration
-	pruneApplyCursor string
+	pruneMu       sync.Mutex
+	pruneInterval time.Duration
 
 	// processTable, processGroups, and processGroupGoneFn are the service's restart-recovery
 	// dependencies. They deliberately live here instead of in jobstore: the
@@ -174,6 +177,7 @@ type Server struct {
 	executions        map[string]*activeExecution
 	executionWG       sync.WaitGroup
 	submissionMu      sync.Mutex
+	discardMu         sync.Mutex
 	queuedJobs        []queuedJob
 	runningByBackend  map[string]int
 	maxJobs           int
@@ -192,10 +196,20 @@ type Server struct {
 	// beforeSocketStateFlockHook lets the stale-replacement regression test
 	// establish that a loser encounters the winner's held flock before release.
 	beforeSocketStateFlockHook func(*os.File)
+	// Test seams for the revocation transaction and the post-commit removal window.
+	discardSessionCommit func(*jobstore.Store, string) (jobstore.Record, error)
+	beforeDiscardRemoval func()
+	afterDiscardHomeOpen func()
 
 	clients    atomic.Int64
 	accepting  atomic.Int64
 	activeJobs atomic.Int64
+
+	admissionMu sync.Mutex
+	draining    bool
+	handlers    int
+	handlerWG   sync.WaitGroup
+	quietChange chan struct{}
 
 	mu                 sync.Mutex
 	lastActivity       time.Time
@@ -203,9 +217,8 @@ type Server struct {
 	executableIdentity BinaryIdentity
 	binaryStale        bool
 
-	lifecycleMu  sync.Mutex
-	lifecycle    *serveLifecycle
-	shuttingDown *serveLifecycle
+	lifecycleMu sync.Mutex
+	lifecycle   *serveLifecycle
 }
 
 // New creates a daemon server and ensures that its state root and token file
@@ -302,6 +315,7 @@ func New(cfg Config) (*Server, error) {
 		pruneInterval:     cfg.PruneInterval,
 		readyHook:         cfg.ReadyHook,
 		lastActivity:      time.Now().UTC(),
+		quietChange:       make(chan struct{}, 1),
 	}, nil
 }
 
@@ -340,96 +354,106 @@ func (s *Server) serve(ctx, startupCtx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer s.closeJobStore()
-	// Startup sweeping is deliberately absent: SIGKILL-orphaned leaves under
-	// the Codex layout are a known residual, and removing them is an operator
-	// action rather than a daemon guess.
 	if err := s.reconcileRecoveredJobs(store); err != nil {
+		s.closeJobStore()
 		return err
 	}
 	if err := s.captureBinaryIdentity(); err != nil {
+		s.closeJobStore()
 		return err
 	}
 	if err := startupCtx.Err(); err != nil {
+		s.closeJobStore()
 		return err
 	}
 	listener, socketIdentity, err := s.listen()
 	if err != nil {
+		s.closeJobStore()
 		return err
 	}
-	serveCtx, cancel := context.WithCancel(ctx)
+	serveCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	pruneCtx, pruneCancel := context.WithCancel(serveCtx)
 	s.beginExecutions(serveCtx)
-	var pruneWG sync.WaitGroup
 	lifecycle := &serveLifecycle{
-		listener:      listener,
-		socket:        socketIdentity,
-		cancel:        cancel,
-		acceptSettled: make(chan struct{}),
-		serveDone:     make(chan struct{}),
+		listener: listener, socket: socketIdentity, cancel: cancel,
+		acceptSettled: make(chan struct{}), serveDone: make(chan struct{}),
+		shutdownDone: make(chan struct{}), connections: make(map[net.Conn]struct{}), pruneCancel: pruneCancel,
 	}
 	if err := s.registerLifecycle(lifecycle); err != nil {
+		pruneCancel()
 		cancel()
 		_ = listener.Close()
 		s.removeOwnedSocket(socketIdentity, "duplicate serve")
+		s.closeJobStore()
 		return err
 	}
-	defer func() {
-		lifecycle.settleAccept()
-		_ = listener.Close()
-		s.removeOwnedSocket(socketIdentity, "server shutdown")
-		cancel()
-		pruneWG.Wait()
-		s.clearLifecycle(lifecycle)
-		close(lifecycle.serveDone)
-	}()
+	defer func() { s.clearLifecycle(lifecycle); close(lifecycle.serveDone) }()
 	if err := startupCtx.Err(); err != nil {
+		s.startShutdown(lifecycle, false)
+		lifecycle.settleAccept()
+		<-lifecycle.shutdownDone
 		return err
 	}
 	if s.readyHook != nil {
 		if err := s.readyHook(ServeReadyInfo{StateRoot: s.stateRoot, SocketPath: s.socketPath}); err != nil {
+			s.startShutdown(lifecycle, false)
+			lifecycle.settleAccept()
+			<-lifecycle.shutdownDone
 			return err
 		}
 	}
-	if s.pruneInterval > 0 {
-		pruneWG.Add(1)
-		go func() {
-			defer pruneWG.Done()
-			s.automaticPruneLoop(serveCtx)
-		}()
+	s.admissionMu.Lock()
+	if s.pruneInterval > 0 && !s.draining {
+		lifecycle.pruneWG.Add(1)
+		go func() { defer lifecycle.pruneWG.Done(); s.automaticPruneLoop(pruneCtx) }()
 	}
+	s.admissionMu.Unlock()
 	s.touchActivity()
 	go func() {
-		<-serveCtx.Done()
-		_ = listener.Close()
+		select {
+		case <-ctx.Done():
+			s.startShutdown(lifecycle, false)
+		case <-lifecycle.shutdownDone:
+		}
 	}()
 	go s.idleLoop(serveCtx, cancel, listener, socketIdentity, lifecycle.acceptSettled)
-
+	var acceptErr error
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
 			lifecycle.settleAccept()
-			if serveCtx.Err() != nil {
-				return nil
+			s.admissionMu.Lock()
+			draining := s.draining
+			s.admissionMu.Unlock()
+			if !draining {
+				acceptErr = err
+				s.startShutdown(lifecycle, false)
 			}
-			if errors.Is(err, net.ErrClosed) {
-				<-serveCtx.Done()
-				return nil
-			}
-			return err
+			break
 		}
 		s.accepting.Add(1)
 		s.clients.Add(1)
+		lifecycle.connectionsMu.Lock()
+		lifecycle.connections[conn] = struct{}{}
+		lifecycle.clients.Add(1)
+		lifecycle.connectionsMu.Unlock()
 		s.accepting.Add(-1)
 		s.touchActivity()
-		lifecycle.clients.Add(1)
 		connection := &connection{server: s, conn: conn}
 		go func() {
 			defer lifecycle.clients.Done()
 			defer s.clients.Add(-1)
 			defer s.touchActivity()
+			defer func() {
+				lifecycle.connectionsMu.Lock()
+				delete(lifecycle.connections, conn)
+				lifecycle.connectionsMu.Unlock()
+			}()
 			connection.serve()
 		}()
 	}
+	<-lifecycle.shutdownDone
+	return errors.Join(acceptErr, lifecycle.shutdownErr)
 }
 
 func (s *Server) registerLifecycle(lifecycle *serveLifecycle) error {
@@ -450,8 +474,8 @@ func (s *Server) clearLifecycle(lifecycle *serveLifecycle) {
 	}
 }
 
-// Shutdown stops accepting connections, waits for accepted connections to
-// finish, conditionally removes the PID file, and ends Serve.
+// Shutdown closes admission first and keeps the listener responsive until the
+// store has been released. A caller deadline bounds the wait, not the cleanup.
 func (s *Server) Shutdown(ctx context.Context) error {
 	if s == nil {
 		return ErrShutdownNotServing
@@ -461,79 +485,93 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 	s.lifecycleMu.Lock()
 	lifecycle := s.lifecycle
+	s.lifecycleMu.Unlock()
 	if lifecycle == nil {
-		lifecycle = s.shuttingDown
-	}
-	if lifecycle == nil {
-		s.lifecycleMu.Unlock()
 		return ErrShutdownNotServing
 	}
-	lifecycle.shutdownMu.Lock()
-	if lifecycle.shutdownDone != nil {
-		done := lifecycle.shutdownDone
-		lifecycle.shutdownMu.Unlock()
-		s.lifecycleMu.Unlock()
-		return waitForShutdown(ctx, lifecycle, done)
-	}
-	done := make(chan struct{})
-	lifecycle.shutdownDone = done
-	s.shuttingDown = lifecycle
-	lifecycle.shutdownMu.Unlock()
-	s.lifecycleMu.Unlock()
-
-	err := s.shutdownLifecycle(ctx, lifecycle)
-	lifecycle.shutdownMu.Lock()
-	lifecycle.shutdownErr = err
-	close(done)
-	lifecycle.shutdownMu.Unlock()
-	s.lifecycleMu.Lock()
-	if s.shuttingDown == lifecycle {
-		s.shuttingDown = nil
-	}
-	s.lifecycleMu.Unlock()
-	return err
-}
-
-func waitForShutdown(ctx context.Context, lifecycle *serveLifecycle, done <-chan struct{}) error {
-	select {
-	case <-done:
-		lifecycle.shutdownMu.Lock()
-		err := lifecycle.shutdownErr
-		lifecycle.shutdownMu.Unlock()
-		return err
-	case <-ctx.Done():
-		return shutdownError(ctx.Err())
-	}
-}
-
-func (s *Server) shutdownLifecycle(ctx context.Context, lifecycle *serveLifecycle) (err error) {
-	defer lifecycle.cancel()
-	if closeErr := lifecycle.listener.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
-		log.Printf("agentbus daemon: close listener during graceful shutdown: %v", closeErr)
-	}
-	s.removeOwnedSocket(lifecycle.socket, "graceful shutdown")
-	if err := waitForChannel(ctx, lifecycle.acceptSettled); err != nil {
+	s.startShutdown(lifecycle, false)
+	if err := waitForChannel(ctx, lifecycle.shutdownDone); err != nil {
 		return shutdownError(err)
 	}
-	clientsDone := make(chan struct{})
-	go func() {
-		lifecycle.clients.Wait()
-		close(clientsDone)
-	}()
-	if err := waitForChannel(ctx, clientsDone); err != nil {
-		return shutdownError(err)
-	}
-	if err := s.removeOwnedPIDFile(ctx, "graceful shutdown"); err != nil {
-		return shutdownError(err)
-	}
-	// A listener closed by graceful shutdown deliberately leaves the accept loop
-	// waiting for this cancellation until accepted connections and PID teardown
-	// have completed. Cancel before waiting for Serve's final lifecycle receipt.
-	lifecycle.cancel()
 	if err := waitForChannel(ctx, lifecycle.serveDone); err != nil {
 		return shutdownError(err)
 	}
-	return nil
+	return lifecycle.shutdownErr
+}
+
+// startShutdown atomically fences method admission. Upgrade and idle drains
+// recheck quietness while holding the same gate used to admit handlers.
+func (s *Server) startShutdown(lifecycle *serveLifecycle, onlyIfQuiet bool) bool {
+	s.admissionMu.Lock()
+	if onlyIfQuiet && (s.handlers != 0 || s.activeJobs.Load() != 0 || s.accepting.Load() != 0) {
+		s.admissionMu.Unlock()
+		return false
+	}
+	s.draining = true
+	lifecycle.shutdownOnce.Do(func() {
+		lifecycle.pruneCancel()
+		go s.finishShutdown(lifecycle)
+	})
+	s.admissionMu.Unlock()
+	return true
+}
+
+func (s *Server) finishShutdown(lifecycle *serveLifecycle) {
+	s.handlerWG.Wait()
+	s.stopExecutions()
+	lifecycle.pruneWG.Wait()
+	s.jobStoreMu.Lock()
+	store := s.jobStore
+	s.jobStore = nil
+	s.storeRetired = true
+	var err error
+	if store != nil {
+		err = store.Close()
+	}
+	s.jobStoreMu.Unlock()
+	if closeErr := lifecycle.listener.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+		err = errors.Join(err, closeErr)
+	}
+	<-lifecycle.acceptSettled
+	lifecycle.connectionsMu.Lock()
+	for conn := range lifecycle.connections {
+		_ = conn.Close()
+	}
+	lifecycle.connectionsMu.Unlock()
+	lifecycle.clients.Wait()
+	if pidErr := s.removeOwnedPIDFile(context.Background(), "daemon shutdown"); pidErr != nil {
+		err = errors.Join(err, pidErr)
+	}
+	s.removeOwnedSocket(lifecycle.socket, "daemon shutdown")
+	lifecycle.cancel()
+	lifecycle.shutdownErr = err
+	close(lifecycle.shutdownDone)
+}
+
+func (s *Server) beginRequest() bool {
+	s.admissionMu.Lock()
+	defer s.admissionMu.Unlock()
+	if s.draining {
+		return false
+	}
+	s.handlers++
+	s.handlerWG.Add(1)
+	return true
+}
+
+func (s *Server) endRequest() {
+	s.admissionMu.Lock()
+	s.handlers--
+	s.handlerWG.Done()
+	s.admissionMu.Unlock()
+	s.notifyQuietChange()
+}
+
+func (s *Server) notifyQuietChange() {
+	select {
+	case s.quietChange <- struct{}{}:
+	default:
+	}
 }
 
 func waitForChannel(ctx context.Context, done <-chan struct{}) error {
@@ -611,58 +649,50 @@ func (s *Server) listen() (net.Listener, socketFileIdentity, error) {
 func (s *Server) idleLoop(ctx context.Context, cancel context.CancelFunc, listener net.Listener, socketIdentity socketFileIdentity, acceptSettled <-chan struct{}) {
 	ticker := time.NewTicker(s.idleCheckInterval)
 	defer ticker.Stop()
-	staleDraining := false
+	stale := false
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			stale := s.checkBinaryStale()
-			quiet := s.clients.Load() == 0 && s.accepting.Load() == 0 && s.activeJobs.Load() == 0
-			if staleDraining {
-				if !quiet {
-					continue
-				}
-				cancel()
-				return
-			}
-			if !quiet {
-				s.touchActivity()
-				continue
-			}
-			if stale {
-				if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-					log.Printf("agentbus daemon: close stale listener: %v", err)
-				}
-				s.removeOwnedSocket(socketIdentity, "stale daemon listener close")
-				staleDraining = true
-				select {
-				case <-ctx.Done():
-					return
-				case <-acceptSettled:
-				}
-				if s.clients.Load() == 0 && s.accepting.Load() == 0 && s.activeJobs.Load() == 0 {
-					cancel()
-					return
-				}
-				continue
-			}
-			if s.pruneInterval > 0 {
-				// An enabled periodic sweep needs a daemon that remains available
-				// until its next tick, even when no clients are connected.
-				continue
-			}
+			stale = s.checkBinaryStale()
+		case <-s.quietChange:
+		}
+		if !stale {
 			if s.idleTimeout < 0 {
+				continue
+			}
+			// An idle client keeps the daemon alive. Upgrade drains, in
+			// contrast, need only wait for admitted work to settle.
+			if s.clients.Load() != 0 {
 				continue
 			}
 			s.mu.Lock()
 			last := s.lastActivity
 			s.mu.Unlock()
-			if !time.Now().UTC().Before(last.Add(s.idleTimeout)) {
-				cancel()
-				_ = listener.Close()
+			if time.Now().UTC().Before(last.Add(s.idleTimeout)) {
+				continue
+			}
+		}
+		s.lifecycleMu.Lock()
+		lifecycle := s.lifecycle
+		s.lifecycleMu.Unlock()
+		if lifecycle != nil {
+			if s.startShutdown(lifecycle, true) {
 				return
 			}
+			continue
+		}
+		// The standalone idle-loop test supplies its own listener.
+		if s.activeJobs.Load() == 0 && s.clients.Load() == 0 && s.accepting.Load() == 0 {
+			_ = listener.Close()
+			select {
+			case <-acceptSettled:
+			case <-ctx.Done():
+				return
+			}
+			cancel()
+			return
 		}
 	}
 }
@@ -718,7 +748,7 @@ func (s *Server) checkBinaryStale() bool {
 	s.mu.Lock()
 	if !s.binaryStale {
 		s.binaryStale = true
-		log.Print("agentbus daemon: binary on disk changed; will restart when idle")
+		log.Print("agentbus daemon: binary on disk changed; will exit after accepted work settles")
 	}
 	s.mu.Unlock()
 	return true

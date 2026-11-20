@@ -77,15 +77,18 @@ func (s *Server) prepareCodexHome(layout engine.WorkspaceLayout, jobID string) (
 		return "", nil, fmt.Errorf("invalid Codex job directory name")
 	}
 	path = filepath.Join(layout.Codex, jobID)
+	sourceHome, err := resolveCodexAuthHome(s.codexAuthHome)
+	if err != nil {
+		return path, nil, err
+	}
+	if filepath.Clean(sourceHome) == filepath.Clean(path) {
+		return path, nil, errors.New("operator Codex home must not be the owned destination")
+	}
 	managed, err = createManagedCodexHome(layout, jobID)
 	if err != nil {
 		return path, managed, err
 	}
 
-	sourceHome, err := resolveCodexAuthHome(s.codexAuthHome)
-	if err != nil {
-		return path, managed, err
-	}
 	for _, name := range codexHomeLinkedFiles {
 		if err = linkManagedCodexHomeFile(sourceHome, managed, name); err != nil {
 			return path, managed, err
@@ -275,11 +278,11 @@ func finalizeManagedCodexHome(home *managedCodexHome, record jobstore.Record, cl
 		return cleanup, diagnostics
 	}
 	defer home.close()
-	if cleanup != protocol.CleanupClean || record.SessionHomeRetained() {
+	if cleanup != protocol.CleanupClean || (record.SessionHomeRetained() && strings.TrimSpace(record.BackendSessionID) != "") {
 		return cleanup, diagnostics
 	}
 	if err := removeManagedCodexHome(home); err != nil {
-		return protocol.CleanupUncertain, append(diagnostics, "managed Codex home cleanup: "+err.Error())
+		return cleanup, append(diagnostics, "managed Codex home cleanup: "+err.Error())
 	}
 	return cleanup, diagnostics
 }

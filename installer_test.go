@@ -220,7 +220,7 @@ func TestInstallerLiveInstallWarnsForMatchingDaemonWithoutStoppingIt(t *testing.
 		t.Fatalf("live install failed: %v stderr=%s stdout=%s", err, stderr, stdout)
 	}
 	warnings := decodeInstallerResult(t, stdout).Warnings
-	if !containsWarningText(warnings, fmt.Sprintf("running agentbus daemon (pid %d) will restart on the new binary once it has no clients or active jobs; in-flight jobs are not interrupted", daemon.Process.Pid)) {
+	if !containsWarningText(warnings, fmt.Sprintf("running agentbus daemon (pid %d) will drain accepted work and exit when its binary becomes stale; the next ordinary client can start the selected binary", daemon.Process.Pid)) {
 		t.Fatalf("live install warnings = %#v", warnings)
 	}
 	if err := daemon.Process.Signal(syscall.Signal(0)); err != nil {

@@ -478,11 +478,49 @@ func assertZeroValueOmitsOmitEmpty(t *testing.T, value any) {
 	for i := 0; i < valueType.NumField(); i++ {
 		field := valueType.Field(i)
 		name, options, _ := strings.Cut(field.Tag.Get("json"), ",")
+		// ResultInfoWire has a custom marshaler: an inline empty result is
+		// represented as an empty string rather than omitted.
+		if valueType == reflect.TypeOf(ResultInfoWire{}) && name == "text" {
+			continue
+		}
 		if name == "-" || !strings.Contains(","+options+",", ",omitempty,") {
 			continue
 		}
 		if _, ok := fields[name]; ok {
 			t.Errorf("zero %s includes omitempty field %q in %s", valueType, name, encoded)
 		}
+	}
+}
+
+func TestResultInfoWireInlineAndElidedText(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		info ResultInfoWire
+		want bool
+	}{
+		{name: "empty inline", info: ResultInfoWire{Bytes: 0}, want: true},
+		{name: "below cap", info: ResultInfoWire{Text: "answer", Bytes: engine.DefaultInlineResultCap - 1}, want: true},
+		{name: "at cap", info: ResultInfoWire{Bytes: engine.DefaultInlineResultCap}, want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			encoded, err := json.Marshal(test.info)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(encoded, &fields); err != nil {
+				t.Fatal(err)
+			}
+			text, present := fields["text"]
+			if present != test.want {
+				t.Fatalf("text presence = %v, want %v: %s", present, test.want, encoded)
+			}
+			if present {
+				var got string
+				if err := json.Unmarshal(text, &got); err != nil || got != test.info.Text {
+					t.Fatalf("text = %s, want %q: %v", text, test.info.Text, err)
+				}
+			}
+		})
 	}
 }

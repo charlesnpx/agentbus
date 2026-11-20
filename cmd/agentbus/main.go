@@ -167,6 +167,8 @@ func (a *app) run(ctx context.Context, args []string, stdin io.Reader, out, errO
 		return a.runPrune(ctx, args[1:], out, errOut)
 	case "steer":
 		return a.runSteer(ctx, args[1:], stdin, out, errOut)
+	case "session":
+		return a.runSession(ctx, args[1:], out, errOut)
 	default:
 		return usageError(errOut, "unknown command %q", args[0])
 	}
@@ -174,7 +176,7 @@ func (a *app) run(ctx context.Context, args []string, stdin io.Reader, out, errO
 
 func knownCommand(command string) bool {
 	switch command {
-	case "version", "backends", "serve", "status", "transcript", "result", "cancel", "prune", "steer":
+	case "version", "backends", "serve", "status", "transcript", "result", "cancel", "prune", "steer", "session":
 		return true
 	default:
 		return false
@@ -198,18 +200,24 @@ func printCommandHelp(out io.Writer, command string) {
 		fmt.Fprintln(out, "Usage: agentbus backends [--json]")
 	case "serve":
 		fmt.Fprintln(out, "Usage: agentbus serve [--foreground] [--max-jobs <n>] [--max-jobs-per-backend <n>] [--max-queued <n>] [--prune-interval 24h]")
+		fmt.Fprintln(out, "Automatic diagnostic retention runs after readiness and every 24h; --prune-interval 0 disables it.")
 	case "status":
-		fmt.Fprintln(out, "Usage: agentbus status [--job <id>] [--workspace-key <key>] [--tag <key=value>] [--state <state>] [--limit <n>] [--before <cursor> | --all] [--json]")
+		fmt.Fprintln(out, "Usage: agentbus status [<job-id>] [--workspace-key <key>] [--tag <key=value>] [--state <state>] [--limit <n>] [--before <cursor> | --all] [--json]")
 	case "transcript":
-		fmt.Fprintln(out, "Usage: agentbus transcript --job <id> [--follow] [--kind <kind>]... [--since <rfc3339>] [--since-ordinal <n>] [--last <n>] [--limit <n>] [--json]")
+		fmt.Fprintln(out, "Usage: agentbus transcript <job-id> [--follow] [--kind <kind>]... [--since <rfc3339>] [--since-ordinal <n>] [--last <n>] [--limit <n>] [--json]")
 	case "result":
-		fmt.Fprintln(out, "Usage: agentbus result --job <id> [--wait [--wait-timeout <duration>]] [--json]")
+		fmt.Fprintln(out, "Usage: agentbus result <job-id> [--wait [--wait-timeout <duration>]] [--json]")
+		fmt.Fprintln(out, "The observation timeout defaults to 30m and never cancels or extends the job.")
 	case "cancel":
-		fmt.Fprintln(out, "Usage: agentbus cancel --job <id> [--json]")
+		fmt.Fprintln(out, "Usage: agentbus cancel <job-id> [--json]")
 	case "prune":
 		fmt.Fprintln(out, "Usage: agentbus prune [--apply] [--successful-older-than 168h] [--failed-older-than 720h] [--json]")
+		fmt.Fprintln(out, "Preview or remove expired diagnostics; results, job history, and conversation homes are preserved.")
 	case "steer":
-		fmt.Fprintln(out, "Usage: agentbus steer --job <id> --request-id <messageId> --message-file <path|-> [--json]")
+		fmt.Fprintln(out, "Usage: agentbus steer <job-id> --request-id <messageId> --message-file <path|-> [--json]")
+	case "session":
+		fmt.Fprintln(out, "Usage: agentbus session discard <job-id> [--json]")
+		fmt.Fprintln(out, "Permanently removes resume capability for the whole Codex conversation, including retained descendants.")
 	default:
 		printRootHelp(out)
 	}
@@ -280,7 +288,7 @@ func (a *app) runServe(ctx context.Context, args []string, errOut io.Writer) int
 	maxJobs := fs.Int("max-jobs", 12, "maximum concurrent jobs across all backends (positive integer)")
 	maxJobsPerBackend := fs.Int("max-jobs-per-backend", 12, "maximum concurrent jobs per backend (positive integer)")
 	maxQueued := fs.Int("max-queued", 64, "maximum waiting jobs before submissions are rejected (positive integer)")
-	pruneInterval := fs.Duration("prune-interval", 0, "run the owned-artifact retention sweep at this interval (default off)")
+	pruneInterval := fs.Duration("prune-interval", 24*time.Hour, "diagnostic retention interval (default 24h; 0 disables automatic pruning)")
 	if code, ok := parseFlags(fs, args); !ok {
 		return code
 	}
@@ -358,9 +366,7 @@ func (a *app) startBackgroundDaemon(ctx context.Context, maxJobs, maxJobsPerBack
 		"--max-jobs-per-backend", strconv.Itoa(maxJobsPerBackend),
 		"--max-queued", strconv.Itoa(maxQueued),
 	}
-	if pruneInterval > 0 {
-		args = append(args, "--prune-interval", pruneInterval.String())
-	}
+	args = append(args, "--prune-interval", pruneInterval.String())
 	result, err := launcher(ctx, daemonlaunch.Options{
 		CommandPath: exe,
 		Args:        args,
@@ -467,7 +473,6 @@ func atomicWriteFile(path string, data []byte, mode os.FileMode) error {
 func (a *app) runStatus(ctx context.Context, args []string, out, errOut io.Writer) int {
 	fs := newCommandFlagSet("status", errOut)
 	jsonOut := fs.Bool("json", false, "emit the protocol response")
-	jobID := fs.String("job", "", "job id")
 	workspaceKey := fs.String("workspace-key", "", "filter list by submitter workspace key")
 	limit := fs.Int("limit", cliStatusDefaultLimit, "limit list results (default 50 newest jobs)")
 	before := fs.String("before", "", "continue a truncated list from its nextCursor")
@@ -482,18 +487,16 @@ func (a *app) runStatus(ctx context.Context, args []string, out, errOut io.Write
 		stateValues = append(stateValues, value)
 		return nil
 	})
-	if code, ok := parseFlags(fs, args); !ok {
+	jobID, code, ok := parseJobFlags(fs, args, false)
+	if !ok {
 		return code
-	}
-	if fs.NArg() != 0 {
-		return usageError(errOut, "status does not accept positional arguments")
 	}
 	limitSet := transcriptFlagSet(fs, "limit")
 	beforeSet := transcriptFlagSet(fs, "before")
 	listFlagsSet := transcriptFlagSet(fs, "workspace-key") || transcriptFlagSet(fs, "tag") || transcriptFlagSet(fs, "state") ||
 		limitSet || beforeSet || transcriptFlagSet(fs, "all")
-	if *jobID != "" && listFlagsSet {
-		return usageError(errOut, "--workspace-key, --tag, --state, --limit, --before, and --all apply only without --job")
+	if jobID != "" && listFlagsSet {
+		return usageError(errOut, "--workspace-key, --tag, --state, --limit, --before, and --all apply only without a job ID")
 	}
 	if *all && (limitSet || beforeSet) {
 		return usageError(errOut, "--all cannot be combined with --limit or --before")
@@ -502,7 +505,7 @@ func (a *app) runStatus(ctx context.Context, args []string, out, errOut io.Write
 		return usageError(errOut, "--limit must be a positive integer")
 	}
 	var listParams agentclient.JobListParams
-	if *jobID == "" {
+	if jobID == "" {
 		var err error
 		listParams, err = a.statusListParams(*workspaceKey, tagValues, stateValues)
 		if err != nil {
@@ -518,7 +521,7 @@ func (a *app) runStatus(ctx context.Context, args []string, out, errOut io.Write
 		return protocolCommandError(errOut, "status", err)
 	}
 	defer client.Close()
-	if *jobID == "" {
+	if jobID == "" {
 		list, err := client.JobList(ctx, listParams)
 		if err != nil {
 			return protocolCommandError(errOut, "status", err)
@@ -549,7 +552,7 @@ func (a *app) runStatus(ctx context.Context, args []string, out, errOut io.Write
 		return 0
 	}
 
-	record, err := client.JobGet(ctx, agentclient.JobGetParams{JobID: *jobID})
+	record, err := client.JobGet(ctx, agentclient.JobGetParams{JobID: jobID})
 	if err != nil {
 		return protocolCommandError(errOut, "status", err)
 	}
@@ -560,7 +563,7 @@ func (a *app) runStatus(ctx context.Context, args []string, out, errOut io.Write
 	} else {
 		printJobRecordStatus(out, record)
 	}
-	return cliExitCodeForRecord(record)
+	return cliExitSuccess
 }
 
 func (a *app) statusListParams(workspaceKey string, tagValues, stateValues []string) (agentclient.JobListParams, error) {
@@ -578,7 +581,6 @@ func (a *app) statusListParams(workspaceKey string, tagValues, stateValues []str
 func (a *app) runTranscript(ctx context.Context, args []string, out, errOut io.Writer) int {
 	fs := newCommandFlagSet("transcript", errOut)
 	jsonOut := fs.Bool("json", false, "emit the job.transcript response")
-	jobID := fs.String("job", "", "job id")
 	follow := fs.Bool("follow", false, "follow transcript items until the job is terminal and pages are drained")
 	var kinds []string
 	fs.Func("kind", "include transcript kind (repeatable)", func(value string) error {
@@ -589,17 +591,12 @@ func (a *app) runTranscript(ctx context.Context, args []string, out, errOut io.W
 	sinceOrdinal := fs.Int("since-ordinal", 0, "include items after this ordinal")
 	last := fs.Int("last", 0, "include the last N matching items")
 	limit := fs.Int("limit", 0, "limit matching items")
-	if code, ok := parseFlags(fs, args); !ok {
+	jobID, code, ok := parseJobFlags(fs, args, true)
+	if !ok {
 		return code
 	}
-	if fs.NArg() != 0 {
-		return usageError(errOut, "transcript does not accept positional arguments")
-	}
-	if *jobID == "" {
-		return usageError(errOut, "transcript requires --job <id>")
-	}
 
-	params := agentclient.JobTranscriptParams{JobID: *jobID, Kinds: append([]string(nil), kinds...)}
+	params := agentclient.JobTranscriptParams{JobID: jobID, Kinds: append([]string(nil), kinds...)}
 	if transcriptFlagSet(fs, "since") {
 		parsed, err := time.Parse(time.RFC3339Nano, *since)
 		if err != nil {
@@ -628,15 +625,9 @@ func (a *app) runTranscript(ctx context.Context, args []string, out, errOut io.W
 	}
 	defer client.Close()
 	if *follow {
-		return a.followTranscript(ctx, client, *jobID, kinds, *sinceOrdinal, transcriptFlagSet(fs, "since-ordinal"), *jsonOut, out, errOut)
+		return a.followTranscript(ctx, client, jobID, kinds, *sinceOrdinal, transcriptFlagSet(fs, "since-ordinal"), *jsonOut, out, errOut)
 	}
 	transcript, err := client.JobTranscript(ctx, params)
-	if err != nil {
-		return protocolCommandError(errOut, "transcript", err)
-	}
-	// job.transcript omits failure and contract information, so fetch the full
-	// record before selecting the documented selected-job exit code.
-	record, err := client.JobGet(ctx, agentclient.JobGetParams{JobID: *jobID})
 	if err != nil {
 		return protocolCommandError(errOut, "transcript", err)
 	}
@@ -647,7 +638,7 @@ func (a *app) runTranscript(ctx context.Context, args []string, out, errOut io.W
 	} else {
 		printJobTranscript(out, transcript, transcriptIsDigestRequest(params))
 	}
-	return cliExitCodeForRecord(record)
+	return cliExitSuccess
 }
 
 func transcriptFlagSet(fs *flag.FlagSet, name string) bool {
@@ -732,7 +723,7 @@ func (a *app) followTranscript(ctx context.Context, client protocolClient, jobID
 				if err := writeTranscriptFollowSummary(out, latest, jsonOut); err != nil {
 					return commandError(errOut, err)
 				}
-				return cliExitCodeForRecord(agentclient.JobGetResult{State: latest.State})
+				return cliExitSuccess
 			}
 			return protocolCommandError(errOut, "transcript", err)
 		}
@@ -758,7 +749,7 @@ func (a *app) followTranscript(ctx context.Context, client protocolClient, jobID
 				if err := writeTranscriptFollowSummary(out, latest, jsonOut); err != nil {
 					return commandError(errOut, err)
 				}
-				return cliExitCodeForRecord(agentclient.JobGetResult{State: latest.State})
+				return cliExitSuccess
 			}
 			if delay < 2*time.Second {
 				delay *= 2
@@ -771,14 +762,7 @@ func (a *app) followTranscript(ctx context.Context, client protocolClient, jobID
 	if err := writeTranscriptFollowSummary(out, latest, jsonOut); err != nil {
 		return commandError(errOut, err)
 	}
-	record, err := client.JobGet(ctx, agentclient.JobGetParams{JobID: jobID})
-	if err != nil {
-		if errors.Is(err, context.Canceled) && ctx.Err() != nil {
-			return cliExitCodeForRecord(agentclient.JobGetResult{State: latest.State})
-		}
-		return protocolCommandError(errOut, "transcript", err)
-	}
-	return cliExitCodeForRecord(record)
+	return cliExitSuccess
 }
 
 func printTranscriptItem(out io.Writer, item agentclient.TranscriptItem) {
@@ -865,17 +849,11 @@ func parseStateFilters(values []string) ([]protocol.PublicState, error) {
 func (a *app) runResult(ctx context.Context, args []string, out, errOut io.Writer) int {
 	fs := newCommandFlagSet("result", errOut)
 	jsonOut := fs.Bool("json", false, "emit the protocol job.get response")
-	jobID := fs.String("job", "", "job id")
 	wait := fs.Bool("wait", false, "observe the job until it is terminal or the timeout expires")
 	waitTimeoutValue := fs.String("wait-timeout", "30m", "maximum observation time (requires --wait; include a unit such as 30m)")
-	if code, ok := parseFlags(fs, args); !ok {
+	jobID, code, ok := parseJobFlags(fs, args, true)
+	if !ok {
 		return code
-	}
-	if fs.NArg() != 0 {
-		return usageError(errOut, "result does not accept positional arguments")
-	}
-	if *jobID == "" {
-		return usageError(errOut, "result requires --job <id>")
 	}
 	waitTimeoutSet := transcriptFlagSet(fs, "wait-timeout")
 	waitTimeout := 30 * time.Minute
@@ -897,9 +875,9 @@ func (a *app) runResult(ctx context.Context, args []string, out, errOut io.Write
 	var record agentclient.JobGetResult
 	observationTimedOut := false
 	if *wait {
-		record, observationTimedOut, err = a.observeJob(ctx, client, *jobID, waitTimeout)
+		record, observationTimedOut, err = a.observeJob(ctx, client, jobID, waitTimeout)
 	} else {
-		record, err = client.JobGet(ctx, agentclient.JobGetParams{JobID: *jobID})
+		record, err = client.JobGet(ctx, agentclient.JobGetParams{JobID: jobID})
 	}
 	if err != nil {
 		return protocolCommandError(errOut, "result", err)
@@ -908,24 +886,25 @@ func (a *app) runResult(ctx context.Context, args []string, out, errOut io.Write
 		fmt.Fprintln(errOut, "result observation timed out before the job could be read")
 		return cliExitObservationTimeout
 	}
-	code := cliExitCodeForRecord(record)
+	code = cliExitCodeForRecord(record)
 	if *jsonOut {
 		if writeCode := writeOrError(out, errOut, record); writeCode != 0 {
 			return writeCode
 		}
-		if resultArtifactUnavailable(record) {
-			return cliExitResultUnavailable
-		}
 		if observationTimedOut {
 			return cliExitObservationTimeout
 		}
+		if resultArtifactUnavailable(record) {
+			return cliExitResultUnavailable
+		}
 		return code
+	}
+	if observationTimedOut {
+		fmt.Fprintln(errOut, "result observation timed out before a terminal outcome")
+		return cliExitObservationTimeout
 	}
 	if resultCode := printJobRecordResult(out, errOut, record); resultCode != 0 {
 		return resultCode
-	}
-	if observationTimedOut {
-		return cliExitObservationTimeout
 	}
 	return code
 }
@@ -1021,28 +1000,22 @@ func parseWaitDuration(value string) (time.Duration, error) {
 func (a *app) runCancel(ctx context.Context, args []string, out, errOut io.Writer) int {
 	fs := newCommandFlagSet("cancel", errOut)
 	jsonOut := fs.Bool("json", false, "emit the protocol job.cancel response")
-	jobID := fs.String("job", "", "job id")
-	if code, ok := parseFlags(fs, args); !ok {
+	jobID, code, ok := parseJobFlags(fs, args, true)
+	if !ok {
 		return code
-	}
-	if fs.NArg() != 0 {
-		return usageError(errOut, "cancel does not accept positional arguments")
-	}
-	if *jobID == "" {
-		return usageError(errOut, "cancel requires --job <id>")
 	}
 	client, err := a.connectProtocolClient(ctx, errOut)
 	if err != nil {
 		return protocolCommandError(errOut, "cancel", err)
 	}
 	defer client.Close()
-	result, err := client.JobCancel(ctx, agentclient.JobCancelParams{JobID: *jobID})
+	result, err := client.JobCancel(ctx, agentclient.JobCancelParams{JobID: jobID})
 	if err != nil {
 		return protocolCommandError(errOut, "cancel", err)
 	}
 	// job.cancel has only jobId and state. Fetch the full record before choosing
 	// an exit code so a completed noncompliant job retains exit 3.
-	record, err := client.JobGet(ctx, agentclient.JobGetParams{JobID: *jobID})
+	record, err := client.JobGet(ctx, agentclient.JobGetParams{JobID: jobID})
 	if err != nil {
 		return protocolCommandError(errOut, "cancel", err)
 	}
@@ -1092,8 +1065,8 @@ func (a *app) runPrune(ctx context.Context, args []string, out, errOut io.Writer
 	if result.DryRun {
 		mode = "dry-run"
 	}
-	fmt.Fprintf(out, "mode=%s successfulOlderThan=%s failedOlderThan=%s wouldRemoveBytes=%d removedBytes=%d\n",
-		mode, result.SuccessfulOlderThan, result.FailedOlderThan, result.WouldRemoveBytes, result.RemovedBytes)
+	fmt.Fprintf(out, "mode=%s successfulOlderThan=%s failedOlderThan=%s wouldRemoveCount=%d removedCount=%d skippedCount=%d wouldRemoveBytes=%d removedBytes=%d detailsTruncated=%t\n",
+		mode, result.SuccessfulOlderThan, result.FailedOlderThan, result.WouldRemoveCount, result.RemovedCount, result.SkippedCount, result.WouldRemoveBytes, result.RemovedBytes, result.DetailsTruncated)
 	for _, item := range result.WouldRemove {
 		fmt.Fprintf(out, "would-remove jobId=%s kind=%s bytes=%d path=%q\n", item.JobID, item.Kind, item.Bytes, item.Path)
 	}
@@ -1114,20 +1087,60 @@ type steeringProtocolClient interface {
 	Steer(context.Context, agentclient.JobSteerParams) (agentclient.JobSteerResult, error)
 }
 
+type sessionDiscardClient interface {
+	SessionDiscard(context.Context, agentclient.SessionDiscardParams) (agentclient.SessionDiscardResult, error)
+}
+
+func (a *app) runSession(ctx context.Context, args []string, out, errOut io.Writer) int {
+	if len(args) == 0 || args[0] != "discard" {
+		return usageError(errOut, "session requires the discard subcommand")
+	}
+	fs := newCommandFlagSet("session discard", errOut)
+	jsonOut := fs.Bool("json", false, "emit the session.discard response")
+	jobID, code, ok := parseJobFlags(fs, args[1:], true)
+	if !ok {
+		return code
+	}
+	client, err := a.connectProtocolClient(ctx, errOut)
+	if err != nil {
+		return protocolCommandError(errOut, "session discard", err)
+	}
+	defer client.Close()
+	discarder, ok := client.(sessionDiscardClient)
+	if !ok {
+		return commandError(errOut, errors.New("connected client does not support session.discard"))
+	}
+	result, err := discarder.SessionDiscard(ctx, agentclient.SessionDiscardParams{JobID: jobID})
+	if err != nil {
+		return protocolCommandError(errOut, "session discard", err)
+	}
+	if *jsonOut {
+		if code := writeOrError(out, errOut, result); code != 0 {
+			return code
+		}
+	} else {
+		fmt.Fprintf(out, "rootJobId=%s sessionDiscardedAt=%s homeRemoval=%s\n", result.RootJobID, result.SessionDiscardedAt.Format(time.RFC3339Nano), result.HomeRemoval)
+		if result.Diagnostic != "" {
+			fmt.Fprintln(errOut, result.Diagnostic)
+		}
+	}
+	if result.HomeRemoval == protocol.HomeRemovalFailed {
+		return cliExitFailure
+	}
+	return cliExitSuccess
+}
+
 func (a *app) runSteer(ctx context.Context, args []string, stdin io.Reader, out, errOut io.Writer) int {
 	fs := newCommandFlagSet("steer", errOut)
 	jsonOut := fs.Bool("json", false, "emit the job.steer receipt as JSON")
-	jobID := fs.String("job", "", "job id")
 	messageID := fs.String("request-id", "", "caller-generated steering message id")
 	messageFile := fs.String("message-file", "", "file containing steering text, or - for stdin")
-	if code, ok := parseFlags(fs, args); !ok {
+	jobID, code, ok := parseJobFlags(fs, args, true)
+	if !ok {
 		return code
 	}
-	if fs.NArg() != 0 {
-		return usageError(errOut, "steer does not accept positional arguments")
-	}
-	if *jobID == "" || *messageID == "" || *messageFile == "" {
-		return usageError(errOut, "steer requires --job <id>, --request-id <messageId>, and --message-file <path|->")
+	if *messageID == "" || *messageFile == "" {
+		return usageError(errOut, "steer requires --request-id <messageId> and --message-file <path|->")
 	}
 	message, err := readSteerMessage(*messageFile, stdin)
 	if err != nil {
@@ -1142,7 +1155,7 @@ func (a *app) runSteer(ctx context.Context, args []string, stdin io.Reader, out,
 	if !ok {
 		return commandError(errOut, errors.New("connected client does not support job.steer"))
 	}
-	receipt, err := steerer.Steer(ctx, agentclient.JobSteerParams{JobID: *jobID, MessageID: *messageID, Text: message})
+	receipt, err := steerer.Steer(ctx, agentclient.JobSteerParams{JobID: jobID, MessageID: *messageID, Text: message})
 	if err != nil {
 		return protocolCommandError(errOut, "steer", err)
 	}
@@ -1200,14 +1213,23 @@ func readSteerMessage(path string, stdin io.Reader) (string, error) {
 }
 
 func (a *app) connectProtocolClient(ctx context.Context, errOut io.Writer) (protocolClient, error) {
+	disableAutoStart := false
+	switch value := os.Getenv("AGENTBUS_NO_AUTOSTART"); value {
+	case "", "0":
+	case "1":
+		disableAutoStart = true
+	default:
+		return nil, fmt.Errorf("AGENTBUS_NO_AUTOSTART must be empty, 0, or 1 (got %q)", value)
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		return nil, err
 	}
 	opts := agentclient.Options{
-		StateRoot:   a.stateRoot,
-		CommandPath: exe,
-		Release:     a.version,
+		StateRoot:        a.stateRoot,
+		CommandPath:      exe,
+		Release:          a.version,
+		DisableAutoStart: disableAutoStart,
 	}
 	var client protocolClient
 	if a.clientConnect != nil {
@@ -1310,6 +1332,9 @@ func printJobRecordStatus(out io.Writer, record agentclient.JobGetResult) {
 	if record.Resumable != nil {
 		fmt.Fprintf(out, " resumable.eligible=%t resumable.reason=%q", record.Resumable.Eligible, record.Resumable.Reason)
 	}
+	if record.SessionDiscardedAt != nil {
+		fmt.Fprintf(out, " sessionDiscardedAt=%s", humanTime(*record.SessionDiscardedAt))
+	}
 	if record.CancellationReason != "" {
 		fmt.Fprintf(out, " cancellationReason=%s", record.CancellationReason)
 	}
@@ -1380,20 +1405,9 @@ func printJobRecordResult(out, errOut io.Writer, record agentclient.JobGetResult
 		fmt.Fprintf(errOut, "jobId=%s state=%s: no authoritative result\n", record.JobID, record.State)
 		return 0
 	case protocol.PublicStateCompleted:
-		if record.Result == nil {
+		if record.Result == nil || record.Result.ResultPath == "" || record.Result.SHA256 == "" || record.Result.Bytes < 0 {
 			fmt.Fprintf(errOut, "jobId=%s state=%s: no authoritative result\n", record.JobID, record.State)
 			return cliExitResultUnavailable
-		}
-		if record.Result.Text != "" {
-			fmt.Fprint(out, record.Result.Text)
-			if !strings.HasSuffix(record.Result.Text, "\n") {
-				fmt.Fprintln(out)
-			}
-			return 0
-		}
-		if record.Result.ResultPath == "" {
-			fmt.Fprintf(errOut, "jobId=%s state=%s: no authoritative result\n", record.JobID, record.State)
-			return 0
 		}
 		artifact, err := openVerifiedResultArtifact(record.Result)
 		if err != nil {
@@ -1447,8 +1461,11 @@ func openVerifiedResultArtifact(result *protocol.ResultInfoWire) (*os.File, erro
 // to deliver a completed result. JSON still emits the authoritative record;
 // its exit status must nevertheless report an unusable large result.
 func resultArtifactUnavailable(record agentclient.JobGetResult) bool {
-	if record.State != protocol.PublicStateCompleted || record.Result == nil || record.Result.Text != "" || record.Result.ResultPath == "" {
+	if record.State != protocol.PublicStateCompleted {
 		return false
+	}
+	if record.Result == nil || record.Result.ResultPath == "" || record.Result.SHA256 == "" || record.Result.Bytes < 0 {
+		return true
 	}
 	artifact, err := openVerifiedResultArtifact(record.Result)
 	if err != nil {
@@ -1548,6 +1565,41 @@ func parseFlags(fs *flag.FlagSet, args []string) (int, bool) {
 		return 2, false
 	}
 	return 0, true
+}
+
+// parseJobFlags permits options on either side of the sole positional ID.
+func parseJobFlags(fs *flag.FlagSet, args []string, required bool) (string, int, bool) {
+	flags := make([]string, 0, len(args))
+	positions := make([]string, 0, 1)
+	endOptions := false
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if !endOptions && arg == "--" {
+			endOptions = true
+			continue
+		}
+		if !endOptions && strings.HasPrefix(arg, "-") && arg != "-" {
+			flags = append(flags, arg)
+			name := strings.TrimLeft(arg, "-")
+			name, _, hasValue := strings.Cut(name, "=")
+			if option := fs.Lookup(name); option != nil && !hasValue && !isBoolFlag(option) && i+1 < len(args) {
+				i++
+				flags = append(flags, args[i])
+			}
+			continue
+		}
+		positions = append(positions, arg)
+	}
+	if code, ok := parseFlags(fs, flags); !ok {
+		return "", code, false
+	}
+	if len(positions) > 1 || (required && (len(positions) != 1 || strings.TrimSpace(positions[0]) == "")) {
+		return "", usageError(fs.Output(), "provide exactly one job ID"), false
+	}
+	if len(positions) == 1 {
+		return positions[0], 0, true
+	}
+	return "", 0, true
 }
 
 func duplicateSingletonFlag(fs *flag.FlagSet, args []string) string {
@@ -1653,12 +1705,13 @@ func printRootHelp(out io.Writer) {
   agentbus version [--json] (aliases: --version, -version, -V)
   agentbus backends [--json]
   agentbus serve [--foreground] [--max-jobs <n>] [--max-jobs-per-backend <n>] [--max-queued <n>] [--prune-interval 24h]
-  agentbus status [--job <id>] [--workspace-key <key>] [--tag <key=value>] [--state <state>] [--limit <n>] [--before <cursor> | --all] [--json]
-  agentbus transcript --job <id> [--follow] [--kind <kind>]... [--last <n>] [--since <rfc3339>] [--since-ordinal <n>] [--limit <n>] [--json]
-  agentbus result --job <id> [--wait [--wait-timeout <duration>]] [--json]
-  agentbus cancel --job <id> [--json]
+  agentbus status [<job-id>] [--workspace-key <key>] [--tag <key=value>] [--state <state>] [--limit <n>] [--before <cursor> | --all] [--json]
+  agentbus transcript <job-id> [--follow] [--kind <kind>]... [--last <n>] [--since <rfc3339>] [--since-ordinal <n>] [--limit <n>] [--json]
+  agentbus result <job-id> [--wait [--wait-timeout <duration>]] [--json]
+  agentbus cancel <job-id> [--json]
   agentbus prune [--apply] [--successful-older-than 168h] [--failed-older-than 720h] [--json]
-  agentbus steer --job <id> --request-id <messageId> --message-file <path|-> [--json]
+  agentbus steer <job-id> --request-id <messageId> --message-file <path|-> [--json]
+  agentbus session discard <job-id> [--json]
 
 status and result use the same job.get record for a selected job. Their JSON
 output is identical; status is the operator projection and result is pipeable.
@@ -1666,7 +1719,7 @@ The status list defaults to 50 newest jobs; use --before with the returned
 nextCursor to continue, or --all for full history. Duration values require
 units: 2400 is ambiguous; use 2400s or 40m.
 
-Exit codes for a selected job and protocol outcomes:
+Status and transcript reads exit zero when successful. Result and cancel exit codes:
   completed=0, queued/running=2, completed-noncompliant=3, failed=4,
   timeout=5, interrupted=6, canceled=7, unknown-job=10,
   daemon-startup-failure=11, shutdown-deadline=13, unknown=14,
@@ -1675,6 +1728,8 @@ Exit codes for a selected job and protocol outcomes:
   queue-full=19: submission rejected because the daemon's waiting queue is full
 
 Steering exit codes: rejected=17, delivery-unknown=18.
+Session discard permanently revokes resume for the whole Codex conversation.
+Set AGENTBUS_NO_AUTOSTART=1 to prevent clients from starting a daemon.
 `)
 }
 

@@ -400,6 +400,10 @@ type ArtifactsPruneResult struct {
 	Skipped             []PruneSkip `json:"skipped"`
 	WouldRemoveBytes    int64       `json:"wouldRemoveBytes"`
 	RemovedBytes        int64       `json:"removedBytes"`
+	WouldRemoveCount    int         `json:"wouldRemoveCount"`
+	RemovedCount        int         `json:"removedCount"`
+	SkippedCount        int         `json:"skippedCount"`
+	DetailsTruncated    bool        `json:"detailsTruncated,omitempty"`
 }
 
 // SessionDiscardParams names a job in the conversation to dispose.
@@ -593,6 +597,20 @@ type ResultInfoWire struct {
 	ResultPath string `json:"resultPath"`
 	SHA256     string `json:"sha256"`
 	Bytes      int64  `json:"bytes"`
+}
+
+// MarshalJSON preserves an inline empty result as a string while omitting text
+// for artifacts too large to inline.
+func (info ResultInfoWire) MarshalJSON() ([]byte, error) {
+	type resultInfo ResultInfoWire
+	var text *string
+	if info.Bytes >= 0 && info.Bytes < engine.DefaultInlineResultCap {
+		text = &info.Text
+	}
+	return json.Marshal(struct {
+		resultInfo
+		Text *string `json:"text,omitempty"`
+	}{resultInfo: resultInfo(info), Text: text})
 }
 
 // LogPathsWire identifies captured backend log files and whether each captured

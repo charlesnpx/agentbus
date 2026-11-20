@@ -30,8 +30,9 @@ type jobSubmitInput struct {
 // It remains an invalid_task_spec protocol error because the protocol has no
 // separate resume error code, while retaining the target job ID in ErrorData.
 type resumeTargetError struct {
-	jobID string
-	cause error
+	jobID  string
+	reason string
+	cause  error
 }
 
 func (err *resumeTargetError) Error() string {
@@ -75,6 +76,16 @@ func (s *Server) handleJobSubmit(raw json.RawMessage) requestOutcome {
 	// original job.
 	s.submissionMu.Lock()
 	defer s.submissionMu.Unlock()
+	// The snapshot is consulted only by the new-binding factory below, after
+	// SubmitTx has resolved exact replays. Ordinary new conversations do not
+	// need to scan the lineage history.
+	var records map[string]jobstore.Record
+	var active map[string]bool
+	var snapshotErr error
+	var resumeID string
+	if json.Unmarshal(input.taskSpec["resumeJobId"], &resumeID) == nil && resumeID != "" {
+		records, active, snapshotErr = s.lineageSnapshot(store)
+	}
 	backendName := taskSpecBackendName(input.taskSpec)
 	queueFullAtAdmission := backendName != "" && s.queueWouldExceed(backendName)
 	var executionBackend engine.Backend
@@ -89,6 +100,12 @@ func (s *Server) handleJobSubmit(raw json.RawMessage) requestOutcome {
 			return jobstore.Record{}, err
 		}
 		if spec.ResumeJobID != "" {
+			if snapshotErr != nil {
+				return jobstore.Record{}, snapshotErr
+			}
+			if err := s.validateResumeLineage(spec, records, active); err != nil {
+				return jobstore.Record{}, err
+			}
 			if _, err := s.resumeTargetFromLookup(spec, lookup); err != nil {
 				return jobstore.Record{}, err
 			}
@@ -128,7 +145,7 @@ func (s *Server) handleJobSubmit(raw json.RawMessage) requestOutcome {
 		}
 		var resumeErr *resumeTargetError
 		if errors.As(err, &resumeErr) {
-			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "submit job: "+resumeErr.Error(), protocol.ErrorData{JobID: resumeErr.jobID})}
+			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "submit job: "+resumeErr.Error(), protocol.ErrorData{JobID: resumeErr.jobID, Reason: resumeErr.reason})}
 		}
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "submit job: "+err.Error(), protocol.ErrorData{})}
 	}
@@ -380,6 +397,9 @@ func (s *Server) ensureJobStore() (*jobstore.Store, error) {
 	}
 	s.jobStoreMu.Lock()
 	defer s.jobStoreMu.Unlock()
+	if s.storeRetired {
+		return nil, errors.New("job store has retired during daemon shutdown")
+	}
 	if s.jobStore != nil {
 		return s.jobStore, nil
 	}

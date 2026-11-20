@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -215,6 +216,10 @@ func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
 			}
 			return requestOutcome{result: protocol.JobCancelResult{JobID: current.JobID, State: projectedState(current)}}
 		}
+		run.mu.Lock()
+		cancelFinalized := run.cancelFinalized
+		run.mu.Unlock()
+		defer close(cancelFinalized)
 		defer s.finishSteering(store, run)
 	}
 	cleanup, diagnostics := s.cancelActiveOrRecordedProcess(store, record)
@@ -252,6 +257,15 @@ func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
 			return jobStoreUnavailable("read concurrent terminal cancellation", getErr)
 		}
 		return jobStoreUnavailable("persist cancellation", err)
+	}
+	if home := s.takeManagedCodexHome(record.JobID); home != nil {
+		_, homeDiagnostics := finalizeManagedCodexHome(home, terminal, terminal.Cleanup, nil)
+		for _, diagnostic := range homeDiagnostics {
+			diagnostic = boundProviderValue(diagnostic, 512)
+			if _, err := store.AppendDiagnostic(record.JobID, diagnostic); err != nil {
+				log.Printf("agentbus service: job %s: %s", record.JobID, diagnostic)
+			}
+		}
 	}
 
 	return requestOutcome{result: protocol.JobCancelResult{JobID: terminal.JobID, State: projectedState(terminal)}}
@@ -306,6 +320,7 @@ func (s *Server) cancelQueuedJob(store *jobstore.Store, record jobstore.Record) 
 	if index >= 0 {
 		s.removeQueuedJobLocked(index)
 		s.activeJobs.Add(-1)
+		s.notifyQuietChange()
 	}
 
 	s.dispatchQueuedLocked()
@@ -362,6 +377,14 @@ func (s *Server) jobRecordWire(record jobstore.Record) (protocol.JobRecordWire, 
 	modelRequested := cloneRequestedValue(spec.Model)
 	effortRequested := cloneRequestedValue(spec.Effort)
 	modelReported, effortReported := s.projectedSelection(record)
+	store, err := s.ensureJobStore()
+	if err != nil {
+		return protocol.JobRecordWire{}, err
+	}
+	root, err := resumeThreadSource(store, record)
+	if err != nil {
+		return protocol.JobRecordWire{}, err
+	}
 	wire := protocol.JobRecordWire{
 		JobID:              record.JobID,
 		WorkspaceKey:       record.WorkspaceKey,
@@ -391,6 +414,7 @@ func (s *Server) jobRecordWire(record jobstore.Record) (protocol.JobRecordWire, 
 		EffortReported:     effortReported,
 		Intent:             record.Intent,
 		Selection:          record.Selection,
+		SessionDiscardedAt: root.SessionDiscardedAt,
 		Steers:             steers,
 		CancellationReason: record.CancellationReason,
 	}
@@ -486,6 +510,17 @@ func (s *Server) resumableProjection(record jobstore.Record) *protocol.Resumable
 	reason := resumeTargetIneligibilityReason(spec, record)
 	if reason != "" {
 		return &protocol.ResumableProjection{Eligible: false, Reason: reason}
+	}
+	store, err := s.ensureJobStore()
+	if err != nil {
+		return &protocol.ResumableProjection{Eligible: false, Reason: err.Error()}
+	}
+	records, active, err := s.lineageSnapshot(store)
+	if err == nil {
+		err = s.validateResumeLineage(spec, records, active)
+	}
+	if err != nil {
+		return &protocol.ResumableProjection{Eligible: false, Reason: err.Error()}
 	}
 	if record.State == protocol.PublicStateCompleted {
 		return &protocol.ResumableProjection{
