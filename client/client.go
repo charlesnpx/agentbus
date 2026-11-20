@@ -244,10 +244,6 @@ func (c *Client) connect(ctx context.Context) error {
 	return nil
 }
 
-func clientHello(ctx context.Context, conn net.Conn, reader *bufio.Reader, token string) (HelloResult, error) {
-	return clientHelloWithRelease(ctx, conn, reader, token, "")
-}
-
 func clientHelloWithRelease(ctx context.Context, conn net.Conn, reader *bufio.Reader, token, release string) (HelloResult, error) {
 	req := protocol.Request{
 		JSONRPC: "2.0",
