@@ -6,9 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,7 +21,6 @@ const appServerRequestTimeout = 15 * time.Second
 
 type appServerDriver struct {
 	binary         string
-	writePolicy    WritePolicy
 	requestTimeout time.Duration
 	nextID         atomic.Uint64
 
@@ -47,10 +43,9 @@ type activeAppServerTurn struct {
 	steerResponses     map[string]chan map[string]any
 }
 
-func newAppServerDriver(binary string, writePolicy WritePolicy) *appServerDriver {
+func newAppServerDriver(binary string) *appServerDriver {
 	return &appServerDriver{
 		binary:         binary,
-		writePolicy:    writePolicy,
 		requestTimeout: appServerRequestTimeout,
 		active:         make(map[*duplex.Conn]*activeAppServerTurn),
 	}
@@ -58,32 +53,10 @@ func newAppServerDriver(binary string, writePolicy WritePolicy) *appServerDriver
 
 func (d *appServerDriver) ExecSpec(_ string, opts engine.SessionOpts, _ engine.TurnInput) (command.ExecSpec, error) {
 	argv := []string{d.binaryName(), "app-server"}
-	if opts.LocalIPC {
-		if !opts.Write && !opts.Verify {
-			return command.ExecSpec{}, errors.New("Codex local IPC requires a write-enabled or verify job")
-		}
-		if opts.CWD == "" || opts.WriteSandboxRoot == "" || opts.LocalIPCRoot == "" {
-			return command.ExecSpec{}, errors.New("Codex local IPC requires workspace, scratch, and private temp roots")
-		}
-		argv = append(argv, localIPCConfigArgsForWorkspace(opts.CWD, opts.WriteSandboxRoot, opts.LocalIPCRoot, runtime.GOOS, opts.LocalIPCDenyPaths, !opts.Verify, !opts.Verify)...)
-	}
 	return command.ExecSpec{
 		Argv: argv,
 		Dir:  opts.CWD,
 	}, nil
-}
-
-// CodexSandboxArgs returns the CLI sandbox overrides used to probe a local-IPC
-// session. The profile fields come from the same builder used by app-server.
-func (b *backend) CodexSandboxArgs(opts engine.SessionOpts) ([]string, error) {
-	if !opts.LocalIPC {
-		return nil, errors.New("Codex local IPC sandbox args require local IPC")
-	}
-	if opts.CWD == "" || opts.WriteSandboxRoot == "" || opts.LocalIPCRoot == "" {
-		return nil, errors.New("Codex local IPC requires workspace, scratch, and private temp roots")
-	}
-	args := localIPCConfigArgsForWorkspace(opts.CWD, opts.WriteSandboxRoot, opts.LocalIPCRoot, runtime.GOOS, opts.LocalIPCDenyPaths, !opts.Verify, !opts.Verify)
-	return append(args, "-P", localIPCPermissionProfile), nil
 }
 
 func (d *appServerDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resumeID string, opts engine.SessionOpts, input engine.TurnInput, emit duplex.EmitFunc) (string, error) {
@@ -126,7 +99,7 @@ func (d *appServerDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resume
 	// including transport errors and cancellation paths that bypass completion.
 	defer observer.flushPendingToolItems()
 	active.setThreadID(threadID)
-	turnResult, err := rpc.request(ctx, "turn/start", turnStartParams(threadID, opts, input, d.writePolicy), observer, active.writeTurnStart(conn))
+	turnResult, err := rpc.request(ctx, "turn/start", turnStartParams(threadID, opts, input), observer, active.writeTurnStart(conn))
 	if err != nil {
 		return threadID, err
 	}
@@ -1242,12 +1215,7 @@ func threadParams(opts engine.SessionOpts, input engine.TurnInput, resumeID stri
 	params := map[string]any{
 		"approvalPolicy": "never",
 	}
-	workspaceWrite := input.Write || opts.Verify
-	if opts.LocalIPC && workspaceWrite {
-		params["permissions"] = localIPCPermissionProfile
-	} else {
-		params["sandbox"] = sandboxMode(workspaceWrite)
-	}
+	params["sandbox"] = "danger-full-access"
 	if opts.CWD != "" {
 		params["cwd"] = opts.CWD
 	}
@@ -1260,7 +1228,7 @@ func threadParams(opts engine.SessionOpts, input engine.TurnInput, resumeID stri
 	return params
 }
 
-func turnStartParams(threadID string, opts engine.SessionOpts, input engine.TurnInput, writePolicy WritePolicy) map[string]any {
+func turnStartParams(threadID string, opts engine.SessionOpts, input engine.TurnInput) map[string]any {
 	params := map[string]any{
 		"threadId":       threadID,
 		"approvalPolicy": "never",
@@ -1269,20 +1237,7 @@ func turnStartParams(threadID string, opts engine.SessionOpts, input engine.Turn
 			"text": input.Prompt,
 		}},
 	}
-	workspaceWrite := input.Write || opts.Verify
-	if opts.LocalIPC && workspaceWrite {
-		params["permissions"] = localIPCPermissionProfile
-	} else {
-		if opts.Verify {
-			writePolicy = WritePolicyWorkspaceOffline
-		}
-		policy := sandboxPolicy(workspaceWrite, opts.CWD, opts.WriteSandboxRoot, writePolicy)
-		if opts.Verify {
-			policy["excludeSlashTmp"] = true
-			policy["excludeTmpdirEnvVar"] = true
-		}
-		params["sandboxPolicy"] = policy
-	}
+	params["sandboxPolicy"] = map[string]any{"type": "dangerFullAccess"}
 	if opts.CWD != "" {
 		params["cwd"] = opts.CWD
 	}
@@ -1293,138 +1248,6 @@ func turnStartParams(threadID string, opts engine.SessionOpts, input engine.Turn
 		params["effort"] = opts.Effort
 	}
 	return params
-}
-
-func localIPCConfigArgs(workspace, scratch, ipcRoot string) []string {
-	return localIPCConfigArgsForWorkspace(workspace, scratch, ipcRoot, runtime.GOOS, nil, true, true)
-}
-
-func localIPCConfigArgsForWorkspace(workspace, scratch, ipcRoot, targetGOOS string, denyPaths []string, includeGitMetadata, includeSystemTemp bool) []string {
-	type filesystemEntry struct {
-		path       string
-		permission string
-	}
-	entries := make([]filesystemEntry, 0, 6+len(denyPaths))
-	indices := make(map[string]int, 6+len(denyPaths))
-	setFilesystemPermission := func(path, permission string) {
-		if index, ok := indices[path]; ok {
-			entries[index].permission = permission
-			return
-		}
-		indices[path] = len(entries)
-		entries = append(entries, filesystemEntry{path: path, permission: permission})
-	}
-	setFilesystemPermission(":root", "read")
-	setFilesystemPermission(workspace, "write")
-	setFilesystemPermission(scratch, "write")
-	setFilesystemPermission(ipcRoot, "write")
-	if includeSystemTemp && targetGOOS != "linux" {
-		setFilesystemPermission("/tmp", "write")
-	}
-	if includeGitMetadata {
-		setFilesystemPermission(filepath.Join(workspace, ".git"), "read")
-	}
-	if targetGOOS == "linux" {
-		for _, path := range denyPaths {
-			setFilesystemPermission(path, "deny")
-		}
-	}
-	filesystemParts := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		filesystemParts = append(filesystemParts, tomlString(entry.path)+"=\""+entry.permission+"\"")
-	}
-	filesystem := "{" + strings.Join(filesystemParts, ",") + "}"
-	args := []string{
-		"-c", `default_permissions=":workspace"`,
-		"-c", "features.network_proxy=true",
-		"-c", "permissions." + localIPCPermissionProfile + ".filesystem=" + filesystem,
-		"-c", "permissions." + localIPCPermissionProfile + ".network.enabled=true",
-		"-c", "permissions." + localIPCPermissionProfile + ".network.allow_local_binding=true",
-	}
-	if targetGOOS == "linux" {
-		args = append(args, "-c", "permissions."+localIPCPermissionProfile+".network.dangerously_allow_all_unix_sockets=true")
-	} else {
-		args = append(args, "-c", "permissions."+localIPCPermissionProfile+".network.unix_sockets={"+tomlString(ipcRoot)+"=\"allow\"}")
-	}
-	return args
-}
-
-func tomlString(value string) string {
-	var quoted strings.Builder
-	quoted.Grow(len(value) + 2)
-	quoted.WriteByte('"')
-	for _, r := range value {
-		switch r {
-		case '\\':
-			quoted.WriteString(`\\`)
-		case '"':
-			quoted.WriteString(`\"`)
-		case '\b':
-			quoted.WriteString(`\b`)
-		case '\t':
-			quoted.WriteString(`\t`)
-		case '\n':
-			quoted.WriteString(`\n`)
-		case '\f':
-			quoted.WriteString(`\f`)
-		case '\r':
-			quoted.WriteString(`\r`)
-		default:
-			if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
-				fmt.Fprintf(&quoted, `\u%04X`, r)
-			} else {
-				quoted.WriteRune(r)
-			}
-		}
-	}
-	quoted.WriteByte('"')
-	return quoted.String()
-}
-
-func sandboxMode(write bool) string {
-	if write {
-		return "workspace-write"
-	}
-	return "read-only"
-}
-
-func sandboxPolicy(write bool, cwd, writeSandboxRoot string, writePolicy WritePolicy) map[string]any {
-	if !write {
-		return map[string]any{
-			"type":          "readOnly",
-			"networkAccess": false,
-		}
-	}
-	if writePolicy == WritePolicyTrusted {
-		return map[string]any{
-			"type": "dangerFullAccess",
-		}
-	}
-	policy := map[string]any{
-		"type":          "workspaceWrite",
-		"networkAccess": writePolicy == WritePolicyWorkspaceNetwork,
-	}
-	roots := make([]string, 0, 2)
-	if root := workspaceRoot(cwd); root != "" {
-		roots = append(roots, root)
-	}
-	if writeSandboxRoot != "" {
-		roots = append(roots, writeSandboxRoot)
-	}
-	if len(roots) > 0 {
-		policy["writableRoots"] = roots
-	}
-	return policy
-}
-
-func workspaceRoot(cwd string) string {
-	if cwd != "" {
-		return cwd
-	}
-	if wd, err := os.Getwd(); err == nil {
-		return wd
-	}
-	return ""
 }
 
 func declineResponse(method string, params map[string]any) (map[string]any, bool) {

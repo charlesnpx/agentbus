@@ -43,7 +43,7 @@ func (s *Server) handleBackendInspect(raw json.RawMessage) requestOutcome {
 		return invalidParams(err)
 	}
 
-	result := protocol.BackendInspectResult{Backends: make([]protocol.BackendInspectionWire, 0, len(s.backends))}
+	result := protocol.BackendInspectResult{ProtocolVersion: protocol.Version, DaemonRelease: releaseName(s.release), DaemonExecutable: s.daemonExecutable(), Backends: make([]protocol.BackendInspectionWire, 0, len(s.backends))}
 	for _, name := range s.backendNames() {
 		entry := protocol.BackendInspectionWire{Backend: name}
 		defaults := s.backendDefaults[name]

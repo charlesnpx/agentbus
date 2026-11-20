@@ -24,7 +24,7 @@ func (d FixtureDriver) RunTurn(ctx context.Context, conn *Conn, resumeID string,
 	prompt := map[string]any{
 		"type":   "prompt",
 		"prompt": input.Prompt,
-		"write":  input.Write,
+		"intent": input.Intent,
 	}
 	if resumeID != "" {
 		prompt["resumeId"] = resumeID

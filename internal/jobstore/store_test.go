@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -252,7 +253,7 @@ func TestMarkStartingTransitionsQueuedAndRefusesTerminal(t *testing.T) {
 	key := RequestKey{WorkspaceKey: "workspace-starting", RequestID: "request-starting"}
 	taskSpec := testTaskSpec("durable starting transition")
 	record, _, err := store.SubmitTx(key, taskSpec, func(string) (Record, error) {
-		return Record{Backend: "codex", Model: "gpt-test", CWD: "/workspace/starting"}, nil
+		return Record{Backend: "codex", CWD: "/workspace/starting"}, nil
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -301,7 +302,7 @@ func TestRecordProcessClaimUsesSeparateTransaction(t *testing.T) {
 	key := RequestKey{WorkspaceKey: "workspace-claim", RequestID: "request-claim"}
 	taskSpec := testTaskSpec("separate claim transaction")
 	record, _, err := store.SubmitTx(key, taskSpec, func(string) (Record, error) {
-		return Record{Backend: "codex", Model: "gpt-test", CWD: "/workspace/claim"}, nil
+		return Record{Backend: "codex", CWD: "/workspace/claim"}, nil
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -313,7 +314,10 @@ func TestRecordProcessClaimUsesSeparateTransaction(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	claim := ProcessClaim{PID: 4242, PGID: 4242, StartToken: "claim-start-token"}
+	claim := ProcessClaim{PID: 4242, PGID: 4242, StartToken: "claim-start-token", Scope: ProcessScope{BootID: "test-boot", RootDevice: "1", RootInode: "2"}}
+	if runtime.GOOS == "linux" {
+		claim.Scope.PIDNamespace = "pid:[42]"
+	}
 	if _, err := store.RecordProcessClaim(record.JobID, claim); err == nil {
 		t.Fatal("RecordProcessClaim succeeded after its database was closed")
 	}
@@ -362,7 +366,7 @@ func TestReopenRecoversTerminalRecord(t *testing.T) {
 	record, _, err := store.SubmitTx(
 		RequestKey{WorkspaceKey: "workspace-reopen", RequestID: "request-reopen"},
 		testTaskSpec("terminal task"),
-		func(string) (Record, error) { return Record{Backend: "codex", Model: "gpt-test"}, nil },
+		func(string) (Record, error) { return Record{Backend: "codex"}, nil },
 	)
 	if err != nil {
 		t.Fatal(err)

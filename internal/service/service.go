@@ -13,7 +13,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -75,18 +74,13 @@ type BinaryIdentity struct {
 
 // Config configures the one local JSON-RPC daemon.
 type Config struct {
+	Release         string
 	StateRoot       string
 	SocketPath      string
 	Token           string
 	Backends        []engine.Backend
 	BackendDefaults map[string]BackendDefaults
 
-	// CodexHomeOverride selects a fixed CODEX_HOME instead of a per-job home.
-	// It is intended for an operator-owned compatibility configuration.
-	CodexHomeOverride string
-	// CodexHomeInherit preserves the historical inherited CODEX_HOME behavior.
-	// It wins over CodexHomeOverride when both are configured.
-	CodexHomeInherit bool
 	// CodexAuthHome selects the operator home from which auth.json and
 	// config.toml are linked into a managed per-job CODEX_HOME.
 	CodexAuthHome string
@@ -140,28 +134,19 @@ func (lifecycle *serveLifecycle) settleAccept() {
 	}
 }
 
-// Server serves protocol version 3 over one private Unix socket.
+// Server serves protocol version 4 over one private Unix socket.
 type Server struct {
-	stateRoot            string
-	socketPath           string
-	token                string
-	backends             map[string]engine.Backend
-	backendDefaults      map[string]BackendDefaults
-	backendVersionMu     sync.Mutex
-	backendVersions      map[backendVersionCacheKey]backendVersionCacheEntry
-	codexSandboxMu       sync.Mutex
-	codexSandboxResults  map[codexSandboxCacheKey]codexSandboxCacheEntry
-	codexSandboxProbe    func(context.Context, string) error
-	codexLocalIPCResults map[codexSandboxCacheKey]codexSandboxCacheEntry
-	codexLocalIPCProbe   func(context.Context, string, []string, string, string, string) error
-
-	codexHomeOverride    string
-	codexHomeInherit     bool
-	codexAuthHome        string
-	moduleCache          string
-	codexHomesMu         sync.Mutex
-	managedCodexHomes    map[string]*managedCodexHome
-	managedLocalIPCRoots map[string]string
+	release           string
+	stateRoot         string
+	socketPath        string
+	token             string
+	backends          map[string]engine.Backend
+	backendDefaults   map[string]BackendDefaults
+	backendVersionMu  sync.Mutex
+	backendVersions   map[backendVersionCacheKey]backendVersionCacheEntry
+	codexAuthHome     string
+	codexHomesMu      sync.Mutex
+	managedCodexHomes map[string]*managedCodexHome
 
 	jobStoreMu sync.Mutex
 	jobStore   *jobstore.Store
@@ -176,6 +161,7 @@ type Server struct {
 	// taken from a recovered claim. Tests replace them with deterministic
 	// fakes; production uses the native process implementations and leaves
 	// processGroupGoneFn nil for its syscall probe.
+	processScopeFn     func() (jobstore.ProcessScope, error)
 	processTable       engine.ProcessTable
 	processGroups      engine.ProcessGroupSignaler
 	processGroupGoneFn func(int) (bool, error)
@@ -248,6 +234,16 @@ func New(cfg Config) (*Server, error) {
 	if socketPath == "" {
 		socketPath = filepath.Join(root, protocol.SocketName)
 	}
+	ownershipStore, err := jobstore.Open(filepath.Join(root, jobStoreFilename))
+	if err != nil {
+		return nil, fmt.Errorf("validate state root before startup: %w", err)
+	}
+	if err := ownershipStore.Close(); err != nil {
+		return nil, fmt.Errorf("close validated state root: %w", err)
+	}
+	if err := os.Chmod(root, 0o700); err != nil {
+		return nil, fmt.Errorf("secure state root: %w", err)
+	}
 	tokenPath := filepath.Join(root, protocol.TokenFileName)
 	token, err := ensureToken(tokenPath, cfg.Token)
 	if err != nil {
@@ -261,7 +257,12 @@ func New(cfg Config) (*Server, error) {
 	}
 	backendDefaults := make(map[string]BackendDefaults, len(cfg.BackendDefaults))
 	for name, defaults := range cfg.BackendDefaults {
-		backendDefaults[name] = BackendDefaults{Model: strings.TrimSpace(defaults.Model), Effort: strings.TrimSpace(defaults.Effort)}
+		for field, value := range map[string]string{"model": defaults.Model, "effort": defaults.Effort} {
+			if value != "" && !validSelectionValue(value) {
+				return nil, fmt.Errorf("invalid %s default for %s", field, name)
+			}
+		}
+		backendDefaults[name] = defaults
 	}
 	idleTimeout := cfg.IdleTimeout
 	if idleTimeout == 0 {
@@ -278,36 +279,29 @@ func New(cfg Config) (*Server, error) {
 		}
 	}
 	return &Server{
-		stateRoot:            root,
-		socketPath:           socketPath,
-		token:                token,
-		backends:             backends,
-		backendDefaults:      backendDefaults,
-		backendVersions:      make(map[backendVersionCacheKey]backendVersionCacheEntry),
-		codexSandboxResults:  make(map[codexSandboxCacheKey]codexSandboxCacheEntry),
-		codexSandboxProbe:    runCodexSandboxProbe,
-		codexLocalIPCResults: make(map[codexSandboxCacheKey]codexSandboxCacheEntry),
-		codexLocalIPCProbe:   runCodexLocalIPCProbe,
-		codexHomeOverride:    cfg.CodexHomeOverride,
-		codexHomeInherit:     cfg.CodexHomeInherit,
-		codexAuthHome:        cfg.CodexAuthHome,
-		moduleCache:          resolveModuleCache(),
-		managedCodexHomes:    make(map[string]*managedCodexHome),
-		managedLocalIPCRoots: make(map[string]string),
-		processTable:         engine.NativeProcessTable{},
-		processGroups:        engine.NativeProcessGroupSignaler{},
-		processGroupGrace:    engine.DefaultCancelGrace,
-		turnDrainGrace:       engine.DefaultCancelGrace,
-		maxJobs:              cfg.MaxJobs,
-		maxJobsPerBackend:    cfg.MaxJobsPerBackend,
-		maxQueued:            cfg.MaxQueued,
-		runningByBackend:     make(map[string]int),
-		idleTimeout:          idleTimeout,
-		idleCheckInterval:    idleCheckInterval,
-		shutdownTimeout:      normalizeShutdownTimeout(cfg.ShutdownTimeout),
-		pruneInterval:        cfg.PruneInterval,
-		readyHook:            cfg.ReadyHook,
-		lastActivity:         time.Now().UTC(),
+		release:           cfg.Release,
+		stateRoot:         root,
+		socketPath:        socketPath,
+		token:             token,
+		backends:          backends,
+		backendDefaults:   backendDefaults,
+		backendVersions:   make(map[backendVersionCacheKey]backendVersionCacheEntry),
+		codexAuthHome:     cfg.CodexAuthHome,
+		managedCodexHomes: make(map[string]*managedCodexHome),
+		processTable:      engine.NativeProcessTable{},
+		processGroups:     engine.NativeProcessGroupSignaler{},
+		processGroupGrace: engine.DefaultCancelGrace,
+		turnDrainGrace:    engine.DefaultCancelGrace,
+		maxJobs:           cfg.MaxJobs,
+		maxJobsPerBackend: cfg.MaxJobsPerBackend,
+		maxQueued:         cfg.MaxQueued,
+		runningByBackend:  make(map[string]int),
+		idleTimeout:       idleTimeout,
+		idleCheckInterval: idleCheckInterval,
+		shutdownTimeout:   normalizeShutdownTimeout(cfg.ShutdownTimeout),
+		pruneInterval:     cfg.PruneInterval,
+		readyHook:         cfg.ReadyHook,
+		lastActivity:      time.Now().UTC(),
 	}, nil
 }
 

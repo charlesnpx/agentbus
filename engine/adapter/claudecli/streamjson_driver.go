@@ -92,17 +92,7 @@ func (d *streamJSONDriver) ExecSpec(resumeID string, opts engine.SessionOpts, in
 	if opts.Effort != "" {
 		args = append(args, "--effort", opts.Effort)
 	}
-	if input.Write {
-		args = append(args, "--dangerously-skip-permissions")
-	} else {
-		args = append(args,
-			"--strict-mcp-config",
-			"--mcp-config", `{"mcpServers":{}}`,
-			"--permission-mode", "dontAsk",
-			"--allowedTools", strings.Join(readOnlyAllowedTools, ","),
-			"--disallowedTools", strings.Join(readOnlyDeniedTools, ","),
-		)
-	}
+	args = append(args, "--dangerously-skip-permissions")
 	if resumeID != "" {
 		args = append(args, "--resume", resumeID)
 	}

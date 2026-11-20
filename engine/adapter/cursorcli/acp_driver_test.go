@@ -19,7 +19,7 @@ import (
 )
 
 func TestACPFreshWritableTurn(t *testing.T) {
-	if _, err := newACPDriver("fake-cursor").ExecSpec("", engine.SessionOpts{Effort: "high"}, engine.TurnInput{}); err == nil || err.Error() != "cursor backend does not expose a supported effort control" {
+	if _, err := newACPDriver("fake-cursor").ExecSpec("", engine.SessionOpts{Effort: "high"}, engine.TurnInput{Intent: engine.IntentInspect}); err == nil || err.Error() != "cursor backend does not expose a supported effort control" {
 		t.Fatalf("effort error = %v", err)
 	}
 
@@ -103,7 +103,7 @@ func TestACPFreshWritableTurn(t *testing.T) {
 	})
 
 	session := startFakeCursorSession(t, engine.SessionOpts{CWD: cwd, Model: modelID})
-	events, err := turnWithFakeRunner(t, session, engine.TurnInput{Prompt: "hello", Write: true}, runner)
+	events, err := turnWithFakeRunner(t, session, engine.TurnInput{Prompt: "hello", Intent: engine.IntentEdit}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +117,7 @@ func TestACPFreshWritableTurn(t *testing.T) {
 	if results := eventsOfType(got, engine.EventResultMessage); len(results) != 1 || results[0].Text != "Hello, world" {
 		t.Fatalf("result events = %#v, want one concatenated result", results)
 	}
-	if models := eventsOfType(got, engine.EventModelReported); len(models) != 1 || models[0].ModelReported != modelID {
+	if models := eventsOfType(got, engine.EventModelReported); len(models) != 0 {
 		t.Fatalf("model events = %#v", models)
 	}
 	tools := eventsOfType(got, engine.EventToolUse)
@@ -157,8 +157,8 @@ func TestACPRequestedBareModelSelection(t *testing.T) {
 		))
 
 		setModel := peer.expectRequest("session/set_model")
-		if got := nestedString(setModel, "params", "modelId"); got != resolvedModel {
-			t.Fatalf("modelId = %q, want %q", got, resolvedModel)
+		if got := nestedString(setModel, "params", "modelId"); got != requestedModel {
+			t.Fatalf("modelId = %q, want %q", got, requestedModel)
 		}
 		peer.respond(setModel, map[string]any{})
 
@@ -169,12 +169,12 @@ func TestACPRequestedBareModelSelection(t *testing.T) {
 	})
 
 	session := startFakeCursorSession(t, engine.SessionOpts{CWD: t.TempDir(), Model: requestedModel})
-	events, err := turnWithFakeRunner(t, session, engine.TurnInput{Prompt: "hello", Write: true}, runner)
+	events, err := turnWithFakeRunner(t, session, engine.TurnInput{Prompt: "hello", Intent: engine.IntentEdit}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
 	got := collectEvents(t, events, 2*time.Second)
-	if models := eventsOfType(got, engine.EventModelReported); len(models) != 1 || models[0].ModelReported != resolvedModel {
+	if models := eventsOfType(got, engine.EventModelReported); len(models) != 0 {
 		t.Fatalf("model events = %#v, want %q", models, resolvedModel)
 	}
 	runner.assertRetired(t)
@@ -202,7 +202,7 @@ func TestACPUnavailableModelStopsBeforePrompt(t *testing.T) {
 	})
 
 	session := startFakeCursorSession(t, engine.SessionOpts{CWD: t.TempDir(), Model: requestedModel})
-	events, err := turnWithFakeRunner(t, session, engine.TurnInput{Prompt: "hello", Write: true}, runner)
+	events, err := turnWithFakeRunner(t, session, engine.TurnInput{Prompt: "hello", Intent: engine.IntentEdit}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +229,7 @@ func TestACPNoRequestedModelReportsCurrentModel(t *testing.T) {
 	})
 
 	session := startFakeCursorSession(t, engine.SessionOpts{CWD: t.TempDir()})
-	events, err := turnWithFakeRunner(t, session, engine.TurnInput{Prompt: "hello", Write: true}, runner)
+	events, err := turnWithFakeRunner(t, session, engine.TurnInput{Prompt: "hello", Intent: engine.IntentEdit}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -262,7 +262,7 @@ func TestACPTurnFlushesToolCallWithoutTerminalUpdate(t *testing.T) {
 	})
 
 	session := startFakeCursorSession(t, engine.SessionOpts{CWD: t.TempDir()})
-	events, err := turnWithFakeRunner(t, session, engine.TurnInput{Prompt: "hello", Write: true}, runner)
+	events, err := turnWithFakeRunner(t, session, engine.TurnInput{Prompt: "hello", Intent: engine.IntentEdit}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -301,8 +301,8 @@ func TestACPLoadedReadOnlyTurnCancellation(t *testing.T) {
 		peer.respond(load, acpSessionResult("session-load", "loaded-model"))
 
 		setMode := peer.expectRequest("session/set_mode")
-		if got := nestedString(setMode, "params", "modeId"); got != "plan" {
-			t.Fatalf("modeId = %q, want plan", got)
+		if got := nestedString(setMode, "params", "modeId"); got != "agent" {
+			t.Fatalf("modeId = %q, want agent", got)
 		}
 		peer.respond(setMode, map[string]any{})
 		prompt := peer.expectRequest("session/prompt")
@@ -314,7 +314,7 @@ func TestACPLoadedReadOnlyTurnCancellation(t *testing.T) {
 			},
 		})
 		permission := peer.expectResponse("permission-read")
-		if got := nestedString(permission, "result", "outcome", "optionId"); got != "reject-once" {
+		if got := nestedString(permission, "result", "outcome", "optionId"); got != "allow-once" {
 			t.Fatalf("read-only permission response = %#v", permission)
 		}
 		close(promptPending)
@@ -338,7 +338,7 @@ func TestACPLoadedReadOnlyTurnCancellation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	events, err := turnWithFakeRunner(t, session, engine.TurnInput{Prompt: "review", Write: false}, runner)
+	events, err := turnWithFakeRunner(t, session, engine.TurnInput{Prompt: "review", Intent: engine.IntentInspect}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -383,7 +383,7 @@ func TestACPSteerInterruptContinuesInOrder(t *testing.T) {
 		peer.respond(setMode, map[string]any{})
 
 		prompt := peer.expectRequest("session/prompt")
-		if got := nestedString(prompt, "params", "sessionId"); got != "session-steer" || acpPromptText(prompt) != "initial" {
+		if got := nestedString(prompt, "params", "sessionId"); got != "session-steer" || !strings.HasSuffix(acpPromptText(prompt), "\n\ninitial") {
 			t.Fatalf("initial prompt = %#v", prompt)
 		}
 		peer.notify("session/update", map[string]any{
@@ -450,7 +450,7 @@ func TestACPSteerInterruptContinuesInOrder(t *testing.T) {
 	if !ok {
 		t.Fatal("Cursor session does not implement engine.Steerer")
 	}
-	events, err := turnWithFakeRunner(t, session, engine.TurnInput{Prompt: "initial", Write: true}, runner)
+	events, err := turnWithFakeRunner(t, session, engine.TurnInput{Prompt: "initial", Intent: engine.IntentEdit}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -504,7 +504,7 @@ func TestACPSteerEmptyContinuationResultDoesNotReuseInterruptedText(t *testing.T
 		peer.respond(setMode, map[string]any{})
 
 		prompt := peer.expectRequest("session/prompt")
-		if acpPromptText(prompt) != "initial" {
+		if !strings.HasSuffix(acpPromptText(prompt), "\n\ninitial") {
 			t.Fatalf("initial prompt = %#v", prompt)
 		}
 		peer.notify("session/update", map[string]any{
@@ -531,7 +531,7 @@ func TestACPSteerEmptyContinuationResultDoesNotReuseInterruptedText(t *testing.T
 
 	session := startFakeCursorSession(t, engine.SessionOpts{CWD: t.TempDir()})
 	steerer := session.(engine.Steerer)
-	events, err := turnWithFakeRunner(t, session, engine.TurnInput{Prompt: "initial", Write: true}, runner)
+	events, err := turnWithFakeRunner(t, session, engine.TurnInput{Prompt: "initial", Intent: engine.IntentEdit}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -601,7 +601,7 @@ func TestACPCancelDropsPendingSteer(t *testing.T) {
 	steerer := session.(engine.Steerer)
 	turnCtx, cancelTurn := context.WithCancel(context.Background())
 	defer cancelTurn()
-	events, err := turnWithFakeRunnerContext(t, turnCtx, session, engine.TurnInput{Prompt: "initial", Write: true}, runner)
+	events, err := turnWithFakeRunnerContext(t, turnCtx, session, engine.TurnInput{Prompt: "initial", Intent: engine.IntentEdit}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -685,7 +685,7 @@ func TestACPCancelEmptyResultDoesNotReusePartialText(t *testing.T) {
 
 	session := startFakeCursorSession(t, engine.SessionOpts{CWD: t.TempDir()})
 	steerer := session.(engine.Steerer)
-	events, err := turnWithFakeRunner(t, session, engine.TurnInput{Prompt: "initial", Write: true}, runner)
+	events, err := turnWithFakeRunner(t, session, engine.TurnInput{Prompt: "initial", Intent: engine.IntentEdit}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -758,7 +758,7 @@ func TestACPSteerDoesNotContinueIfCancelledPromptDoesNotDrain(t *testing.T) {
 
 	session := startFakeCursorSession(t, engine.SessionOpts{CWD: t.TempDir()})
 	steerer := session.(engine.Steerer)
-	events, err := turnWithFakeRunner(t, session, engine.TurnInput{Prompt: "initial", Write: true}, runner)
+	events, err := turnWithFakeRunner(t, session, engine.TurnInput{Prompt: "initial", Intent: engine.IntentEdit}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -883,7 +883,7 @@ func TestACPNegativeTerminalProtocolBranches(t *testing.T) {
 			})
 
 			session := startFakeCursorSession(t, engine.SessionOpts{CWD: t.TempDir()})
-			events, err := turnWithFakeRunner(t, session, engine.TurnInput{Prompt: "hello", Write: true}, runner)
+			events, err := turnWithFakeRunner(t, session, engine.TurnInput{Prompt: "hello", Intent: engine.IntentEdit}, runner)
 			if err != nil {
 				t.Fatal(err)
 			}

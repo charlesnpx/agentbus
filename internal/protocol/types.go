@@ -14,10 +14,11 @@ const (
 	MethodJobSubmit      = "job.submit"
 	MethodJobCancel      = "job.cancel"
 	MethodBackendInspect = "backend.inspect"
+	MethodSessionDiscard = "session.discard"
 )
 
 const (
-	DefaultTimeout = 30 * time.Minute
+	DefaultTimeout = 2 * time.Hour
 	MaxTimeout     = 4 * time.Hour
 )
 
@@ -49,6 +50,11 @@ type ErrorData struct {
 	Code                  string `json:"code"`
 	JobID                 string `json:"jobId,omitempty"`
 	ServerProtocolVersion int    `json:"serverProtocolVersion,omitempty"`
+	ClientProtocolVersion int    `json:"clientProtocolVersion,omitempty"`
+	ClientRelease         string `json:"clientRelease,omitempty"`
+	DaemonRelease         string `json:"daemonRelease,omitempty"`
+	DaemonExecutable      string `json:"daemonExecutable,omitempty"`
+	Reason                string `json:"reason,omitempty"`
 }
 
 // RPCError is returned by typed clients when a JSON-RPC error response arrives.
@@ -78,6 +84,7 @@ func NewError(stableCode, message string, data ErrorData) *ErrorObject {
 
 type HelloParams struct {
 	ClientProtocolVersion int    `json:"clientProtocolVersion"`
+	ClientRelease         string `json:"clientRelease,omitempty"`
 	Token                 string `json:"token"`
 }
 

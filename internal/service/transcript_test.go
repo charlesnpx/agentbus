@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/internal/jobstore"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 )
@@ -347,7 +348,7 @@ func transcriptTestRecord(t *testing.T, server *Server, requestID string) jobsto
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, err := json.Marshal(protocol.TaskSpec{Backend: "fake", CWD: t.TempDir(), Prompt: "transcript", Write: false})
+	raw, err := json.Marshal(protocol.TaskSpec{Backend: "fake", CWD: t.TempDir(), Prompt: "transcript", Intent: engine.IntentInspect})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -355,7 +356,7 @@ func transcriptTestRecord(t *testing.T, server *Server, requestID string) jobsto
 		jobstore.RequestKey{WorkspaceKey: "transcript-workspace", RequestID: requestID},
 		raw,
 		func(id string) (jobstore.Record, error) {
-			return jobstore.Record{JobID: id, Backend: "fake", CWD: t.TempDir(), Write: false}, nil
+			return jobstore.Record{JobID: id, Backend: "fake", CWD: t.TempDir(), Intent: engine.IntentInspect}, nil
 		},
 	)
 	if err != nil {

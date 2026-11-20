@@ -84,6 +84,10 @@ func (e *ProtocolVersionMismatchError) Error() string {
 	if e == nil {
 		return ErrProtocolVersionMismatch.Error()
 	}
+	if e.Cause != nil {
+		d := e.Cause.Object.Data
+		return fmt.Sprintf("%s: expected %d received %d; client release %s, daemon release %s, daemon executable %s", ErrProtocolVersionMismatch, e.Expected, e.Received, d.ClientRelease, d.DaemonRelease, d.DaemonExecutable)
+	}
 	return fmt.Sprintf("%s: expected %d received %d", ErrProtocolVersionMismatch, e.Expected, e.Received)
 }
 
@@ -112,6 +116,7 @@ func rpcResponseError(object protocol.ErrorObject) error {
 
 // Options configures a protocol client.
 type Options struct {
+	Release          string
 	StateRoot        string
 	SocketPath       string
 	Token            string
@@ -221,7 +226,7 @@ func (c *Client) connect(ctx context.Context) error {
 		return err
 	}
 	reader := bufio.NewReader(conn)
-	hello, err := clientHello(ctx, conn, reader, token)
+	hello, err := clientHelloWithRelease(ctx, conn, reader, token, c.opts.Release)
 	if err != nil {
 		_ = conn.Close()
 		return err
@@ -240,11 +245,15 @@ func (c *Client) connect(ctx context.Context) error {
 }
 
 func clientHello(ctx context.Context, conn net.Conn, reader *bufio.Reader, token string) (HelloResult, error) {
+	return clientHelloWithRelease(ctx, conn, reader, token, "")
+}
+
+func clientHelloWithRelease(ctx context.Context, conn net.Conn, reader *bufio.Reader, token, release string) (HelloResult, error) {
 	req := protocol.Request{
 		JSONRPC: "2.0",
 		ID:      json.RawMessage(`"hello"`),
 		Method:  protocol.MethodHello,
-		Params:  mustMarshal(protocol.HelloParams{ClientProtocolVersion: protocol.Version, Token: token}),
+		Params:  mustMarshal(protocol.HelloParams{ClientProtocolVersion: protocol.Version, ClientRelease: release, Token: token}),
 	}
 	if err := writeDeadline(ctx, conn, req); err != nil {
 		return HelloResult{}, &helloTransportError{err: err}
@@ -934,7 +943,7 @@ func (c *Client) Hello(ctx context.Context) (HelloResult, error) {
 		return HelloResult{}, err
 	}
 	var out HelloResult
-	err = c.do(ctx, protocol.MethodHello, protocol.HelloParams{ClientProtocolVersion: protocol.Version, Token: token}, &out)
+	err = c.do(ctx, protocol.MethodHello, protocol.HelloParams{ClientProtocolVersion: protocol.Version, ClientRelease: c.opts.Release, Token: token}, &out)
 	return out, err
 }
 

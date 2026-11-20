@@ -130,7 +130,7 @@ func verifyProcessGroupLeader(ref engine.ProcessRef) error {
 	if !alive {
 		return fmt.Errorf("%w: process group can no longer be identified: leader %d is missing", engine.ErrProcessIdentityUnverifiable, ref.PID)
 	}
-	if info.StartTime != ref.StartTime {
+	if info.PID != ref.PID || ref.PID != ref.PGID || info.PGID != ref.PGID || info.StartTime != ref.StartTime {
 		return fmt.Errorf("%w: process group can no longer be identified: leader %d start token changed", engine.ErrProcessIdentityUnverifiable, ref.PID)
 	}
 	return nil

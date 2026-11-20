@@ -1,5 +1,9 @@
 # ADR-14: Simplified core
 
+The protocol version, provider sandbox, per-job cache, and compatibility
+requirements in this historical decision are superseded by
+[ADR-15](ADR-15-protocol4-intent.md).
+
 ADR-13 expressly leaves worker-launch removal for a separate deletion-oriented
 review as a non-goal. This ADR is that review. It completes the de-escalation
 that ADR-13 began.

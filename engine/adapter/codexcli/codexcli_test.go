@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +16,7 @@ import (
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
+	"github.com/charlesnpx/agentbus/engine/adapter/internal/cliadapter"
 	"github.com/charlesnpx/agentbus/engine/command"
 )
 
@@ -26,31 +26,6 @@ func TestStaticDefaultEffortsAcceptMaxAndUltra(t *testing.T) {
 			backend := New(Options{Binary: "fake-codex"})
 			if _, err := backend.Start(context.Background(), engine.SessionOpts{Effort: effort}); err != nil {
 				t.Fatalf("Start() with static default effort %q: %v", effort, err)
-			}
-		})
-	}
-}
-
-func TestCodexSandboxRequiredExceptForTrustedWriteTurns(t *testing.T) {
-	for _, test := range []struct {
-		name     string
-		policy   WritePolicy
-		write    bool
-		localIPC bool
-		want     bool
-	}{
-		{name: "read-only always sandboxed", policy: WritePolicyTrusted, write: false, want: true},
-		{name: "ordinary edit sandboxed", policy: WritePolicyWorkspaceOffline, write: true, want: true},
-		{name: "trusted edit unrestricted", policy: WritePolicyTrusted, write: true, want: false},
-		{name: "trusted local IPC remains sandboxed", policy: WritePolicyTrusted, write: true, localIPC: true, want: true},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			backend, ok := New(Options{Binary: "fake-codex", WritePolicy: test.policy}).(*backend)
-			if !ok {
-				t.Fatal("Codex constructor did not retain its sandbox policy")
-			}
-			if got := backend.CodexSandboxRequired(test.write, test.localIPC); got != test.want {
-				t.Fatalf("CodexSandboxRequired(%t, %t) = %t, want %t", test.write, test.localIPC, got, test.want)
 			}
 		})
 	}
@@ -66,8 +41,8 @@ func TestAppServerInitializeHandshakePrecedesTurnAndFailureIsTerminal(t *testing
 			peer.expectNotification("initialized")
 			thread := peer.expectRequest("thread/start")
 			threadParams, ok := thread["params"].(map[string]any)
-			if !ok || threadParams["sandbox"] != "workspace-write" {
-				t.Fatalf("thread/start params = %#v, want existing workspace-write sandbox", thread["params"])
+			if !ok || threadParams["sandbox"] != "danger-full-access" {
+				t.Fatalf("thread/start params = %#v, want full-access sandbox", thread["params"])
 			}
 			if _, ok := threadParams["permissions"]; ok {
 				t.Fatalf("thread/start params = %#v, local IPC profile must be absent", threadParams)
@@ -86,7 +61,7 @@ func TestAppServerInitializeHandshakePrecedesTurnAndFailureIsTerminal(t *testing
 		})
 
 		session := startFakeCodexSession(t, engine.SessionOpts{CWD: cwd, Model: "gpt-5", Effort: "high"})
-		events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello", Write: true}, runner)
+		events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello", Intent: engine.IntentEdit}, runner)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -108,155 +83,13 @@ func TestAppServerInitializeHandshakePrecedesTurnAndFailureIsTerminal(t *testing
 		})
 
 		session := startFakeCodexSession(t, engine.SessionOpts{})
-		events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+		events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 		if err != nil {
 			t.Fatal(err)
 		}
 		got := collectEventsWithTimeout(t, events, 2*time.Second)
 		if !containsEvent(got, engine.EventTerminalError, "initialize failed") {
 			t.Fatalf("events = %#v, want terminal initialize error", got)
-		}
-	})
-}
-
-func TestAppServerLocalIPCUsesScopedPermissionsProfile(t *testing.T) {
-	cwd := `/work/a"b\c`
-	scratch := `/scratch/d"e\f`
-	ipcRoot := `/tmp/ipc/r"oot\w`
-	wantArgv := []string{
-		"fake-codex", "app-server",
-		"-c", `default_permissions=":workspace"`,
-		"-c", "features.network_proxy=true",
-		"-c", `permissions.agentbus_local_ipc.filesystem={":root"="read","/work/a\"b\\c"="write","/scratch/d\"e\\f"="write","/tmp/ipc/r\"oot\\w"="write","/tmp"="write","/work/a\"b\\c/.git"="read"}`,
-		"-c", "permissions.agentbus_local_ipc.network.enabled=true",
-		"-c", "permissions.agentbus_local_ipc.network.allow_local_binding=true",
-		"-c", `permissions.agentbus_local_ipc.network.unix_sockets={"/tmp/ipc/r\"oot\\w"="allow"}`,
-	}
-	if runtime.GOOS == "linux" {
-		wantArgv = []string{
-			"fake-codex", "app-server",
-			"-c", `default_permissions=":workspace"`,
-			"-c", "features.network_proxy=true",
-			"-c", `permissions.agentbus_local_ipc.filesystem={":root"="read","/work/a\"b\\c"="write","/scratch/d\"e\\f"="write","/tmp/ipc/r\"oot\\w"="write","/work/a\"b\\c/.git"="read"}`,
-			"-c", "permissions.agentbus_local_ipc.network.enabled=true",
-			"-c", "permissions.agentbus_local_ipc.network.allow_local_binding=true",
-			"-c", "permissions.agentbus_local_ipc.network.dangerously_allow_all_unix_sockets=true",
-		}
-	}
-	runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
-		if !reflect.DeepEqual(spec.Argv, wantArgv) {
-			t.Fatalf("argv = %#v, want quoted local IPC profile overrides %#v", spec.Argv, wantArgv)
-		}
-		peer := newAppServerPeer(t, proc)
-		peer.handshake()
-		thread := peer.expectRequest("thread/start")
-		threadParams, ok := thread["params"].(map[string]any)
-		if !ok || threadParams["permissions"] != localIPCPermissionProfile {
-			t.Fatalf("thread/start params = %#v, want permissions profile %q", thread["params"], localIPCPermissionProfile)
-		}
-		if _, ok := threadParams["sandbox"]; ok {
-			t.Fatalf("thread/start params contain incompatible sandbox field: %#v", threadParams)
-		}
-		peer.respond(thread, threadResult("thread-1"))
-		turn := peer.expectRequest("turn/start")
-		turnParams, ok := turn["params"].(map[string]any)
-		if !ok || turnParams["permissions"] != localIPCPermissionProfile {
-			t.Fatalf("turn/start params = %#v, want permissions profile %q", turn["params"], localIPCPermissionProfile)
-		}
-		if _, ok := turnParams["sandboxPolicy"]; ok {
-			t.Fatalf("turn/start params contain incompatible sandboxPolicy field: %#v", turnParams)
-		}
-		peer.respond(turn, turnResult("turn-1"))
-		peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
-	})
-	session := startFakeCodexSession(t, engine.SessionOpts{
-		CWD: cwd, Write: true, LocalIPC: true, WriteSandboxRoot: scratch, LocalIPCRoot: ipcRoot,
-	})
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "use local IPC", Write: true}, runner)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = collectEventsWithTimeout(t, events, 2*time.Second)
-
-	readOnlyRunner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
-		if !reflect.DeepEqual(spec.Argv, wantArgv) {
-			t.Fatalf("read-only turn argv = %#v, want local IPC profile available for the session %#v", spec.Argv, wantArgv)
-		}
-		peer := newAppServerPeer(t, proc)
-		peer.handshake()
-		thread := peer.expectRequest("thread/resume")
-		threadParams, ok := thread["params"].(map[string]any)
-		if !ok || threadParams["sandbox"] != "read-only" {
-			t.Fatalf("read-only thread/resume params = %#v, want sandbox read-only", thread["params"])
-		}
-		if _, ok := threadParams["permissions"]; ok {
-			t.Fatalf("read-only thread/resume params contain writable permissions: %#v", threadParams)
-		}
-		peer.respond(thread, threadResult("thread-1"))
-		turn := peer.expectRequest("turn/start")
-		turnParams, ok := turn["params"].(map[string]any)
-		wantPolicy := map[string]any{"type": "readOnly", "networkAccess": false}
-		if !ok || !reflect.DeepEqual(turnParams["sandboxPolicy"], wantPolicy) {
-			t.Fatalf("read-only turn/start params = %#v, want sandboxPolicy %#v", turn["params"], wantPolicy)
-		}
-		if _, ok := turnParams["permissions"]; ok {
-			t.Fatalf("read-only turn/start params contain writable permissions: %#v", turnParams)
-		}
-		peer.respond(turn, turnResult("turn-2"))
-		peer.notify("turn/completed", completedParams("thread-1", "turn-2", "completed", ""))
-	})
-	events, err = turnWithRunner(t, session, engine.TurnInput{Prompt: "correct the result", Write: false}, readOnlyRunner)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = collectEventsWithTimeout(t, events, 2*time.Second)
-}
-
-func TestLocalIPCProfileArgsByGOOS(t *testing.T) {
-	workspace := "/work/project"
-	scratch := "/scratch/job"
-	ipcRoot := "/tmp/agentbus-ipc-test"
-	denyPaths := []string{"/run/user/501", "/run/docker.sock"}
-	backend := New(Options{Binary: "codex"}).(*backend)
-	opts := engine.SessionOpts{CWD: workspace, WriteSandboxRoot: scratch, LocalIPCRoot: ipcRoot, LocalIPC: true}
-	sandboxArgs, err := backend.CodexSandboxArgs(opts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantSandboxArgs := append(localIPCConfigArgsForWorkspace(workspace, scratch, ipcRoot, runtime.GOOS, nil, true, true), "-P", localIPCPermissionProfile)
-	if !reflect.DeepEqual(sandboxArgs, wantSandboxArgs) {
-		t.Fatalf("Codex sandbox local IPC args = %#v, want shared profile args plus selector %#v", sandboxArgs, wantSandboxArgs)
-	}
-
-	t.Run("linux", func(t *testing.T) {
-		args := localIPCConfigArgsForWorkspace(workspace, scratch, ipcRoot, "linux", denyPaths, true, true)
-		joined := strings.Join(args, "\n")
-		for _, want := range []string{
-			`permissions.agentbus_local_ipc.network.dangerously_allow_all_unix_sockets=true`,
-			`"/run/user/501"="deny"`,
-			`"/run/docker.sock"="deny"`,
-		} {
-			if !strings.Contains(joined, want) {
-				t.Fatalf("Linux local IPC args missing %q: %#v", want, args)
-			}
-		}
-		if strings.Contains(joined, ".network.unix_sockets=") || strings.Contains(joined, `"/tmp"="write"`) {
-			t.Fatalf("Linux local IPC args contain per-path sockets or /tmp write: %#v", args)
-		}
-	})
-
-	t.Run("macOS", func(t *testing.T) {
-		args := localIPCConfigArgsForWorkspace(workspace, scratch, ipcRoot, "darwin", denyPaths, true, true)
-		want := []string{
-			"-c", `default_permissions=":workspace"`,
-			"-c", "features.network_proxy=true",
-			"-c", `permissions.agentbus_local_ipc.filesystem={":root"="read","/work/project"="write","/scratch/job"="write","/tmp/agentbus-ipc-test"="write","/tmp"="write","/work/project/.git"="read"}`,
-			"-c", "permissions.agentbus_local_ipc.network.enabled=true",
-			"-c", "permissions.agentbus_local_ipc.network.allow_local_binding=true",
-			"-c", `permissions.agentbus_local_ipc.network.unix_sockets={"/tmp/agentbus-ipc-test"="allow"}`,
-		}
-		if !reflect.DeepEqual(args, want) {
-			t.Fatalf("macOS local IPC args = %#v, want unchanged profile %#v", args, want)
 		}
 	})
 }
@@ -288,7 +121,7 @@ func TestAppServerThreadSettingsUpdateReportsEffectiveSelection(t *testing.T) {
 	})
 
 	session := startFakeCodexSession(t, engine.SessionOpts{Model: "gpt-6-luna", Effort: "max"})
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "observe effective selection"}, runner)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "observe effective selection"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -337,7 +170,7 @@ func TestAppServerNativeSteerUsesTurnSteerAndKeepsOneLogicalTurn(t *testing.T) {
 	if !ok {
 		t.Fatal("Codex session does not implement engine.Steerer")
 	}
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -404,7 +237,7 @@ func TestAppServerSteerWaitsForTurnIDDuringInitialize(t *testing.T) {
 
 	session := startFakeCodexSession(t, engine.SessionOpts{})
 	steerer := session.(engine.Steerer)
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -472,7 +305,7 @@ func TestAppServerSteerWithoutAcknowledgementIsUnconfirmed(t *testing.T) {
 
 	session := startFakeCodexSession(t, engine.SessionOpts{})
 	steerer := session.(engine.Steerer)
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -530,7 +363,7 @@ func TestAppServerSteerProviderErrorsAndCancellation(t *testing.T) {
 					peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
 				})
 				session := startFakeCodexSession(t, engine.SessionOpts{})
-				events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+				events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -575,7 +408,7 @@ func TestAppServerSteerProviderErrorsAndCancellation(t *testing.T) {
 		turner := session.(interface {
 			TurnWithRunner(context.Context, engine.TurnInput, command.Runner) (<-chan engine.Event, error)
 		})
-		events, err := turner.TurnWithRunner(turnCtx, engine.TurnInput{Prompt: "hello"}, runner)
+		events, err := turner.TurnWithRunner(turnCtx, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 		if err != nil {
 			cancelTurn()
 			t.Fatal(err)
@@ -713,7 +546,7 @@ func TestAppServerOversizedTerminalFrameFailsWithTransportClass(t *testing.T) {
 	})
 
 	session := startFakeCodexSession(t, engine.SessionOpts{})
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -757,7 +590,7 @@ func TestAppServerSkipsOversizedFileChangeFrame(t *testing.T) {
 	})
 
 	session := startFakeCodexSession(t, engine.SessionOpts{})
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -813,7 +646,7 @@ func TestAppServerOversizedDuplicateDiscriminatorFailsClosed(t *testing.T) {
 			})
 
 			session := startFakeCodexSession(t, engine.SessionOpts{})
-			events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+			events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -832,279 +665,6 @@ func containsTransportFrameError(events []engine.Event) bool {
 		}
 	}
 	return false
-}
-
-func TestAppServerTurnSandboxPolicyFollowsWritePolicy(t *testing.T) {
-	cwd := t.TempDir()
-	tests := []struct {
-		name        string
-		writePolicy WritePolicy
-		write       bool
-		want        map[string]any
-	}{
-		{
-			name:  "zero value write remains workspace offline",
-			write: true,
-			want: map[string]any{
-				"type":          "workspaceWrite",
-				"networkAccess": false,
-				"writableRoots": []any{cwd},
-			},
-		},
-		{
-			name:        "workspace network write enables network",
-			writePolicy: WritePolicyWorkspaceNetwork,
-			write:       true,
-			want: map[string]any{
-				"type":          "workspaceWrite",
-				"networkAccess": true,
-				"writableRoots": []any{cwd},
-			},
-		},
-		{
-			name:        "trusted write uses unrestricted policy",
-			writePolicy: WritePolicyTrusted,
-			write:       true,
-			want: map[string]any{
-				"type": "dangerFullAccess",
-			},
-		},
-		{
-			name:  "zero value read is read only offline",
-			write: false,
-			want: map[string]any{
-				"type":          "readOnly",
-				"networkAccess": false,
-			},
-		},
-		{
-			name:        "workspace network read is read only offline",
-			writePolicy: WritePolicyWorkspaceNetwork,
-			write:       false,
-			want: map[string]any{
-				"type":          "readOnly",
-				"networkAccess": false,
-			},
-		},
-		{
-			name:        "trusted read is read only offline",
-			writePolicy: WritePolicyTrusted,
-			write:       false,
-			want: map[string]any{
-				"type":          "readOnly",
-				"networkAccess": false,
-			},
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
-				peer := newAppServerPeer(t, proc)
-				peer.handshake()
-				thread := peer.expectRequest("thread/start")
-				peer.respond(thread, threadResult("thread-1"))
-				turn := peer.expectRequest("turn/start")
-				params, ok := turn["params"].(map[string]any)
-				if !ok {
-					t.Fatalf("turn/start params = %#v", turn["params"])
-				}
-				got, ok := params["sandboxPolicy"].(map[string]any)
-				if !ok {
-					t.Fatalf("turn/start sandboxPolicy = %#v", params["sandboxPolicy"])
-				}
-				if !reflect.DeepEqual(got, test.want) {
-					t.Fatalf("turn/start sandboxPolicy = %#v, want %#v", got, test.want)
-				}
-				peer.respond(turn, turnResult("turn-1"))
-				peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
-			})
-
-			session := startFakeCodexSessionWithOptions(t, Options{
-				Binary:      "fake-codex",
-				WritePolicy: test.writePolicy,
-			}, engine.SessionOpts{CWD: cwd})
-			events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello", Write: test.write}, runner)
-			if err != nil {
-				t.Fatal(err)
-			}
-			_ = collectEventsWithTimeout(t, events, 2*time.Second)
-		})
-	}
-}
-
-func TestAppServerWriteCacheAppliesOnlyToWriteTurns(t *testing.T) {
-	cwd := t.TempDir()
-	cacheRoot := filepath.Join(t.TempDir(), "job-cache")
-	ambient := map[string]string{
-		"GOCACHE":    "ambient-go-build",
-		"GOMODCACHE": "ambient-go-mod",
-		"TMPDIR":     "ambient-tmp",
-	}
-	for key, value := range ambient {
-		t.Setenv(key, value)
-	}
-	writeOverlay := map[string]string{
-		"GOCACHE":    filepath.Join(cacheRoot, "cache", "go-build"),
-		"GOMODCACHE": filepath.Join(cacheRoot, "cache", "go-mod"),
-		"TMPDIR":     filepath.Join(cacheRoot, "tmp"),
-	}
-
-	for _, tt := range []struct {
-		name       string
-		write      bool
-		wantPolicy map[string]any
-		wantEnv    map[string]string
-	}{
-		{
-			name:  "write",
-			write: true,
-			wantPolicy: map[string]any{
-				"type":          "workspaceWrite",
-				"networkAccess": false,
-				"writableRoots": []any{cwd, cacheRoot},
-			},
-			wantEnv: writeOverlay,
-		},
-		{
-			name:  "read only",
-			write: false,
-			wantPolicy: map[string]any{
-				"type":          "readOnly",
-				"networkAccess": false,
-			},
-			wantEnv: ambient,
-		},
-	} {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
-				peer := newAppServerPeer(t, proc)
-				peer.handshake()
-				thread := peer.expectRequest("thread/start")
-				peer.respond(thread, threadResult("thread-1"))
-				turn := peer.expectRequest("turn/start")
-				params, ok := turn["params"].(map[string]any)
-				if !ok {
-					t.Fatalf("turn/start params = %#v", turn["params"])
-				}
-				gotPolicy, ok := params["sandboxPolicy"].(map[string]any)
-				if !ok || !reflect.DeepEqual(gotPolicy, tt.wantPolicy) {
-					t.Fatalf("turn/start sandboxPolicy = %#v, want %#v", params["sandboxPolicy"], tt.wantPolicy)
-				}
-				if tt.write {
-					for _, key := range []string{"excludeSlashTmp", "excludeTmpdirEnvVar"} {
-						if _, ok := gotPolicy[key]; ok {
-							t.Fatalf("ordinary write sandboxPolicy contains verify-only %q: %#v", key, gotPolicy)
-						}
-					}
-				}
-				peer.respond(turn, turnResult("turn-1"))
-				peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
-			})
-			session := startFakeCodexSession(t, engine.SessionOpts{
-				CWD:              cwd,
-				WriteSandboxRoot: cacheRoot,
-				WriteEnvOverlay:  writeOverlay,
-			})
-			events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello", Write: tt.write}, runner)
-			if err != nil {
-				t.Fatal(err)
-			}
-			_ = collectEventsWithTimeout(t, events, 2*time.Second)
-			spec := runner.lastSpec()
-			for key, want := range tt.wantEnv {
-				got, ok := execSpecEnvironmentValue(spec, key)
-				if !ok || got != want {
-					t.Fatalf("%s = %q present=%t, want %q", key, got, ok, want)
-				}
-			}
-		})
-	}
-}
-
-// TestAppServerWriteCacheDoesNotLeakIntoReadOnlyRetryOnSameSession pins the
-// boundary the table test above cannot: each of its cases builds a fresh
-// session, so it would pass even if a write turn contaminated persistent session
-// state and a following read-only turn inherited the overlay or extra root.
-// A read-only retry after a write attempt reuses one session, so that is the
-// path where a leak would actually happen.
-func TestAppServerWriteCacheDoesNotLeakIntoReadOnlyRetryOnSameSession(t *testing.T) {
-	cwd := t.TempDir()
-	cacheRoot := filepath.Join(t.TempDir(), "job-cache")
-	ambient := map[string]string{
-		"GOCACHE":    "ambient-go-build",
-		"GOMODCACHE": "ambient-go-mod",
-		"TMPDIR":     "ambient-tmp",
-	}
-	for key, value := range ambient {
-		t.Setenv(key, value)
-	}
-	writeOverlay := map[string]string{
-		"GOCACHE":    filepath.Join(cacheRoot, "cache", "go-build"),
-		"GOMODCACHE": filepath.Join(cacheRoot, "cache", "go-mod"),
-		"TMPDIR":     filepath.Join(cacheRoot, "tmp"),
-	}
-
-	newRunner := func(turnID, threadMethod string, wantPolicy map[string]any) *fakeAppServerRunner {
-		return newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
-			peer := newAppServerPeer(t, proc)
-			peer.handshake()
-			thread := peer.expectRequest(threadMethod)
-			peer.respond(thread, threadResult("thread-1"))
-			turn := peer.expectRequest("turn/start")
-			params, ok := turn["params"].(map[string]any)
-			if !ok {
-				t.Fatalf("turn/start params = %#v", turn["params"])
-			}
-			gotPolicy, ok := params["sandboxPolicy"].(map[string]any)
-			if !ok || !reflect.DeepEqual(gotPolicy, wantPolicy) {
-				t.Fatalf("turn/start sandboxPolicy = %#v, want %#v", params["sandboxPolicy"], wantPolicy)
-			}
-			peer.respond(turn, turnResult(turnID))
-			peer.notify("turn/completed", completedParams("thread-1", turnID, "completed", ""))
-		})
-	}
-
-	session := startFakeCodexSession(t, engine.SessionOpts{
-		CWD:              cwd,
-		WriteSandboxRoot: cacheRoot,
-		WriteEnvOverlay:  writeOverlay,
-	})
-
-	writeRunner := newRunner("turn-1", "thread/start", map[string]any{
-		"type":          "workspaceWrite",
-		"networkAccess": false,
-		"writableRoots": []any{cwd, cacheRoot},
-	})
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "write", Write: true}, writeRunner)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = collectEventsWithTimeout(t, events, 2*time.Second)
-	for key, want := range writeOverlay {
-		if got, ok := execSpecEnvironmentValue(writeRunner.lastSpec(), key); !ok || got != want {
-			t.Fatalf("write turn %s = %q present=%t, want %q", key, got, ok, want)
-		}
-	}
-
-	// The second turn resumes the established thread rather than starting a new
-	// one, which is exactly why it is the interesting case: session state carries
-	// across it.
-	readRunner := newRunner("turn-2", "thread/resume", map[string]any{
-		"type":          "readOnly",
-		"networkAccess": false,
-	})
-	events, err = turnWithRunner(t, session, engine.TurnInput{Prompt: "read", Write: false}, readRunner)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = collectEventsWithTimeout(t, events, 2*time.Second)
-	for key, want := range ambient {
-		if got, ok := execSpecEnvironmentValue(readRunner.lastSpec(), key); !ok || got != want {
-			t.Fatalf("read-only retry %s = %q present=%t, want the ambient value %q", key, got, ok, want)
-		}
-	}
 }
 
 func TestAppServerThreadsStartThenResumeWithReturnedID(t *testing.T) {
@@ -1136,7 +696,7 @@ func TestAppServerThreadsStartThenResumeWithReturnedID(t *testing.T) {
 	)
 
 	session := startFakeCodexSession(t, engine.SessionOpts{})
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "first"}, runner)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "first"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1145,7 +705,7 @@ func TestAppServerThreadsStartThenResumeWithReturnedID(t *testing.T) {
 		t.Fatalf("session id after first turn = %q, want thread-1", session.ID())
 	}
 
-	events, err = turnWithRunner(t, session, engine.TurnInput{Prompt: "second"}, runner)
+	events, err = turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "second"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1170,7 +730,7 @@ func TestAppServerCompletedTurnUsesLastCompletedAgentMessageAsResult(t *testing.
 	})
 
 	session := startFakeCodexSession(t, engine.SessionOpts{})
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1202,7 +762,7 @@ func TestAppServerWarningFrameEmitsOneOrderedEventSequence(t *testing.T) {
 	})
 
 	session := startFakeCodexSession(t, engine.SessionOpts{})
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1247,7 +807,7 @@ func TestAppServerCompletedTurnUsesCompletedTextAfterMismatchedAgentDelta(t *tes
 	})
 
 	session := startFakeCodexSession(t, engine.SessionOpts{})
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1277,7 +837,7 @@ func TestAppServerCompletedTurnUsesAccumulatedAgentMessageDeltasAsResult(t *test
 	})
 
 	session := startFakeCodexSession(t, engine.SessionOpts{})
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1309,7 +869,7 @@ func TestAppServerCompletedTurnUsesLastDeltaAgentMessageItemAsResult(t *testing.
 	})
 
 	session := startFakeCodexSession(t, engine.SessionOpts{})
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1338,7 +898,7 @@ func TestAppServerTaskCompleteUsesLastAgentMessageAsResult(t *testing.T) {
 	})
 
 	session := startFakeCodexSession(t, engine.SessionOpts{})
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1443,7 +1003,7 @@ func TestAppServerTerminalTurnStatuses(t *testing.T) {
 			})
 
 			session := startFakeCodexSession(t, engine.SessionOpts{})
-			events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+			events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1539,7 +1099,7 @@ func TestAppServerProviderOverloadIgnoresTerminalItemInventory(t *testing.T) {
 			})
 
 			session := startFakeCodexSession(t, engine.SessionOpts{})
-			events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+			events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1592,7 +1152,7 @@ func TestAppServerInterruptFlushesPendingFileChange(t *testing.T) {
 	})
 
 	session := startFakeCodexSession(t, engine.SessionOpts{})
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1662,7 +1222,7 @@ func TestAppServerInterruptLatchesSentTurnStartUntilResponse(t *testing.T) {
 		peer.notify("turn/completed", completedParams("thread-1", "turn-1", "interrupted", ""))
 	})
 
-	backend, ok := New(Options{Binary: "fake-codex"}).(*backend)
+	backend, ok := New(Options{Binary: "fake-codex"}).(*cliadapter.Backend)
 	if !ok {
 		t.Fatal("codex backend was not a CLI adapter backend")
 	}
@@ -1674,7 +1234,7 @@ func TestAppServerInterruptLatchesSentTurnStartUntilResponse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1732,7 +1292,7 @@ func TestAppServerFileChangesReportObservedWorkspaceWriteItems(t *testing.T) {
 	})
 
 	session := startFakeCodexSession(t, engine.SessionOpts{})
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1803,7 +1363,7 @@ func TestAppServerEmitsOneEventPerLogicalItem(t *testing.T) {
 	})
 
 	session := startFakeCodexSession(t, engine.SessionOpts{})
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1864,7 +1424,7 @@ func TestAppServerAnswersServerRequestsAndContinues(t *testing.T) {
 		})
 
 		session := startFakeCodexSession(t, engine.SessionOpts{})
-		events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+		events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1893,7 +1453,7 @@ func TestAppServerAnswersServerRequestsAndContinues(t *testing.T) {
 		})
 
 		session := startFakeCodexSession(t, engine.SessionOpts{})
-		events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+		events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1918,7 +1478,7 @@ func TestAppServerUnknownNotificationIsIgnored(t *testing.T) {
 	})
 
 	session := startFakeCodexSession(t, engine.SessionOpts{})
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+	events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1947,7 +1507,7 @@ func TestCodexPreflightSucceedsWithoutSetupProbeCache(t *testing.T) {
 		Version:      MinimumKnownGoodVersion,
 		StreamSchema: StreamSchema,
 		Minimum:      MinimumKnownGoodVersion,
-		Warning:      "model discovery unavailable; using static known-good validation lists",
+		Warning:      "model discovery unavailable; provider validates selections",
 	}
 	if health != want {
 		t.Fatalf("health = %#v, want %#v", health, want)
@@ -2035,120 +1595,6 @@ func execSpecEnvironmentValue(spec command.ExecSpec, key string) (string, bool) 
 		}
 	}
 	return "", false
-}
-
-func TestAppServerVerifyUsesFrozenWorkspaceAndOfflineWritableRoots(t *testing.T) {
-	source := t.TempDir()
-	frozenCopy := t.TempDir()
-	scratch := t.TempDir()
-	prompt := "run the submitted checks"
-	writeOverlay := map[string]string{"GOCACHE": filepath.Join(scratch, "cache", "go-build")}
-	runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
-		if spec.Dir != frozenCopy {
-			t.Fatalf("provider cwd = %q, want frozen copy %q", spec.Dir, frozenCopy)
-		}
-		peer := newAppServerPeer(t, proc)
-		peer.handshake()
-		thread := peer.expectRequest("thread/start")
-		threadParams := thread["params"].(map[string]any)
-		if threadParams["cwd"] != frozenCopy || threadParams["sandbox"] != "workspace-write" {
-			t.Fatalf("thread/start params = %#v, want frozen cwd and workspace-write mode", threadParams)
-		}
-		if _, ok := threadParams["permissions"]; ok {
-			t.Fatalf("verify thread/start unexpectedly used a permission profile: %#v", threadParams)
-		}
-		peer.respond(thread, threadResult("thread-verify"))
-		turn := peer.expectRequest("turn/start")
-		turnParams := turn["params"].(map[string]any)
-		wantPolicy := map[string]any{
-			"type":                "workspaceWrite",
-			"networkAccess":       false,
-			"writableRoots":       []any{frozenCopy, scratch},
-			"excludeSlashTmp":     true,
-			"excludeTmpdirEnvVar": true,
-		}
-		if turnParams["cwd"] != frozenCopy || !reflect.DeepEqual(turnParams["sandboxPolicy"], wantPolicy) {
-			t.Fatalf("verify turn/start params = %#v, want cwd %q and policy %#v", turnParams, frozenCopy, wantPolicy)
-		}
-		for _, root := range wantPolicy["writableRoots"].([]any) {
-			if root == source {
-				t.Fatalf("submitted source appears in verify writable roots: %#v", wantPolicy["writableRoots"])
-			}
-		}
-		input := turnParams["input"].([]any)
-		if len(input) != 1 || input[0].(map[string]any)["text"] != prompt {
-			t.Fatalf("verify prompt input = %#v, want unchanged prompt %q", turnParams["input"], prompt)
-		}
-		peer.respond(turn, turnResult("turn-verify"))
-		peer.notify("turn/completed", completedParams("thread-verify", "turn-verify", "completed", ""))
-	})
-	session := startFakeCodexSessionWithOptions(t, Options{Binary: "fake-codex", WritePolicy: WritePolicyTrusted}, engine.SessionOpts{
-		CWD: frozenCopy, WriteSandboxRoot: scratch, Verify: true, WriteEnvOverlay: writeOverlay,
-	})
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: prompt, Write: false}, runner)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = collectEventsWithTimeout(t, events, 2*time.Second)
-	if got, ok := execSpecEnvironmentValue(runner.lastSpec(), "GOCACHE"); !ok || got != writeOverlay["GOCACHE"] {
-		t.Fatalf("verify GOCACHE = %q present=%t, want scratch cache %q", got, ok, writeOverlay["GOCACHE"])
-	}
-}
-
-func TestAppServerVerifyLocalIPCProfileUsesCopyWithoutGitMetadata(t *testing.T) {
-	source := t.TempDir()
-	frozenCopy := t.TempDir()
-	scratch := t.TempDir()
-	ipcRoot := t.TempDir()
-	runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
-		if spec.Dir != frozenCopy {
-			t.Fatalf("provider cwd = %q, want frozen copy %q", spec.Dir, frozenCopy)
-		}
-		arguments := strings.Join(spec.Argv, "\n")
-		for _, expected := range []string{
-			tomlString(frozenCopy) + `="write"`,
-			tomlString(scratch) + `="write"`,
-			tomlString(ipcRoot) + `="write"`,
-		} {
-			if !strings.Contains(arguments, expected) {
-				t.Fatalf("local IPC argv does not grant %s: %#v", expected, spec.Argv)
-			}
-		}
-		for _, forbidden := range []string{tomlString(source) + `="write"`, tomlString(filepath.Join(source, ".git")), tomlString(filepath.Join(frozenCopy, ".git"))} {
-			if strings.Contains(arguments, forbidden) {
-				t.Fatalf("verify local IPC argv contains source or copy Git metadata entry %s: %#v", forbidden, spec.Argv)
-			}
-		}
-		if strings.Contains(arguments, tomlString("/tmp")+`="write"`) {
-			t.Fatalf("verify local IPC argv contains a broad /tmp write grant: %#v", spec.Argv)
-		}
-		peer := newAppServerPeer(t, proc)
-		peer.handshake()
-		thread := peer.expectRequest("thread/start")
-		threadParams := thread["params"].(map[string]any)
-		if threadParams["cwd"] != frozenCopy || threadParams["permissions"] != localIPCPermissionProfile {
-			t.Fatalf("verify local IPC thread/start params = %#v, want copy cwd and %q profile", threadParams, localIPCPermissionProfile)
-		}
-		peer.respond(thread, threadResult("thread-verify-ipc"))
-		turn := peer.expectRequest("turn/start")
-		turnParams := turn["params"].(map[string]any)
-		if turnParams["cwd"] != frozenCopy || turnParams["permissions"] != localIPCPermissionProfile {
-			t.Fatalf("verify local IPC turn/start params = %#v, want copy cwd and %q profile", turnParams, localIPCPermissionProfile)
-		}
-		if _, ok := turnParams["sandboxPolicy"]; ok {
-			t.Fatalf("verify local IPC turn/start unexpectedly has sandboxPolicy: %#v", turnParams)
-		}
-		peer.respond(turn, turnResult("turn-verify-ipc"))
-		peer.notify("turn/completed", completedParams("thread-verify-ipc", "turn-verify-ipc", "completed", ""))
-	})
-	session := startFakeCodexSession(t, engine.SessionOpts{
-		CWD: frozenCopy, WriteSandboxRoot: scratch, LocalIPCRoot: ipcRoot, LocalIPC: true, Verify: true,
-	})
-	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "run tests", Write: false}, runner)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = collectEventsWithTimeout(t, events, 2*time.Second)
 }
 
 type fakeAppServerProcess struct {
