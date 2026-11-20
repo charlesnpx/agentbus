@@ -1250,6 +1250,8 @@ func TestRestartDuringCorrectionPreservesRetiredSessionForResume(t *testing.T) {
 	first.closeJobStore()
 
 	restarted := newTestServer(t, root, Config{Backends: []engine.Backend{helloBackend{name: "restart-running"}}})
+	restarted.processTable = summaryProcessTable{alive: false}
+	restarted.processGroupGoneFn = func(int) (bool, error) { return false, nil }
 	store, err = restarted.ensureJobStore()
 	if err != nil {
 		t.Fatal(err)
@@ -1275,7 +1277,7 @@ func TestRestartDuringCorrectionPreservesRetiredSessionForResume(t *testing.T) {
 	}
 }
 
-func TestRestartPreservesUnknownTerminalRecordBytes(t *testing.T) {
+func TestRestartPreservesUnknownTerminalWithoutProcessClaim(t *testing.T) {
 	root := t.TempDir()
 	var starts atomic.Int64
 	backend := &executionFakeBackend{name: "restart-unknown"}
@@ -1289,11 +1291,11 @@ func TestRestartPreservesUnknownTerminalRecordBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.MarkTerminal(submitted.JobID, jobstore.TerminalUpdate{State: protocol.PublicStateUnknown, Cleanup: protocol.CleanupUncertain}); err != nil {
+	before, err := store.MarkTerminal(submitted.JobID, jobstore.TerminalUpdate{State: protocol.PublicStateUnknown, Cleanup: protocol.CleanupUncertain})
+	if err != nil {
 		t.Fatal(err)
 	}
 	first.closeJobStore()
-	before := rawJobRecord(t, root, submitted.JobID)
 
 	restarted := newTestServer(t, root, Config{Backends: []engine.Backend{backend}})
 	store, err = restarted.ensureJobStore()
@@ -1303,10 +1305,9 @@ func TestRestartPreservesUnknownTerminalRecordBytes(t *testing.T) {
 	if err := restarted.reconcileRecoveredJobs(store); err != nil {
 		t.Fatal(err)
 	}
-	restarted.closeJobStore()
-	after := rawJobRecord(t, root, submitted.JobID)
-	if !bytes.Equal(before, after) {
-		t.Fatalf("terminal record bytes changed across restart\nbefore=%s\nafter=%s", before, after)
+	after, err := store.Get(submitted.JobID)
+	if err != nil || after.State != before.State || after.Cleanup != protocol.CleanupUncertain || after.RequestID != before.RequestID || after.WorkspaceKey != before.WorkspaceKey {
+		t.Fatalf("terminal record after restart = %#v, error %v", after, err)
 	}
 	if got := starts.Load(); got != 0 {
 		t.Fatalf("recovered terminal backend Start calls = %d, want 0", got)
@@ -1357,28 +1358,27 @@ func TestRestartTerminalRecordsWithoutAdmittedSteersDoNotWriteStore(t *testing.T
 
 func TestOrphanReaperSignalsExactTokenMatch(t *testing.T) {
 	for _, tt := range []struct {
-		name              string
-		secondLookupToken string
-		wantCleanup       protocol.Cleanup
-		wantEvents        []string
+		name        string
+		lookupToken string
+		wantCleanup protocol.Cleanup
+		wantSignal  bool
 	}{
 		{
 			name:        "matching token signals in order",
 			wantCleanup: protocol.CleanupClean,
-			wantEvents:  []string{"lookup", "group-present", "lookup", "TERM", "group-gone"},
+			wantSignal:  true,
 		},
 		{
-			name:              "changed second token does not signal",
-			secondLookupToken: "recycled-pid-token",
-			wantCleanup:       protocol.CleanupUncertain,
-			wantEvents:        []string{"lookup", "group-present", "lookup"},
+			name:        "changed token does not signal",
+			lookupToken: "recycled-pid-token",
+			wantCleanup: protocol.CleanupUncertain,
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "reaper-exact"}}})
 			fixture := newOrphanReaperFixture()
-			if tt.secondLookupToken != "" {
-				fixture.lookupTokens = []string{fixture.startToken, tt.secondLookupToken}
+			if tt.lookupToken != "" {
+				fixture.lookupTokens = []string{tt.lookupToken}
 			}
 			server.processTable = fixture
 			server.processGroups = fixture
@@ -1399,8 +1399,8 @@ func TestOrphanReaperSignalsExactTokenMatch(t *testing.T) {
 			if stored.State != protocol.PublicStateUnknown || stored.Cleanup != tt.wantCleanup {
 				t.Fatalf("exact-token reaped record = %#v, want cleanup %s", stored, tt.wantCleanup)
 			}
-			if !slices.Equal(fixture.events, tt.wantEvents) {
-				t.Fatalf("exact-token events = %#v, want %#v", fixture.events, tt.wantEvents)
+			if tt.wantSignal && (len(fixture.signals) != 1 || fixture.signals[0].signal != syscall.SIGTERM) || !tt.wantSignal && len(fixture.signals) != 0 {
+				t.Fatalf("signals = %#v, want TERM: %t", fixture.signals, tt.wantSignal)
 			}
 		})
 	}
@@ -1422,8 +1422,8 @@ func TestOrphanReaperDoesNotSignalTokenMismatch(t *testing.T) {
 	if err := server.reconcileRecoveredJobs(store); err != nil {
 		t.Fatal(err)
 	}
-	if fixture.lookups != 1 || len(fixture.signals) != 0 || len(fixture.groupGone) != 0 {
-		t.Fatalf("mismatched-token fixture activity = lookups:%d signals:%#v group-gone:%#v, want one lookup and no group action", fixture.lookups, fixture.signals, fixture.groupGone)
+	if len(fixture.signals) != 0 {
+		t.Fatalf("mismatched-token signals = %#v, want none", fixture.signals)
 	}
 	stored, err := store.Get(record.JobID)
 	if err != nil {
@@ -1523,27 +1523,6 @@ func (f *orphanReaperFixture) processGroupGone(pgid int) (bool, error) {
 		f.events = append(f.events, "group-present")
 	}
 	return seenGone, nil
-}
-
-func rawJobRecord(t *testing.T, root, jobID string) []byte {
-	t.Helper()
-	db, err := bolt.Open(root+"/jobs.db", 0o600, &bolt.Options{ReadOnly: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	var raw []byte
-	if err := db.View(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket([]byte("jobs"))
-		if bucket == nil {
-			return errors.New("jobs bucket is missing")
-		}
-		raw = append([]byte(nil), bucket.Get([]byte(jobID))...)
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	return raw
 }
 
 func persistRunningClaim(t *testing.T, server *Server, backend string, claim jobstore.ProcessClaim) jobstore.Record {

@@ -245,10 +245,10 @@ func TestDirectCommandRunnerCanceledWithMismatchedTokenKeepsWritingProcessAlive(
 	if observation.ExecutionErr != nil {
 		t.Fatalf("execution error = %v, want nil before asynchronous reap", observation.ExecutionErr)
 	}
-	if _, err := command.stdoutPipe.Stat(); err != nil {
+	if _, err := command.terminator.pipes[0].Stat(); err != nil {
 		t.Fatalf("stdout pipe closed after cleanup uncertainty: %v", err)
 	}
-	if _, err := command.stderrPipe.Stat(); err != nil {
+	if _, err := command.terminator.pipes[1].Stat(); err != nil {
 		t.Fatalf("stderr pipe closed after cleanup uncertainty: %v", err)
 	}
 
@@ -443,10 +443,10 @@ func TestDirectCommandRunnerPermissionDeniedReportsCleanupFailure(t *testing.T) 
 	if observation.ExecutionErr != nil {
 		t.Fatalf("execution error = %v, want nil before asynchronous reap", observation.ExecutionErr)
 	}
-	if _, err := command.stdoutPipe.Stat(); err != nil {
+	if _, err := command.terminator.pipes[0].Stat(); err != nil {
 		t.Fatalf("stdout pipe closed after cleanup uncertainty: %v", err)
 	}
-	if _, err := command.stderrPipe.Stat(); err != nil {
+	if _, err := command.terminator.pipes[1].Stat(); err != nil {
 		t.Fatalf("stderr pipe closed after cleanup uncertainty: %v", err)
 	}
 	assertProcessRunning(t, command.cmd.Process.Pid)

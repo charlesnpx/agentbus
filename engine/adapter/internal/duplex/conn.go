@@ -39,16 +39,14 @@ const (
 // line limit after its remainder was discarded for resynchronization.
 var ErrFrameTooLarge = errors.New("backend JSONL frame exceeded configured limit")
 
-// Frame is one decoded JSON object or an in-order recoverable reader condition
-// from the process stdout stream.
+// Frame is one decoded JSON object or an in-order reader error from the
+// process stdout stream.
 type Frame struct {
 	Raw    json.RawMessage
 	Object map[string]any
-	// Err reports an in-order recoverable transport condition. It is used for
-	// an oversized frame after the reader has discarded that frame through its
-	// newline; the following JSONL frame remains readable. Keeping this on the
-	// frame stream preserves wire order, so a following terminal frame cannot
-	// be accepted before a discarded terminal frame is classified.
+	// Err reports an in-order transport error. An oversized frame is recoverable
+	// after its remainder is discarded; other read and decode errors are fatal.
+	// Keeping errors on the frame stream preserves their order relative to data.
 	Err error
 }
 
@@ -97,7 +95,6 @@ func (e *DecodeError) Unwrap() error {
 type Conn struct {
 	stdin      io.WriteCloser
 	frames     <-chan Frame
-	decodeErrs <-chan error
 	readerDone <-chan struct{}
 	drops      *frameDropTracker
 	capture    *captureWarningTracker
@@ -127,7 +124,6 @@ func isBrokenStdinPipe(err error) bool {
 
 func newConn(stdin io.WriteCloser, stdout io.ReadCloser, stdoutLog io.Writer, capture *captureWarningTracker, running command.RunningCommand, retirement *retirement) *Conn {
 	frames := make(chan Frame, 16)
-	decodeErrs := make(chan error, 1)
 	readerDone := make(chan struct{})
 	drops := &frameDropTracker{}
 	if capture == nil {
@@ -136,11 +132,10 @@ func newConn(stdin io.WriteCloser, stdout io.ReadCloser, stdoutLog io.Writer, ca
 	if stdoutLog != nil {
 		stdoutLog = capture.tolerantWriter(stdoutLog)
 	}
-	go readJSONL(stdout, stdoutLog, frames, decodeErrs, readerDone, drops)
+	go readJSONL(stdout, stdoutLog, frames, readerDone, drops)
 	return &Conn{
 		stdin:      stdin,
 		frames:     frames,
-		decodeErrs: decodeErrs,
 		readerDone: readerDone,
 		drops:      drops,
 		capture:    capture,
@@ -197,15 +192,9 @@ func (c *Conn) CloseStdin() error {
 	return c.closeErr
 }
 
-// Frames returns decoded stdout JSON objects.
+// Frames returns decoded stdout JSON objects and ordered reader errors.
 func (c *Conn) Frames() <-chan Frame {
 	return c.frames
-}
-
-// DecodeErrors returns fatal stdout JSON decode or reader errors. Recoverable
-// oversized-frame errors are delivered in order on Frames.
-func (c *Conn) DecodeErrors() <-chan error {
-	return c.decodeErrs
 }
 
 // Interrupt invokes the underlying process interrupt path.
@@ -235,27 +224,14 @@ func (c *Conn) drainReader() {
 	if c == nil {
 		return
 	}
-	frames := c.Frames()
-	decodeErrs := c.DecodeErrors()
-	for frames != nil || decodeErrs != nil {
-		select {
-		case _, ok := <-frames:
-			if !ok {
-				frames = nil
-			}
-		case _, ok := <-decodeErrs:
-			if !ok {
-				decodeErrs = nil
-			}
-		}
+	for range c.Frames() {
 	}
 	c.waitReader()
 }
 
-func readJSONL(src io.ReadCloser, log io.Writer, frames chan<- Frame, decodeErrs chan<- error, done chan<- struct{}, drops *frameDropTracker) {
+func readJSONL(src io.ReadCloser, log io.Writer, frames chan<- Frame, done chan<- struct{}, drops *frameDropTracker) {
 	defer close(done)
 	defer close(frames)
-	defer close(decodeErrs)
 	defer func() { _ = src.Close() }()
 
 	var reader io.Reader = src
@@ -270,16 +246,12 @@ func readJSONL(src io.ReadCloser, log io.Writer, frames chan<- Frame, decodeErrs
 			if drops != nil {
 				drops.record(overlong)
 			}
-			// This must stay on the ordered frame stream rather than decodeErrs.
-			// Drivers may receive a valid subsequent frame and a buffered decode
-			// error in either select order; that could turn a discarded terminal
-			// frame into a false success.
 			frames <- Frame{Err: overlong}
 			continue
 		}
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
-				decodeErrs <- fmt.Errorf("incomplete backend transport: stdout read: %w", err)
+				frames <- Frame{Err: fmt.Errorf("incomplete backend transport: stdout read: %w", err)}
 			}
 			return
 		}
@@ -290,7 +262,7 @@ func readJSONL(src io.ReadCloser, log io.Writer, frames chan<- Frame, decodeErrs
 		raw := append([]byte(nil), line...)
 		var obj map[string]any
 		if err := json.Unmarshal(raw, &obj); err != nil {
-			decodeErrs <- &DecodeError{Line: string(raw), Err: err}
+			frames <- Frame{Err: &DecodeError{Line: string(raw), Err: err}}
 			return
 		}
 		frames <- Frame{Raw: json.RawMessage(raw), Object: obj}

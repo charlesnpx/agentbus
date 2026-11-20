@@ -37,9 +37,6 @@ func (d FixtureDriver) RunTurn(ctx context.Context, conn *Conn, resumeID string,
 		select {
 		case frame, ok := <-conn.Frames():
 			if !ok {
-				if err := pendingDecodeError(conn); err != nil {
-					return "", err
-				}
 				return "", ErrBackendExitedBeforeTerminal
 			}
 			if frame.Err != nil {
@@ -66,10 +63,6 @@ func (d FixtureDriver) RunTurn(ctx context.Context, conn *Conn, resumeID string,
 				text, _ := frame.Object["text"].(string)
 				emit(engine.Event{Type: engine.EventWarning, Text: text, Metadata: frame.Object})
 			}
-		case err, ok := <-conn.DecodeErrors():
-			if ok && err != nil {
-				return "", err
-			}
 		case <-ctx.Done():
 			return "", ctx.Err()
 		}
@@ -91,15 +84,4 @@ func (d FixtureDriver) Interrupt(ctx context.Context, conn *Conn) error {
 	default:
 	}
 	return conn.WriteJSON(map[string]any{"type": "interrupt"})
-}
-
-func pendingDecodeError(conn *Conn) error {
-	select {
-	case err, ok := <-conn.DecodeErrors():
-		if ok {
-			return err
-		}
-	default:
-	}
-	return nil
 }

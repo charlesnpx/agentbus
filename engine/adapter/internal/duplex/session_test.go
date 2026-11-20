@@ -89,11 +89,10 @@ func TestFailedRawLogSinkDoesNotDropTerminalFrame(t *testing.T) {
 	payload := []byte("{\"type\":\"message\",\"text\":\"first\"}\n{\"type\":\"complete\",\"text\":\"done\"}\n")
 	stdout, peer := io.Pipe()
 	frames := make(chan Frame, 4)
-	decodeErrs := make(chan error, 1)
 	done := make(chan struct{})
 	capture := &captureWarningTracker{source: "stdout"}
 	sink := &failAfterBytesWriter{remaining: capturedBytes}
-	go readJSONL(stdout, capture.tolerantWriter(sink), frames, decodeErrs, done, nil)
+	go readJSONL(stdout, capture.tolerantWriter(sink), frames, done, nil)
 	go func() {
 		_, _ = peer.Write(payload)
 		_ = peer.Close()
@@ -108,9 +107,6 @@ func TestFailedRawLogSinkDoesNotDropTerminalFrame(t *testing.T) {
 		types = append(types, typ)
 	}
 	<-done
-	if err := <-decodeErrs; err != nil {
-		t.Fatalf("decode error = %v, want none", err)
-	}
 	if got := strings.Join(types, ","); got != "message,complete" {
 		t.Fatalf("decoded frame types = %q, want message,complete", got)
 	}
@@ -1115,13 +1111,34 @@ func TestMalformedStdoutSurfacesDecodeError(t *testing.T) {
 	}
 }
 
+func TestTerminalFrameBeforeMalformedStdoutSucceeds(t *testing.T) {
+	stdin, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdin.Close()
+	const stdout = "{\"type\":\"complete\",\"text\":\"done\"}\nnot-json\n"
+	for i := 0; i < 200; i++ {
+		conn := newConn(stdin, io.NopCloser(strings.NewReader(stdout)), nil, nil, nil, nil)
+		// Ensure both lines have been read before the driver consumes output.
+		conn.waitReader()
+		var events []engine.Event
+		_, err := (FixtureDriver{}).RunTurn(context.Background(), conn, "", engine.SessionOpts{}, engine.TurnInput{}, func(event engine.Event) {
+			events = append(events, event)
+		})
+		conn.drainReader()
+		if err != nil || len(events) != 1 || events[0].Type != engine.EventResultMessage || events[0].Text != "done" {
+			t.Fatalf("iteration %d: events = %#v, error = %v, want successful result", i, events, err)
+		}
+	}
+}
+
 func TestReadJSONLResynchronizesAfterOversizedNonterminalFrame(t *testing.T) {
 	t.Setenv(JSONLineBytesEnv, "96")
 	reader, writer := io.Pipe()
 	frames := make(chan Frame, 2)
-	decodeErrs := make(chan error, 2)
 	done := make(chan struct{})
-	go readJSONL(reader, nil, frames, decodeErrs, done, nil)
+	go readJSONL(reader, nil, frames, done, nil)
 
 	_, _ = io.WriteString(writer, `{"type":"message","text":"`+strings.Repeat("x", 128)+`"}`+"\n")
 	_, _ = io.WriteString(writer, `{"type":"complete","text":"done"}`+"\n")
@@ -2050,9 +2067,6 @@ func (d *delayedFrameConsumerDriver) RunTurn(ctx context.Context, conn *Conn, re
 		select {
 		case frame, ok := <-conn.Frames():
 			if !ok {
-				if err := pendingDecodeError(conn); err != nil {
-					return "", err
-				}
 				return "", ErrBackendExitedBeforeTerminal
 			}
 			if frame.Err != nil {
@@ -2071,10 +2085,6 @@ func (d *delayedFrameConsumerDriver) RunTurn(ctx context.Context, conn *Conn, re
 				}
 				emit(engine.Event{Type: engine.EventResultMessage, Text: text, Metadata: frame.Object})
 				return nextID, nil
-			}
-		case err, ok := <-conn.DecodeErrors():
-			if ok && err != nil {
-				return "", err
 			}
 		case <-ctx.Done():
 			return "", ctx.Err()

@@ -405,17 +405,6 @@ func TestExecutionNoncompliantSchemaUsesOneSuccessfulCorrection(t *testing.T) {
 						t.Fatal("correction turn was write-enabled")
 					}
 					correctionPrompt = input.Prompt
-					store, err := server.ensureJobStore()
-					if err != nil {
-						t.Fatal(err)
-					}
-					beforeCorrectionClaim, err := store.Get(record.JobID)
-					if err != nil {
-						t.Fatal(err)
-					}
-					if beforeCorrectionClaim.ProcessClaim == nil || beforeCorrectionClaim.ProcessClaim.StartToken != "initial-token" {
-						t.Fatalf("claim before correction = %+v, want retired initial claim", beforeCorrectionClaim.ProcessClaim)
-					}
 					input.OnProcessStart(engine.ProcessRef{PID: 4108, PGID: 4108, StartTime: "correction-token"}, 0)
 					return executionEvents(engine.Event{Type: engine.EventResultMessage, Text: correctedResult}), nil
 				default:
@@ -455,6 +444,70 @@ func TestExecutionNoncompliantSchemaUsesOneSuccessfulCorrection(t *testing.T) {
 	}
 	if turns != 2 {
 		t.Fatalf("turn count = %d, want 2", turns)
+	}
+}
+
+func TestUnrecordedCorrectionCannotReuseEarlierClaimForCleanup(t *testing.T) {
+	turns := 0
+	backend := &executionFakeBackend{name: "unrecorded-correction"}
+	backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) {
+		return &executionFakeSession{turn: func(_ context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
+			turns++
+			if turns == 1 {
+				input.OnProcessStart(engine.ProcessRef{PID: 4107, PGID: 4107, StartTime: "retired-token"}, 0)
+				return executionEvents(engine.Event{Type: engine.EventResultMessage, Text: `{"wrong":true}`}), nil
+			}
+			return executionEvents(engine.Event{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{CleanupFailed: true}}), nil
+		}}, nil
+	}
+	server := newExecutionServer(t, backend)
+	server.processGroupGoneFn = func(int) (bool, error) { return true, nil }
+	record := queuedExecutionRecordWithSchema(t, server, backend.Name(), "task", nil, json.RawMessage(`{"required":["ok"]}`))
+	runExecution(t, server, record)
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := store.Get(record.JobID)
+	if err != nil || turns != 2 || before.State != protocol.PublicStateCompleted || before.Cleanup != protocol.CleanupUncertain || before.ResultText != `{"wrong":true}` {
+		t.Fatalf("turns=%d record=%#v error=%v", turns, before, err)
+	}
+	if err := server.reconcileRecoveredJobs(store); err != nil {
+		t.Fatal(err)
+	}
+	after, err := store.Get(record.JobID)
+	if err != nil || after.Cleanup != protocol.CleanupUncertain || after.ResultText != before.ResultText {
+		t.Fatalf("unrecorded correction cleanup after reconciliation = %#v, error %v", after, err)
+	}
+}
+
+func TestMultipleReportedProcessesCannotBeClearedByOneGroupObservation(t *testing.T) {
+	backend := &executionFakeBackend{name: "multiple-process-claims"}
+	backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) {
+		return &executionFakeSession{turn: func(_ context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
+			input.OnProcessStart(engine.ProcessRef{PID: 4107, PGID: 4107, StartTime: "first-token"}, 0)
+			input.OnProcessStart(engine.ProcessRef{PID: 4108, PGID: 4108, StartTime: "second-token"}, 0)
+			return executionEvents(engine.Event{Type: engine.EventResultMessage, Text: "answer"}), nil
+		}}, nil
+	}
+	server := newExecutionServer(t, backend)
+	server.processGroupGoneFn = func(int) (bool, error) { return true, nil }
+	record := queuedExecutionRecord(t, server, backend.Name(), "task", nil)
+	runExecution(t, server, record)
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := store.Get(record.JobID)
+	if err != nil || !before.State.IsTerminal() || before.Cleanup != protocol.CleanupUncertain {
+		t.Fatalf("multiple-claim terminal = %#v, error %v", before, err)
+	}
+	if err := server.reconcileRecoveredJobs(store); err != nil {
+		t.Fatal(err)
+	}
+	after, err := store.Get(record.JobID)
+	if err != nil || after.Cleanup != protocol.CleanupUncertain || after.State != before.State || after.ResultText != before.ResultText {
+		t.Fatalf("multiple-claim reconciliation = %#v, error %v", after, err)
 	}
 }
 

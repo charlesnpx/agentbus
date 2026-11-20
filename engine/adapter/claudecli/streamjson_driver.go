@@ -548,32 +548,18 @@ func (s *claudeStream) nextFrame(ctx context.Context) (duplex.Frame, error) {
 		s.pending = s.pending[:len(s.pending)-1]
 		return frame, nil
 	}
-	frames := s.conn.Frames()
-	decodeErrs := s.conn.DecodeErrors()
-	for frames != nil || decodeErrs != nil {
-		select {
-		case frame, ok := <-frames:
-			if !ok {
-				frames = nil
-				continue
-			}
-			if frame.Err != nil {
-				return duplex.Frame{}, frame.Err
-			}
-			return frame, nil
-		case err, ok := <-decodeErrs:
-			if !ok {
-				decodeErrs = nil
-				continue
-			}
-			if err != nil {
-				return duplex.Frame{}, err
-			}
-		case <-ctx.Done():
-			return duplex.Frame{}, ctx.Err()
+	select {
+	case frame, ok := <-s.conn.Frames():
+		if !ok {
+			return duplex.Frame{}, duplex.ErrBackendExitedBeforeTerminal
 		}
+		if frame.Err != nil {
+			return duplex.Frame{}, frame.Err
+		}
+		return frame, nil
+	case <-ctx.Done():
+		return duplex.Frame{}, ctx.Err()
 	}
-	return duplex.Frame{}, duplex.ErrBackendExitedBeforeTerminal
 }
 
 func (s *claudeStream) handleFrame(ctx context.Context, frame duplex.Frame, sessionID *string) (bool, error) {

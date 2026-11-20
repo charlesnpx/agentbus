@@ -332,6 +332,11 @@ func (run *activeExecution) retireTurn(store *jobstore.Store, outcome turnOutcom
 		}
 		run.controlMu.Unlock()
 		outcome.diagnostics = append(outcome.diagnostics, run.takeSteerDiagnostics()...)
+		_, _, claimErr := run.claimStatus()
+		if claimErr != nil {
+			outcome.cleanup = protocol.CleanupUncertain
+			outcome.diagnostics = append(outcome.diagnostics, "process claim: "+claimErr.Error())
+		}
 		if strings.TrimSpace(outcome.modelReported) != "" || strings.TrimSpace(outcome.effortReported) != "" {
 			if err := store.RecordObservedSelection(run.jobID, outcome.modelReported, outcome.effortReported); err != nil && !errors.Is(err, jobstore.ErrTerminal) {
 				outcome.diagnostics = append(outcome.diagnostics, "record reported model: "+err.Error())
@@ -436,6 +441,17 @@ func (run *activeExecution) noteProcessClaim(ref engine.ProcessRef) {
 // the owner invokes this method before that retirement can publish.
 func (run *activeExecution) persistProcessClaim(store *jobstore.Store) {
 	run.mu.Lock()
+	if run.claimErr != nil {
+		run.mu.Unlock()
+		// A second reported process makes the previously stored claim
+		// insufficient evidence for the whole turn.
+		if err := store.ClearProcessClaim(run.jobID); err != nil && !errors.Is(err, jobstore.ErrTerminal) {
+			run.mu.Lock()
+			run.claimErr = errors.Join(run.claimErr, fmt.Errorf("clear invalid process claim: %w", err))
+			run.mu.Unlock()
+		}
+		return
+	}
 	if run.claimRecorded || run.processClaim == nil {
 		run.mu.Unlock()
 		return
@@ -890,15 +906,11 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 			return
 		}
 		outcome := collectTurn(s, jobCtx, run, events, items)
-		outcome.cleanup, outcome.diagnostics = cleanupForRun(run, outcome.cleanup, outcome.diagnostics)
 		run.retireTurn(store, outcome)
 		return
 	}
 	if err != nil {
 		cleanup, diagnostics := cleanupAfterContextStop(run, jobCtx.Err())
-		if cleanup == protocol.CleanupClean {
-			cleanup, diagnostics = cleanupForRun(run, cleanup, diagnostics)
-		}
 		diagnostics = appendItemSidecarDiagnostics(diagnostics, itemWriter)
 		outcome := run.retireTurn(store, turnOutcome{err: err, cleanup: cleanup, diagnostics: diagnostics})
 		s.finishTurnError(store, record, jobCtx, outcome.err, outcome.cleanup, outcome.diagnostics, outcome.backendSessionID)
@@ -907,7 +919,6 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 
 	s.startDeadlineWarning(record.JobID, run, session, jobCtx, acquiredAt, timeout, protocol.EffectiveInputMode(spec.InputMode))
 	outcome := collectTurn(s, jobCtx, run, events, items)
-	outcome.cleanup, outcome.diagnostics = cleanupForRun(run, outcome.cleanup, outcome.diagnostics)
 	outcome = run.retireTurn(store, outcome)
 	if run.cancellationRequested() {
 		return
@@ -1112,6 +1123,9 @@ func (s *Server) runCorrectionTurn(store *jobstore.Store, record jobstore.Record
 	if scopeErr != nil {
 		return turnOutcome{err: fmt.Errorf("establish correction process claim scope: %w", scopeErr), cleanup: protocol.CleanupClean}
 	}
+	if err := store.ClearProcessClaim(record.JobID); err != nil {
+		return turnOutcome{err: fmt.Errorf("clear retired process claim before correction: %w", err), cleanup: protocol.CleanupClean}
+	}
 	run.claimScope = scope
 	run.beginTurn()
 	events, err, canceled := run.startTurn(store, session, ctx, engine.TurnInput{
@@ -1127,22 +1141,17 @@ func (s *Server) runCorrectionTurn(store *jobstore.Store, record jobstore.Record
 			return outcome
 		}
 		outcome := collectTurn(s, ctx, run, events, items)
-		outcome.cleanup, outcome.diagnostics = cleanupForRun(run, outcome.cleanup, outcome.diagnostics)
 		outcome = run.retireTurn(store, outcome)
 		return outcome
 	}
 	if err != nil {
 		cleanup, diagnostics := cleanupAfterContextStop(run, ctx.Err())
-		if cleanup == protocol.CleanupClean {
-			cleanup, diagnostics = cleanupForRun(run, cleanup, diagnostics)
-		}
 		outcome := turnOutcome{err: err, cleanup: cleanup, diagnostics: diagnostics}
 		outcome = run.retireTurn(store, outcome)
 		return outcome
 	}
 
 	outcome := collectTurn(s, ctx, run, events, items)
-	outcome.cleanup, outcome.diagnostics = cleanupForRun(run, outcome.cleanup, outcome.diagnostics)
 	outcome = run.retireTurn(store, outcome)
 	return outcome
 }
@@ -1385,16 +1394,6 @@ func cleanupAfterContextStop(run *activeExecution, contextErr error) (protocol.C
 		return protocol.CleanupUncertain, []string{"backend cleanup: " + err.Error()}
 	}
 	return protocol.CleanupClean, nil
-}
-
-func cleanupForRun(run *activeExecution, cleanup protocol.Cleanup, diagnostics []string) (protocol.Cleanup, []string) {
-	_, _, claimErr := run.claimStatus()
-	if claimErr != nil {
-		cleanup = protocol.CleanupUncertain
-		diagnostics = append(diagnostics, "process claim: "+claimErr.Error())
-		return cleanup, diagnostics
-	}
-	return cleanup, diagnostics
 }
 
 func (s *Server) recordExecutionCompletion(store *jobstore.Store, record jobstore.Record, text string, cleanup protocol.Cleanup, diagnostics []string, contract protocol.ContractResult, backendSessionID string) {

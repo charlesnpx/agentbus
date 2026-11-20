@@ -709,6 +709,63 @@ func (store *Store) DiscardSession(id string) (Record, error) {
 	return result, err
 }
 
+// MarkCleanupClean improves only the cleanup evidence for a terminal record
+// whose recorded process claim is the one that was observed absent.
+func (store *Store) MarkCleanupClean(id string, claim ProcessClaim) (Record, error) {
+	if err := validateJobID(id); err != nil {
+		return Record{}, fmt.Errorf("%w: %v", ErrInvalid, err)
+	}
+	var result Record
+	err := store.update(func(tx *bolt.Tx) error {
+		jobs := tx.Bucket(bucketJobs)
+		if jobs == nil {
+			return fmt.Errorf("%w: missing jobs bucket", ErrCorrupt)
+		}
+		current, err := getRecord(jobs, id)
+		if err != nil {
+			return err
+		}
+		if !current.State.IsTerminal() || current.ProcessClaim == nil || *current.ProcessClaim != claim {
+			return fmt.Errorf("%w: terminal process claim changed", ErrInvalid)
+		}
+		if current.Cleanup == protocol.CleanupUncertain {
+			current.Cleanup = protocol.CleanupClean
+			if err := putRecord(jobs, current); err != nil {
+				return err
+			}
+		}
+		result = current
+		return nil
+	})
+	return result, err
+}
+
+// ClearProcessClaim removes a claim that no longer describes all processes
+// requiring cleanup, before another turn or after invalid claim reporting.
+func (store *Store) ClearProcessClaim(id string) error {
+	if err := validateJobID(id); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalid, err)
+	}
+	return store.update(func(tx *bolt.Tx) error {
+		jobs := tx.Bucket(bucketJobs)
+		if jobs == nil {
+			return fmt.Errorf("%w: missing jobs bucket", ErrCorrupt)
+		}
+		current, err := getRecord(jobs, id)
+		if err != nil {
+			return err
+		}
+		if current.State.IsTerminal() {
+			return ErrTerminal
+		}
+		if current.ProcessClaim != nil {
+			current.ProcessClaim = nil
+			return putRecord(jobs, current)
+		}
+		return nil
+	})
+}
+
 // MarkStarting commits the private no-relaunch marker before a caller spawns
 // a backend process. Only queued jobs may make this transition.
 func (store *Store) MarkStarting(id string) (Record, error) {
