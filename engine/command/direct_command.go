@@ -90,8 +90,6 @@ func (r DirectCommandRunner) Start(ctx context.Context, spec ExecSpec) (RunningC
 		stderr:           stderr,
 		cancelGrace:      grace,
 		terminator:       terminator,
-		stdoutPipe:       stdoutReader,
-		stderrPipe:       stderrReader,
 		startContextStop: make(chan struct{}),
 		startContextDone: make(chan struct{}),
 		cleanupDone:      make(chan struct{}),
@@ -109,8 +107,6 @@ type directRunningCommand struct {
 	stderr           *ownedOutputReader
 	cancelGrace      time.Duration
 	terminator       *directTerminator
-	stdoutPipe       *os.File
-	stderrPipe       *os.File
 	startContextStop chan struct{}
 	startContextDone chan struct{}
 	cleanupOnce      sync.Once
@@ -292,21 +288,6 @@ func (r *directRunningCommand) stopStartContext() {
 	<-r.startContextDone
 }
 
-func (r *directRunningCommand) closeOutputPipes() {
-	if r.terminator != nil {
-		if r.terminator.canClosePipes() {
-			r.terminator.closePipes()
-		}
-		return
-	}
-	if r.stdoutPipe != nil {
-		_ = r.stdoutPipe.Close()
-	}
-	if r.stderrPipe != nil {
-		_ = r.stderrPipe.Close()
-	}
-}
-
 func (r *directRunningCommand) watchWaitContext(ctx context.Context) func() {
 	if ctx == nil || ctx.Done() == nil {
 		return func() {}
@@ -360,16 +341,14 @@ func exitObservationForCmd(cmd *exec.Cmd) ExitObservation {
 }
 
 type directTerminator struct {
-	cmd                  *exec.Cmd
-	grace                time.Duration
-	pipes                []*os.File
-	once                 sync.Once
-	pipesOnce            sync.Once
-	processRef           engine.ProcessRef
-	leaderReaped         atomic.Bool
-	terminationStarted   atomic.Bool
-	terminationSucceeded atomic.Bool
-	err                  error
+	cmd          *exec.Cmd
+	grace        time.Duration
+	pipes        []*os.File
+	once         sync.Once
+	pipesOnce    sync.Once
+	processRef   engine.ProcessRef
+	leaderReaped atomic.Bool
+	err          error
 }
 
 func (t *directTerminator) captureProcessRef() {
@@ -399,26 +378,19 @@ func (t *directTerminator) terminate() error {
 	if t == nil {
 		return nil
 	}
-	t.terminationStarted.Store(true)
 	t.once.Do(func() {
 		// cmd.Wait has established that this direct execution is over. Do not
 		// attempt a group signal after its leader has been reaped.
 		if t.leaderReaped.Load() {
-			t.terminationSucceeded.Store(true)
 			t.closePipes()
 			return
 		}
 		t.err = terminateProcessGroup(t.cmd, t.processRef, t.grace)
 		if t.err == nil {
-			t.terminationSucceeded.Store(true)
 			t.closePipes()
 		}
 	})
 	return t.err
-}
-
-func (t *directTerminator) canClosePipes() bool {
-	return !t.terminationStarted.Load() || t.terminationSucceeded.Load()
 }
 
 func (t *directTerminator) closePipes() {

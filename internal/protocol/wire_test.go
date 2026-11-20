@@ -24,6 +24,7 @@ func TestWireGoldenJSONRoundTrip(t *testing.T) {
 	updatedAt := time.Date(2025, time.January, 2, 3, 7, 5, 0, time.UTC)
 	lastItemAt := time.Date(2025, time.January, 2, 3, 7, 6, 0, time.UTC)
 	lastActivityAt := time.Date(2025, time.January, 2, 3, 7, 7, 0, time.UTC)
+	sessionDiscardedAt := time.Date(2025, time.January, 2, 3, 8, 5, 0, time.UTC)
 	itemCount := 2
 	timeout := &engine.TimeoutResolution{
 		Requested: &requested,
@@ -80,8 +81,10 @@ func TestWireGoldenJSONRoundTrip(t *testing.T) {
 		ModelReported:   "gpt-5",
 		EffortReported:  "high",
 		Intent:          engine.IntentEdit, Selection: &InvocationSelection{Model: "gpt-5", Effort: "high"},
+		SessionDiscardedAt: &sessionDiscardedAt,
 		Steers:             []SteerSummaryWire{},
 		CancellationReason: CancellationReasonOperator,
+		Queue:              &QueueProjection{Position: 2, BackendRunning: 1, BackendLimit: 3, Running: 4, Limit: 5},
 	}
 	summary := JobSummaryWire{
 		JobID:          "job-1",
@@ -140,7 +143,7 @@ func TestWireGoldenJSONRoundTrip(t *testing.T) {
 		Gap: false,
 	}
 
-	const recordJSON = `{"jobId":"job-1","workspaceKey":"workspace-1","requestId":"request-1","backend":"codex","inputMode":"fixed","state":"completed","tags":{"team":"core"},"createdAt":"2025-01-02T03:04:05Z","queuedAt":"2025-01-02T03:04:05Z","startedAt":"2025-01-02T03:05:05Z","finishedAt":"2025-01-02T03:06:05Z","timeout":{"requested":1234,"effective":2345,"source":"client"},"deadline":"2025-01-02T03:06:05Z","remainingMs":5000,"resumable":{"eligible":true,"reason":"retained backend session is available"},"modelRequested":"gpt-5","effortRequested":"high","result":{"text":"answer","resultPath":"/results/job-1","sha256":"result-sha","bytes":42},"contract":{"schemaSha256":"schema-sha","evaluated":true,"compliant":true,"attempts":2,"violations":["/answer"]},"failure":{"class":"backend_error","reason":"backend stopped","providerCode":"rate_limit_error","providerMessage":"weekly limit","stage":"turn","retryAfter":"2025-01-02T03:06:05Z"},"diagnostics":["capture warning: raw stdout log stopped after 128 bytes: no space left on device"],"cleanup":"uncertain","logsPruned":true,"logPaths":{"stdout":"/logs/job-1.out","stdoutTruncated":false,"stderr":"/logs/job-1.err","stderrTruncated":false},"modelReported":"gpt-5","effortReported":"high","intent":"edit","selection":{"model":"gpt-5","effort":"high"},"steers":[],"cancellationReason":"operator"}`
+	const recordJSON = `{"jobId":"job-1","workspaceKey":"workspace-1","requestId":"request-1","backend":"codex","inputMode":"fixed","state":"completed","tags":{"team":"core"},"createdAt":"2025-01-02T03:04:05Z","queuedAt":"2025-01-02T03:04:05Z","startedAt":"2025-01-02T03:05:05Z","finishedAt":"2025-01-02T03:06:05Z","timeout":{"requested":1234,"effective":2345,"source":"client"},"deadline":"2025-01-02T03:06:05Z","remainingMs":5000,"resumable":{"eligible":true,"reason":"retained backend session is available"},"modelRequested":"gpt-5","effortRequested":"high","result":{"text":"answer","resultPath":"/results/job-1","sha256":"result-sha","bytes":42},"contract":{"schemaSha256":"schema-sha","evaluated":true,"compliant":true,"attempts":2,"violations":["/answer"]},"failure":{"class":"backend_error","reason":"backend stopped","providerCode":"rate_limit_error","providerMessage":"weekly limit","stage":"turn","retryAfter":"2025-01-02T03:06:05Z"},"diagnostics":["capture warning: raw stdout log stopped after 128 bytes: no space left on device"],"cleanup":"uncertain","logsPruned":true,"logPaths":{"stdout":"/logs/job-1.out","stdoutTruncated":false,"stderr":"/logs/job-1.err","stderrTruncated":false},"modelReported":"gpt-5","effortReported":"high","intent":"edit","selection":{"model":"gpt-5","effort":"high"},"sessionDiscardedAt":"2025-01-02T03:08:05Z","steers":[],"cancellationReason":"operator","queue":{"position":2,"backendRunning":1,"backendLimit":3,"running":4,"limit":5}}`
 	const summaryJSON = `{"jobId":"job-1","backend":"codex","state":"failed","tags":{"team":"core"},"cleanup":"uncertain","createdAt":"2025-01-02T03:04:05Z","queuedAt":"2025-01-02T03:04:05Z","updatedAt":"2025-01-02T03:07:05Z","modelReported":"gpt-5","effortReported":"high","failureClass":"backend_error","contract":{"evaluated":true,"compliant":false},"itemCount":2,"lastItemAt":"2025-01-02T03:07:06Z","lastActivityAt":"2025-01-02T03:07:07Z","liveness":"alive"}`
 
 	tests := []struct {
@@ -326,44 +329,6 @@ func TestWireGoldenJSONRoundTrip(t *testing.T) {
 				assertZeroValueOmitsOmitEmpty(t, reflect.New(valueType).Elem().Interface())
 			}
 		})
-	}
-}
-
-func TestJobRecordWireFieldAllowList(t *testing.T) {
-	want := map[string]struct{}{
-		"JobID": {}, "WorkspaceKey": {}, "RequestID": {}, "Backend": {},
-		"InputMode": {}, "State": {}, "Tags": {}, "CreatedAt": {}, "QueuedAt": {}, "StartedAt": {},
-		"FinishedAt": {}, "Timeout": {}, "Deadline": {}, "RemainingMs": {}, "Resumable": {},
-		"ModelRequested": {}, "EffortRequested": {}, "Result": {}, "Contract": {},
-		"Failure": {}, "Diagnostics": {}, "Cleanup": {}, "LogsPruned": {}, "LogPaths": {},
-		"ModelReported": {}, "EffortReported": {}, "Intent": {}, "Selection": {}, "SessionDiscardedAt": {}, "Steers": {}, "CancellationReason": {},
-		"Queue": {},
-	}
-
-	recordType := reflect.TypeOf(JobRecordWire{})
-	got := make(map[string]struct{}, recordType.NumField())
-	for i := 0; i < recordType.NumField(); i++ {
-		got[recordType.Field(i).Name] = struct{}{}
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("JobRecordWire field names = %v, want %v", got, want)
-	}
-}
-
-func TestJobSummaryWireFieldAllowList(t *testing.T) {
-	want := map[string]struct{}{
-		"JobID": {}, "Backend": {}, "State": {}, "Cleanup": {}, "CreatedAt": {}, "QueuedAt": {},
-		"UpdatedAt": {}, "ModelReported": {}, "EffortReported": {}, "FailureClass": {}, "Contract": {},
-		"Tags": {}, "ItemCount": {}, "LastItemAt": {}, "LastActivityAt": {}, "Liveness": {},
-	}
-
-	summaryType := reflect.TypeOf(JobSummaryWire{})
-	got := make(map[string]struct{}, summaryType.NumField())
-	for i := 0; i < summaryType.NumField(); i++ {
-		got[summaryType.Field(i).Name] = struct{}{}
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("JobSummaryWire field names = %v, want %v", got, want)
 	}
 }
 

@@ -360,7 +360,7 @@ func runClientHelloResult(t *testing.T, result string) (HelloResult, error) {
 		})
 	}()
 
-	hello, err := clientHello(context.Background(), clientConn, bufio.NewReader(clientConn), "token")
+	hello, err := clientHelloWithRelease(context.Background(), clientConn, bufio.NewReader(clientConn), "token", "")
 	if err := <-errCh; err != nil {
 		t.Fatal(err)
 	}

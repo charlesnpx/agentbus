@@ -183,7 +183,7 @@ func TestBackendRequiresDriver(t *testing.T) {
 	}
 }
 
-func TestSessionTurnTimeoutKillsDescendantHoldingStdout(t *testing.T) {
+func TestSessionTurnTimeoutCompletesBoundedlyWithTimeoutEvents(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("process group signal assertions are unix-only")
 	}
