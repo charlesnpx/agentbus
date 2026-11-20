@@ -42,7 +42,7 @@ The codex adapter maps:
 | `item/completed` with command, file-change, MCP, or dynamic-tool items | `ToolUse` | the matching item id clears its pending lifecycle and produces one transcript item; a completed frame without an observed start is still recorded |
 | turn end with a pending command, file-change, MCP, or dynamic-tool item | `ToolUse` | pending items flush once before the completion outcome or any other turn return, including failed, empty-status, interrupted, and cancellation paths; a file-change flush remains a text-free `ObservedWorkspaceWriteItem` |
 | `warning`, `error`, `config/warning`, or `guardian/warning` notification text | `Warning` | backend warning surfaces |
-| `turn/completed` with status `completed` or empty status | `ResultMessage` | result text is the last completed agent message, a turn-level last-agent message, or the last agent delta |
+| `turn/completed` with status `completed` or empty status | `ResultMessage` | an explicit turn-level final text wins; otherwise the latest observed assistant item supplies its completion snapshot or accumulated deltas |
 | `turn/completed` with status `failed`, unexpected interruption, or unsupported status | terminal error | the shared duplex runtime emits the driver error as a terminal error |
 
 ## Cursor ACP event mapping
@@ -74,3 +74,9 @@ stderr capture consistent with the command runner contract. Report provider
 model and effort only from actual applicable telemetry. Transcript observations
 are evidence of supported captured events, not proof that all provider actions
 were reported.
+
+Embedded command consumers must read stdout and stderr concurrently while the
+process runs; pipe backpressure can block a child until both streams are read.
+Embedded session consumers must drain the event channel through closure, including
+after cancellation. Raw log paths are single-owner and must not be shared by
+concurrent sessions.

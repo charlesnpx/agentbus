@@ -1303,3 +1303,64 @@ func TestExecutionResumeFollowsManagedHomeLineage(t *testing.T) {
 		t.Fatalf("second resumed terminal = %+v, want a distinct record with its own artifacts", secondTerminal)
 	}
 }
+
+func TestExecutionPersistsExplicitEmptyResultAfterAssistantText(t *testing.T) {
+	backend := &executionFakeBackend{name: "empty-result"}
+	backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) {
+		return &executionFakeSession{turn: func(_ context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
+			input.OnProcessStart(engine.ProcessRef{PID: 4212, PGID: 4212, StartTime: "empty-token"}, 0)
+			return executionEvents(engine.Event{Type: engine.EventAgentText, Text: "earlier status"}, engine.Event{Type: engine.EventResultMessage, Text: ""}), nil
+		}}, nil
+	}
+	server := newExecutionServer(t, backend)
+	record := queuedExecutionRecord(t, server, backend.Name(), "empty result", nil)
+	runExecution(t, server, record)
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := os.ReadFile(got.Artifacts.Result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(nil)
+	if got.State != protocol.PublicStateCompleted || len(artifact) != 0 || got.ResultBytes != 0 || got.ResultSHA256 != hex.EncodeToString(sum[:]) {
+		t.Fatalf("empty result record = %#v, artifact length = %d", got, len(artifact))
+	}
+}
+
+func TestDeadlineDuringRetirementPreservesAcceptedResult(t *testing.T) {
+	backend := &executionFakeBackend{name: "accepted-before-deadline"}
+	backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) {
+		return &executionFakeSession{turn: func(ctx context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
+			input.OnProcessStart(engine.ProcessRef{PID: 4214, PGID: 4214, StartTime: "completed-token"}, 0)
+			events := make(chan engine.Event, 2)
+			events <- engine.Event{Type: engine.EventResultMessage, Text: "accepted result"}
+			go func() {
+				<-ctx.Done()
+				events <- engine.Event{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{}}
+				close(events)
+			}()
+			return events, nil
+		}, interrupt: func(context.Context) error { return nil }}, nil
+	}
+	server := newExecutionServer(t, backend)
+	timeout := int64(100)
+	record := queuedExecutionRecord(t, server, backend.Name(), "deadline after completion", &timeout)
+	runExecution(t, server, record)
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != protocol.PublicStateCompleted || got.ResultText != "accepted result" {
+		t.Fatalf("deadline changed accepted result: %#v", got)
+	}
+}

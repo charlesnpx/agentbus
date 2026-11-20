@@ -17,6 +17,7 @@ import (
 
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/adapter/internal/cliadapter"
+	"github.com/charlesnpx/agentbus/engine/adapter/internal/duplex"
 	"github.com/charlesnpx/agentbus/engine/command"
 )
 
@@ -101,22 +102,25 @@ func TestAppServerThreadSettingsUpdateReportsEffectiveSelection(t *testing.T) {
 		thread := peer.expectRequest("thread/start")
 		peer.respond(thread, threadResult("thread-1"))
 		turn := peer.expectRequest("turn/start")
-		peer.respond(turn, turnResult("turn-1"))
+		turnResponse := turnResult("turn-1")
+		turnResponse["model"] = "unverified-turn-model"
+		turnResponse["reasoningEffort"] = "unverified-turn-effort"
+		peer.respond(turn, turnResponse)
 		peer.notify("thread/started", map[string]any{"threadId": "thread-1", "reasoningEffort": "medium"})
-		peer.notify("thread/settings/updated", map[string]any{
-			"threadId": "thread-1",
-			"threadSettings": map[string]any{
-				"model":  "gpt-6-luna",
-				"effort": "max",
-				"collaborationMode": map[string]any{
-					"mode": "default",
-					"settings": map[string]any{
-						"model":            "gpt-6-luna",
-						"reasoning_effort": "max",
-					},
-				},
-			},
-		})
+		fixture, err := os.ReadFile("testdata/thread-settings-updated-0.170.0.json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var notification map[string]any
+		if err := json.Unmarshal(fixture, &notification); err != nil {
+			t.Fatal(err)
+		}
+		params := notification["params"].(map[string]any)
+		// The same schema from a different thread is not this invocation's
+		// telemetry. The matching update below is the only accepted one.
+		peer.write(notification)
+		params["threadId"] = "thread-1"
+		peer.write(notification)
 		peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
 	})
 
@@ -132,11 +136,8 @@ func TestAppServerThreadSettingsUpdateReportsEffectiveSelection(t *testing.T) {
 			observations = append(observations, event)
 		}
 	}
-	if len(observations) != 2 {
-		t.Fatalf("model observations = %#v, want thread start and later settings update", observations)
-	}
-	if observations[0].EffortReported != "medium" {
-		t.Fatalf("first effort observation = %q, want medium from thread start", observations[0].EffortReported)
+	if len(observations) != 1 {
+		t.Fatalf("model observations = %#v, want only the actual threadSettings update", observations)
 	}
 	last := observations[len(observations)-1]
 	if last.ModelReported != "gpt-6-luna" || last.EffortReported != "max" {
@@ -398,8 +399,8 @@ func TestAppServerSteerProviderErrorsAndCancellation(t *testing.T) {
 			assertParam(t, interrupt, "turnId", "turn-1")
 			close(interruptWritten)
 			<-finishInterrupt
-			peer.respond(interrupt, map[string]any{"turnId": "turn-1"})
-			peer.notify("turn/completed", completedParams("thread-1", "turn-1", "interrupted", ""))
+			// Cancellation may already have closed the local output reader.
+			_ = json.NewEncoder(proc.stdoutW).Encode(map[string]any{"id": interrupt["id"], "result": map[string]any{"turnId": "turn-1"}})
 		})
 
 		session := startFakeCodexSession(t, engine.SessionOpts{})
@@ -542,7 +543,7 @@ func TestAppServerOversizedTerminalFrameFailsWithTransportClass(t *testing.T) {
 		}
 		// A later valid completion must not race ahead of the discarded terminal
 		// frame and turn this transport failure into a false success.
-		peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
+		_ = json.NewEncoder(proc.stdoutW).Encode(map[string]any{"method": "turn/completed", "params": completedParams("thread-1", "turn-1", "completed", "")})
 	})
 
 	session := startFakeCodexSession(t, engine.SessionOpts{})
@@ -601,14 +602,18 @@ func TestAppServerSkipsOversizedFileChangeFrame(t *testing.T) {
 	if resultText(got) != "" {
 		t.Fatalf("result text = %q, want empty completed turn", resultText(got))
 	}
-	foundDrops := false
-	for _, event := range got {
+	warningIndex, resultIndex, dropWarnings := -1, -1, 0
+	for index, event := range got {
 		if drops, ok := engine.TransportFrameDropsFromMetadata(event.Metadata); ok && drops.Count == 1 && drops.Bytes > 512 && drops.RedactedPrefix == "method=item/completed" {
-			foundDrops = true
+			warningIndex = index
+			dropWarnings++
+		}
+		if event.Type == engine.EventResultMessage {
+			resultIndex = index
 		}
 	}
-	if !foundDrops {
-		t.Fatalf("events = %#v, want persisted dropped-frame warning", got)
+	if dropWarnings != 1 || warningIndex < 0 || resultIndex <= warningIndex {
+		t.Fatalf("events = %#v, want one dropped-frame warning before the result", got)
 	}
 }
 
@@ -641,8 +646,9 @@ func TestAppServerOversizedDuplicateDiscriminatorFailsClosed(t *testing.T) {
 				if _, err := io.WriteString(proc.stdoutW, test.payload); err != nil {
 					t.Fatal(err)
 				}
-				// A later completion makes a skip observable as a false success.
-				peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
+				// The fatal frame closes the reader promptly; if still writable, a
+				// later completion must not turn the failure into success.
+				_ = json.NewEncoder(proc.stdoutW).Encode(map[string]any{"method": "turn/completed", "params": completedParams("thread-1", "turn-1", "completed", "")})
 			})
 
 			session := startFakeCodexSession(t, engine.SessionOpts{})
@@ -1963,4 +1969,48 @@ exit 1
 		t.Fatal(err)
 	}
 	return fake
+}
+
+func TestLatestAssistantItemUsesFirstObservationOrder(t *testing.T) {
+	frame := func(method string, params map[string]any) duplex.Frame {
+		return duplex.Frame{Object: map[string]any{"method": method, "params": params}}
+	}
+	item := func(id, text string) map[string]any {
+		return map[string]any{"item": map[string]any{"id": id, "type": "agentMessage", "text": text}}
+	}
+	observer := &turnObserver{}
+	observer.handle(frame("item/started", item("a", "")))
+	observer.handle(frame("item/agentMessage/delta", map[string]any{"itemId": "a", "delta": "old"}))
+	observer.handle(frame("item/started", item("b", "")))
+	observer.handle(frame("item/agentMessage/delta", map[string]any{"itemId": "b", "delta": "  later\n"}))
+	observer.handle(frame("item/completed", item("a", "old completed late")))
+	if got := observer.resultText(); got != "  later\n" {
+		t.Fatalf("late completion superseded later item: %q", got)
+	}
+	observer.handle(frame("item/completed", item("b", "  exact snapshot\n")))
+	if got := observer.resultText(); got != "  exact snapshot\n" {
+		t.Fatalf("completion snapshot did not win: %q", got)
+	}
+	observer.complete(map[string]any{"last_agent_message": "  terminal\n"})
+	if got := observer.resultText(); got != "  terminal\n" {
+		t.Fatalf("terminal text lost exact bytes: %q", got)
+	}
+}
+
+func TestCodexThreadSelectionDoesNotCarryOverriddenEffort(t *testing.T) {
+	fixture, err := os.ReadFile("testdata/thread-start-response-0.170.0.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response map[string]any
+	if err := json.Unmarshal(fixture, &response); err != nil {
+		t.Fatal(err)
+	}
+	var events []engine.Event
+	emitCodexThreadSelection(response["result"], engine.SessionOpts{Effort: "high"}, func(event engine.Event) {
+		events = append(events, event)
+	})
+	if len(events) != 1 || events[0].ModelReported != "reported-model" || events[0].EffortReported != "" {
+		t.Fatalf("reported selection = %#v", events)
+	}
 }

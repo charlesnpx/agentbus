@@ -603,7 +603,12 @@ func projectLogPaths(record jobstore.Record) *protocol.LogPathsWire {
 	}
 	stdoutExists := fileExists(paths.Stdout)
 	stderrExists := fileExists(paths.Stderr)
-	if !stdoutExists && !stderrExists {
+	stdoutFailed, stderrFailed := false, false
+	for _, diagnostic := range record.Diagnostics {
+		stdoutFailed = stdoutFailed || strings.HasPrefix(diagnostic, "capture warning: raw stdout log stopped after ")
+		stderrFailed = stderrFailed || strings.HasPrefix(diagnostic, "capture warning: raw stderr log stopped after ")
+	}
+	if !stdoutExists && !stderrExists && (!stdoutFailed && !stderrFailed || record.LogsPruned) {
 		return nil
 	}
 	wire := &protocol.LogPathsWire{}
@@ -614,6 +619,14 @@ func projectLogPaths(record jobstore.Record) *protocol.LogPathsWire {
 	if stderrExists {
 		wire.Stderr = paths.Stderr
 		wire.StderrTruncated = logEndsWithTruncationMarker(paths.Stderr)
+	}
+	// Capture failures mean the log is incomplete or its durability is unknown,
+	// including when a correction later appended to the same file.
+	if stdoutFailed {
+		wire.StdoutTruncated = &stdoutFailed
+	}
+	if stderrFailed {
+		wire.StderrTruncated = &stderrFailed
 	}
 	return wire
 }
@@ -639,7 +652,7 @@ func logEndsWithTruncationMarker(path string) *bool {
 	}
 	marker := engine.TruncationMarker()
 	truncated := false
-	if info.Size() < int64(len(marker)) {
+	if info.Size() != engine.DefaultCappedLogCapBytes {
 		return &truncated
 	}
 	if _, err := file.Seek(-int64(len(marker)), io.SeekEnd); err != nil {

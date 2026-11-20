@@ -61,6 +61,7 @@ func (d *appServerDriver) ExecSpec(_ string, opts engine.SessionOpts, _ engine.T
 
 func (d *appServerDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resumeID string, opts engine.SessionOpts, input engine.TurnInput, emit duplex.EmitFunc) (string, error) {
 	rpc := d.newRPC(conn, emit)
+	rpc.threadID = resumeID
 	// Session.Turn exposes the logical turn before this provider handshake.
 	// Register now so an early steer waits for the app-server's turn ID.
 	active := newActiveAppServerTurn(resumeID)
@@ -88,10 +89,11 @@ func (d *appServerDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resume
 	if id := extractThreadID(threadResult); id != "" {
 		threadID = id
 	}
-	emitCodexSelection(threadResult, rpc.emit)
 	if threadID == "" {
 		return "", errors.New("codex app-server thread response missing thread id")
 	}
+	rpc.threadID = threadID
+	emitCodexThreadSelection(threadResult, opts, rpc.emit)
 
 	observer := &turnObserver{emit: emit}
 	// A turn can stop after item/started without ever delivering its matching
@@ -103,7 +105,6 @@ func (d *appServerDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resume
 	if err != nil {
 		return threadID, err
 	}
-	emitCodexSelection(turnResult, rpc.emit)
 	turnID := extractTurnID(turnResult)
 	if turnID == "" {
 		return threadID, errors.New("codex app-server turn/start response missing turn id")
@@ -467,6 +468,7 @@ type appServerRPC struct {
 	conn           *duplex.Conn
 	emit           duplex.EmitFunc
 	requestTimeout time.Duration
+	threadID       string
 }
 
 func (c *appServerRPC) handshake(ctx context.Context) error {
@@ -547,6 +549,9 @@ func (c *appServerRPC) nextFrame(ctx context.Context) (duplex.Frame, error) {
 			if frame.Err != nil {
 				var overlong *duplex.OverlongFrameError
 				if errors.As(frame.Err, &overlong) && codexOverlongFrameCanBeSkipped(overlong) {
+					if c.emit != nil {
+						c.emit(duplex.OrderedFrameDrop(overlong))
+					}
 					continue
 				}
 				return duplex.Frame{}, codexTransportReadError(frame.Err)
@@ -745,8 +750,13 @@ func (c *appServerRPC) handleNotification(frame duplex.Frame) {
 		return
 	}
 	method := firstString(frame.Object, "method")
-	if isCodexSelectionNotification(method) {
-		emitCodexSelection(paramsMap(frame.Object), c.emit)
+	if method == "thread/settings/updated" {
+		params := paramsMap(frame.Object)
+		if c.threadID != "" && firstString(params, "threadId") == c.threadID {
+			if settings, ok := firstMap(params, "threadSettings"); ok {
+				emitCodexSelection(firstString(settings, "model"), firstString(settings, "effort"), c.emit)
+			}
+		}
 	}
 	if method != "warning" && method != "error" && method != "config/warning" && method != "guardian/warning" {
 		return
@@ -756,74 +766,46 @@ func (c *appServerRPC) handleNotification(frame duplex.Frame) {
 	}
 }
 
-func isCodexSelectionNotification(method string) bool {
-	switch method {
-	case "thread/started", "thread/updated", "thread/model/changed", "thread/settings/changed", "thread/settings/updated",
-		"turn/started", "model/changed", "settings/updated", "config/settings/updated":
-		return true
-	default:
-		return false
-	}
-}
-
-func emitCodexSelection(value any, emit duplex.EmitFunc) {
+func emitCodexThreadSelection(value any, opts engine.SessionOpts, emit duplex.EmitFunc) {
 	if emit == nil {
 		return
 	}
-	model, effort := codexSelectionValues(value)
-	if model == "" && effort == "" {
+	object, ok := value.(map[string]any)
+	if !ok {
 		return
 	}
-	emit(engine.Event{Type: engine.EventModelReported, ModelReported: model, EffortReported: effort})
+	// The thread/start and resume responses report these fields. A turn-level
+	// effort override has not yet been observed when this response arrives.
+	model := firstString(object, "model")
+	effort := firstString(object, "reasoningEffort")
+	if opts.Effort != "" {
+		effort = ""
+	}
+	emitCodexSelection(model, effort, emit)
 }
 
-func codexSelectionValues(value any) (string, string) {
-	var model, effort string
-	var visit func(any, int)
-	visit = func(current any, depth int) {
-		if depth > 5 || model != "" && effort != "" {
-			return
-		}
-		object, ok := current.(map[string]any)
-		if !ok {
-			return
-		}
-		if model == "" {
-			model = firstString(object, "model", "modelId", "model_id", "currentModel", "current_model", "modelName", "model_name")
-			if model == "" {
-				if detail, ok := firstMap(object, "model"); ok {
-					model = firstString(detail, "id", "modelId", "model_id", "name")
-				}
-			}
-		}
-		if effort == "" {
-			effort = firstString(object, "effort", "reasoningEffort", "reasoning_effort", "effortLevel", "reasoningLevel", "reasoning_level")
-			if effort == "" {
-				if detail, ok := firstMap(object, "reasoning"); ok {
-					effort = firstString(detail, "effort", "level")
-				}
-			}
-		}
-		for _, key := range []string{"thread", "turn", "settings", "config", "modelSettings", "model_settings", "threadSettings", "reasoning"} {
-			if nested, ok := firstMap(object, key); ok {
-				visit(nested, depth+1)
-			}
-		}
+func emitCodexSelection(model, effort string, emit duplex.EmitFunc) {
+	if model != "" || effort != "" {
+		emit(engine.Event{Type: engine.EventModelReported, ModelReported: model, EffortReported: effort})
 	}
-	visit(value, 0)
-	return strings.TrimSpace(model), strings.TrimSpace(effort)
 }
 
 type turnObserver struct {
 	emit               duplex.EmitFunc
-	lastCompletedAgent string
-	agentDeltaSeen     map[string]bool
-	agentDeltaText     map[string]*strings.Builder
-	lastDeltaAgentItem string
+	agentItems         map[string]*agentItem
+	latestAgentItem    string
+	terminalText       *string
 	pendingToolItems   map[string]pendingToolItem
 	pendingToolItemIDs []string
 	emittedToolItemIDs map[string]struct{}
 	completion         *turnCompletion
+}
+
+type agentItem struct {
+	delta         strings.Builder
+	deltaSeen     bool
+	completedText string
+	completed     bool
 }
 
 type pendingToolItem struct {
@@ -845,7 +827,7 @@ func (o *turnObserver) handle(frame duplex.Frame) bool {
 	payload := paramsMap(frame.Object)
 	switch method {
 	case "item/agentMessage/delta":
-		if text := firstString(payload, "delta", "text"); text != "" {
+		if text := textFrom(payload); text != "" {
 			o.appendAgentDelta(payload, text)
 			o.emitEvent(engine.Event{Type: engine.EventAgentText, Text: text, Metadata: frame.Object})
 		}
@@ -866,10 +848,11 @@ func (o *turnObserver) handleItem(method string, payload map[string]any, metadat
 	kind := normalizeKind(firstString(item, "type"))
 	switch kind {
 	case "agentmessage", "assistantmessage", "message":
+		entry := o.observeAgentItem(agentDeltaItemIDOrDefault(payload))
 		if method == "item/completed" {
-			if text := textFrom(item); text != "" {
-				o.lastCompletedAgent = text
-				if !o.hasAgentDelta(payload) {
+			if text, present := agentMessageText(item); present {
+				entry.completed, entry.completedText = true, text
+				if !entry.deltaSeen && text != "" {
 					o.emitEvent(engine.Event{Type: engine.EventAgentText, Text: text, Metadata: metadata})
 				}
 			}
@@ -967,12 +950,22 @@ func (o *turnObserver) emitToolItem(item map[string]any, metadata map[string]any
 func (o *turnObserver) complete(payload map[string]any) {
 	turn, _ := firstMap(payload, "turn")
 	if turn != nil {
-		if text := lastAgentMessageFromTurn(turn); text != "" {
-			o.lastCompletedAgent = text
+		for _, raw := range anySlice(turn["items"]) {
+			item, ok := raw.(map[string]any)
+			if !ok || normalizeKind(firstString(item, "type")) != "agentmessage" {
+				continue
+			}
+			entry := o.observeAgentItem(agentDeltaItemIDOrDefault(map[string]any{"item": item}))
+			if text, present := agentMessageText(item); present {
+				entry.completed, entry.completedText = true, text
+			}
 		}
 	}
-	if text := firstString(payload, "last_agent_message", "lastAgentMessage"); text != "" {
-		o.lastCompletedAgent = text
+	for _, key := range []string{"last_agent_message", "lastAgentMessage"} {
+		if text, ok := payload[key].(string); ok {
+			o.terminalText = &text
+			break
+		}
 	}
 	status := firstString(payload, "status")
 	if status == "" && turn != nil {
@@ -1024,39 +1017,50 @@ func (o *turnObserver) emitEvent(ev engine.Event) {
 
 const defaultAgentDeltaItemID = "\x00agent-delta-default"
 
-func (o *turnObserver) hasAgentDelta(payload map[string]any) bool {
-	return o.agentDeltaSeen[agentDeltaItemIDOrDefault(payload)]
+func (o *turnObserver) observeAgentItem(itemID string) *agentItem {
+	if o.agentItems == nil {
+		o.agentItems = make(map[string]*agentItem)
+	}
+	item := o.agentItems[itemID]
+	if item == nil {
+		item = &agentItem{}
+		o.agentItems[itemID] = item
+		o.latestAgentItem = itemID
+	}
+	return item
 }
 
 func (o *turnObserver) appendAgentDelta(payload map[string]any, text string) {
-	itemID := agentDeltaItemIDOrDefault(payload)
-	if o.agentDeltaSeen == nil {
-		o.agentDeltaSeen = make(map[string]bool)
-	}
-	o.agentDeltaSeen[itemID] = true
-	if o.agentDeltaText == nil {
-		o.agentDeltaText = make(map[string]*strings.Builder)
-	}
-	builder := o.agentDeltaText[itemID]
-	if builder == nil {
-		builder = &strings.Builder{}
-		o.agentDeltaText[itemID] = builder
-	}
-	builder.WriteString(text)
-	o.lastDeltaAgentItem = itemID
+	item := o.observeAgentItem(agentDeltaItemIDOrDefault(payload))
+	item.deltaSeen = true
+	item.delta.WriteString(text)
 }
 
 func (o *turnObserver) resultText() string {
-	if o.lastCompletedAgent != "" {
-		return o.lastCompletedAgent
+	if o.terminalText != nil {
+		return *o.terminalText
 	}
-	if o.lastDeltaAgentItem == "" {
-		return ""
-	}
-	if builder := o.agentDeltaText[o.lastDeltaAgentItem]; builder != nil {
-		return builder.String()
+	if item := o.agentItems[o.latestAgentItem]; item != nil {
+		if item.completed {
+			return item.completedText
+		}
+		return item.delta.String()
 	}
 	return ""
+}
+
+func agentMessageText(item map[string]any) (string, bool) {
+	for _, key := range []string{"message", "text", "content", "result", "output"} {
+		if value, ok := item[key]; ok {
+			if text, ok := value.(string); ok {
+				return text, true
+			}
+			if text := stringValue(value); text != "" {
+				return text, true
+			}
+		}
+	}
+	return "", false
 }
 
 func finishTurnCompletion(threadID string, active *activeAppServerTurn, observer *turnObserver) (string, error) {
@@ -1344,20 +1348,6 @@ func extractTurnID(result any) string {
 		return firstString(turn, "id", "turnId", "turn_id")
 	}
 	return ""
-}
-
-func lastAgentMessageFromTurn(turn map[string]any) string {
-	var last string
-	for _, raw := range anySlice(turn["items"]) {
-		item, ok := raw.(map[string]any)
-		if !ok || normalizeKind(firstString(item, "type")) != "agentmessage" {
-			continue
-		}
-		if text := textFrom(item); text != "" {
-			last = text
-		}
-	}
-	return last
 }
 
 func toolName(item map[string]any) string {

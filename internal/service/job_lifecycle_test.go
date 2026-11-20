@@ -675,7 +675,17 @@ func TestProjectLogPathsReportsTruncation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(paths.Stdout, []byte("backend stream"+engine.TruncationMarker()), 0o600); err != nil {
+	log, err := engine.NewCappedLogWriter(paths.Stdout, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk := make([]byte, 1<<20)
+	for i := 0; i < 65; i++ {
+		if _, err := log.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := log.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(paths.Stderr, []byte("backend stream completed\n"), 0o600); err != nil {
@@ -707,6 +717,38 @@ func TestProjectLogPathsReportsTruncation(t *testing.T) {
 	wire = projectLogPaths(record)
 	if wire == nil || wire.StdoutTruncated != nil {
 		t.Fatalf("unreadable stdout projection = %#v, want nil truncation state", wire)
+	}
+}
+
+func TestProjectLogPathsReportsCaptureFailures(t *testing.T) {
+	logs := t.TempDir()
+	record := jobstore.Record{
+		JobID: "job_capture_failure",
+		Artifacts: jobstore.ArtifactPaths{
+			Log: filepath.Join(logs, "job_capture_failure.log"),
+		},
+		Diagnostics: []string{
+			"capture warning: raw stdout log stopped after 3 bytes: no space left on device",
+			"capture warning: raw stderr log stopped after 0 bytes: open failed",
+		},
+	}
+	paths, err := engine.LogPathsForLayout(engine.WorkspaceLayout{Logs: logs}, record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.Stdout, []byte("partial then correction"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	wire := projectLogPaths(record)
+	if wire == nil || wire.Stdout != paths.Stdout || wire.Stderr != "" || wire.StdoutTruncated == nil || !*wire.StdoutTruncated || wire.StderrTruncated == nil || !*wire.StderrTruncated {
+		t.Fatalf("capture failure projection = %#v", wire)
+	}
+	if err := os.Remove(paths.Stdout); err != nil {
+		t.Fatal(err)
+	}
+	record.LogsPruned = true
+	if wire := projectLogPaths(record); wire != nil {
+		t.Fatalf("pruned logs projection = %#v, want nil", wire)
 	}
 }
 

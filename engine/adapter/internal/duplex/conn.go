@@ -161,8 +161,8 @@ func (c *Conn) WriteJSON(v any) error {
 	return err
 }
 
-// WriteStdin writes raw bytes to process stdin. Calls are serialized with
-// WriteJSON and CloseStdin so mixed protocol writes cannot interleave.
+// WriteStdin writes raw bytes to process stdin. Writes are serialized with
+// WriteJSON; CloseStdin can interrupt a blocked write.
 func (c *Conn) WriteStdin(p []byte) (int, error) {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
@@ -172,8 +172,7 @@ func (c *Conn) WriteStdin(p []byte) (int, error) {
 // CloseStdin half-closes the process stdin. It is safe to call more than once.
 func (c *Conn) CloseStdin() error {
 	c.closeOnce.Do(func() {
-		c.writeMu.Lock()
-		defer c.writeMu.Unlock()
+		// Closing the descriptor must unblock a writer holding writeMu.
 		c.closeErr = c.stdin.Close()
 	})
 	return c.closeErr
@@ -261,7 +260,7 @@ func readJSONL(src io.ReadCloser, log io.Writer, frames chan<- Frame, decodeErrs
 		}
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
-				decodeErrs <- err
+				decodeErrs <- fmt.Errorf("incomplete backend transport: stdout read: %w", err)
 			}
 			return
 		}
@@ -292,25 +291,30 @@ func configuredJSONLineBytes() int {
 }
 
 type frameDropTracker struct {
-	mu    sync.Mutex
-	drops engine.TransportFrameDrops
+	mu       sync.Mutex
+	drops    engine.TransportFrameDrops
+	reported engine.TransportFrameDrops
 }
 
 func (tracker *frameDropTracker) record(frame *OverlongFrameError) {
 	if tracker == nil || frame == nil {
 		return
 	}
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	tracker.drops.Merge(summarizeFrameDrop(frame))
+}
+
+func summarizeFrameDrop(frame *OverlongFrameError) engine.TransportFrameDrops {
 	summary := "unclassified"
 	if !frame.DuplicateDiscriminator {
 		summary = redactedFramePrefix(frame.Prefix)
 	}
-	tracker.mu.Lock()
-	defer tracker.mu.Unlock()
-	tracker.drops.Merge(engine.TransportFrameDrops{
+	return engine.TransportFrameDrops{
 		Count:          1,
 		Bytes:          frame.Bytes,
 		RedactedPrefix: summary,
-	})
+	}
 }
 
 func (tracker *frameDropTracker) snapshot() engine.TransportFrameDrops {
@@ -319,7 +323,26 @@ func (tracker *frameDropTracker) snapshot() engine.TransportFrameDrops {
 	}
 	tracker.mu.Lock()
 	defer tracker.mu.Unlock()
-	return tracker.drops
+	pending := tracker.drops
+	if tracker.reported.Count >= pending.Count {
+		return engine.TransportFrameDrops{}
+	}
+	pending.Count -= tracker.reported.Count
+	if tracker.reported.Bytes >= pending.Bytes {
+		pending.Bytes = 0
+	} else {
+		pending.Bytes -= tracker.reported.Bytes
+	}
+	return pending
+}
+
+func (tracker *frameDropTracker) markReported(drops engine.TransportFrameDrops) {
+	if tracker == nil {
+		return
+	}
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	tracker.reported.Merge(drops)
 }
 
 func redactedFramePrefix(prefix []byte) string {

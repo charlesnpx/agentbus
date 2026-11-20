@@ -613,8 +613,8 @@ func (info ResultInfoWire) MarshalJSON() ([]byte, error) {
 	}{resultInfo: resultInfo(info), Text: text})
 }
 
-// LogPathsWire identifies captured backend log files and whether each captured
-// file ended at the capped-log truncation marker.
+// LogPathsWire identifies captured backend log files and whether capture was
+// truncated or could not be retained completely.
 type LogPathsWire struct {
 	Stdout          string `json:"stdout,omitempty"`
 	StdoutTruncated *bool  `json:"stdoutTruncated,omitempty"`

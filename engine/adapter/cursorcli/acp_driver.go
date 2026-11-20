@@ -36,7 +36,6 @@ type activeACPTurn struct {
 	interruptRequested bool
 	jobCancelled       bool
 	finished           bool
-	steerRequested     bool
 	pendingSteer       *acpSteerRequest
 }
 
@@ -229,12 +228,6 @@ func (t *activeACPTurn) finish() {
 	}
 }
 
-func (t *activeACPTurn) hasSteerRequest() bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.steerRequested
-}
-
 func newACPDriver(binary string) *acpDriver {
 	return &acpDriver{
 		binary:         binary,
@@ -313,13 +306,9 @@ func (d *acpDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resumeID str
 			if jobCancelled {
 				// Preserve the existing empty result for an explicit job cancel;
 				// never expose the cancelled segment's partial text as a result.
-				if active.hasSteerRequest() {
-					observer.emitEvent(duplex.ResultSegmentBoundary())
-				}
 				observer.emitEvent(engine.Event{Type: engine.EventResultMessage})
 				return info.sessionID, nil
 			}
-			observer.emitEvent(duplex.ResultSegmentBoundary())
 			observer = &acpTurnObserver{emit: emit}
 			result, err = active.prompt(ctx, rpc, continuation.text, observer, continuation)
 		default:
@@ -369,7 +358,6 @@ func (d *acpDriver) Steer(ctx context.Context, conn *duplex.Conn, msg engine.Ste
 		return engine.SteerDelivery{}, err
 	}
 	active.interruptRequested = true
-	active.steerRequested = true
 	active.mu.Unlock()
 
 	select {
