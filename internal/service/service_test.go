@@ -426,19 +426,29 @@ func TestStaleBinaryDrainsActiveJobThenStopsAfterAcceptSettles(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	listener := &drainTestListener{closed: make(chan struct{})}
-	acceptSettled := make(chan struct{})
+	lifecycle := &serveLifecycle{
+		listener: listener, cancel: cancel,
+		acceptSettled: make(chan struct{}), serveDone: make(chan struct{}),
+		shutdownDone: make(chan struct{}), connections: make(map[net.Conn]struct{}),
+		pruneCancel: func() {},
+	}
+	if err := server.registerLifecycle(lifecycle); err != nil {
+		t.Fatal(err)
+	}
 	idleDone := make(chan struct{})
 	go func() {
 		_, _ = listener.Accept()
-		close(acceptSettled)
+		lifecycle.settleAccept()
 	}()
 	go func() {
-		server.idleLoop(ctx, cancel, listener, socketFileIdentity{}, acceptSettled)
+		server.idleLoop(ctx)
 		close(idleDone)
 	}()
 	t.Cleanup(func() {
 		cancel()
 		_ = listener.Close()
+		lifecycle.settleAccept()
+		server.clearLifecycle(lifecycle)
 		select {
 		case <-idleDone:
 		case <-time.After(time.Second):
@@ -483,9 +493,22 @@ func TestStaleBinaryDrainsActiveJobThenStopsAfterAcceptSettles(t *testing.T) {
 		t.Fatal("stale daemon did not close its listener after the job ended")
 	}
 	select {
+	case <-lifecycle.acceptSettled:
+	case <-time.After(idleCheckInterval / 2):
+		t.Fatal("stale daemon did not wait for its accept loop to settle")
+	}
+	select {
 	case <-ctx.Done():
 	case <-time.After(idleCheckInterval / 2):
-		t.Fatal("stale daemon waited for another idle-check interval after its accept loop settled")
+		t.Fatal("stale daemon did not finish shutdown after its accept loop settled")
+	}
+	select {
+	case <-lifecycle.shutdownDone:
+		if lifecycle.shutdownErr != nil {
+			t.Fatalf("stale daemon shutdown error = %v", lifecycle.shutdownErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stale daemon shutdown did not complete")
 	}
 	select {
 	case <-idleDone:
@@ -812,6 +835,41 @@ func TestJobSubmitRejectsTimeoutAboveMaximum(t *testing.T) {
 	}
 }
 
+func TestTimeoutResolutionDefaultUnlimitedAndBounds(t *testing.T) {
+	zero, positive := int64(0), int64(1234)
+	maximum, over, negative := protocol.MaxTimeout.Milliseconds(), protocol.MaxTimeout.Milliseconds()+1, int64(-1)
+	for _, test := range []struct {
+		name      string
+		requested *int64
+		effective int64
+		source    string
+		invalid   bool
+	}{
+		{name: "omitted", effective: protocol.DefaultTimeout.Milliseconds(), source: engine.TimeoutSourceDaemonDefault},
+		{name: "unlimited", requested: &zero, source: engine.TimeoutSourceClient},
+		{name: "positive", requested: &positive, effective: positive, source: engine.TimeoutSourceClient},
+		{name: "maximum", requested: &maximum, effective: maximum, source: engine.TimeoutSourceClient},
+		{name: "above maximum", requested: &over, invalid: true},
+		{name: "negative", requested: &negative, invalid: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, problem := timeoutFromMillis(test.requested)
+			if test.invalid {
+				if problem == nil || got != nil {
+					t.Fatalf("invalid timeout = %#v, %#v", got, problem)
+				}
+				return
+			}
+			if problem != nil || got == nil || got.Effective != test.effective || got.Source != test.source || (got.Requested == nil) != (test.requested == nil) {
+				t.Fatalf("timeout = %#v, %#v", got, problem)
+			}
+			if test.requested != nil && *got.Requested != *test.requested {
+				t.Fatalf("requested = %d, want %d", *got.Requested, *test.requested)
+			}
+		})
+	}
+}
+
 func TestJobSubmitRejectsUnknownTaskSpecField(t *testing.T) {
 	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "codex"}}})
 	raw := json.RawMessage(fmt.Sprintf(`{"workspaceKey":"workspace-unknown-field","requestId":"request-unknown-field","taskSpec":{"backend":"codex","cwd":%q,"intent":"inspect","prompt":"task","unexpected":true}}`, t.TempDir()))
@@ -939,7 +997,7 @@ func TestJobSubmitCompletedTargetRemainsRejected(t *testing.T) {
 	params := submissionParams("resume-completed-target", "resume", "codex", t.TempDir(), "continue")
 	params.TaskSpec.ResumeJobID = source.JobID
 	outcome := submitForTest(t, server, params)
-	const wantReason = "completed jobs are not resumable unless submitted with session retention; submit a new job"
+	const wantReason = "cleanup_uncertain"
 	if outcome.err == nil || outcome.err.Data.Code != protocol.ErrorInvalidTaskSpec || outcome.err.Data.JobID != source.JobID || !strings.Contains(outcome.err.Message, wantReason) {
 		t.Fatalf("resume completed target = %#v, want typed invalid-task error for %q", outcome.err, source.JobID)
 	}

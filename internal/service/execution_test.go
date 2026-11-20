@@ -224,7 +224,7 @@ func TestExecutionWarnsSteerableJobAtDeadlineThreshold(t *testing.T) {
 	if warning.ID != deadlineWarningMessageID {
 		t.Fatalf("warning ID = %q, want %q", warning.ID, deadlineWarningMessageID)
 	}
-	const wantPrefix = "agentbus: about 10% of this task's time limit remains (deadline "
+	const wantPrefix = "agentbus: "
 	if !strings.HasPrefix(warning.Text, wantPrefix) {
 		t.Fatalf("warning text = %q, want prefix %q", warning.Text, wantPrefix)
 	}
@@ -251,51 +251,31 @@ func TestExecutionWarnsSteerableJobAtDeadlineThreshold(t *testing.T) {
 	}
 }
 
-func TestExecutionDoesNotWarnFixedModeJob(t *testing.T) {
+func TestExecutionWarnsFixedModeAfterLateInitialization(t *testing.T) {
 	oldWait := waitForDeadlineWarning
-	var timerCalls atomic.Int64
-	waitForDeadlineWarning = func(context.Context, time.Duration) bool {
-		timerCalls.Add(1)
-		return false
-	}
+	armed := make(chan time.Duration, 1)
+	waitForDeadlineWarning = func(_ context.Context, delay time.Duration) bool { armed <- delay; return true }
 	t.Cleanup(func() { waitForDeadlineWarning = oldWait })
-
-	session := &deadlineWarningTestSession{
-		events: executionEvents(engine.Event{Type: engine.EventResultMessage, Text: "done"}),
-		steers: make(chan engine.SteerMessage, 1),
+	session := &testSteerSession{entered: make(chan engine.SteerMessage, 1), delivery: engine.SteerDelivery{Mechanism: engine.SteerMechanismNative, Confirmed: true}}
+	server, store, run, jobID := newRunningSteerTestJob(t, protocol.InputModeFixed, session, true)
+	server.startDeadlineWarning(jobID, run, session, context.Background(), time.Now().Add(-9500*time.Millisecond), 10*time.Second, protocol.InputModeFixed)
+	select {
+	case delay := <-armed:
+		if delay != 0 {
+			t.Fatalf("late warning delay = %s", delay)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("warning not armed")
 	}
-	backend := &executionFakeBackend{name: "warning-fixed-fake"}
-	backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) { return session, nil }
-	server := newExecutionServer(t, backend)
-	timeoutMS := int64(10_000)
-	record := queuedExecutionRecordWithInputMode(t, server, backend.Name(), "finish", &timeoutMS, protocol.InputModeFixed, nil)
-	run := newActiveExecution(record.JobID, backend)
-	run.slotAcquiredAt = time.Now().UTC()
-	server.executionMu.Lock()
-	if server.executions == nil {
-		server.executions = make(map[string]*activeExecution)
+	select {
+	case message := <-session.entered:
+		if message.ID != deadlineWarningMessageID {
+			t.Fatalf("warning = %#v", message)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fixed job did not receive deadline notice")
 	}
-	server.executions[record.JobID] = run
-	server.executionMu.Unlock()
-	server.runJob(context.Background(), record, run)
-
-	if got := timerCalls.Load(); got != 0 {
-		t.Fatalf("deadline warning timer calls = %d, want 0", got)
-	}
-	if got := session.calls.Load(); got != 0 {
-		t.Fatalf("session steer calls = %d, want 0", got)
-	}
-	store, err := server.ensureJobStore()
-	if err != nil {
-		t.Fatal(err)
-	}
-	stored, err := store.Get(record.JobID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(stored.Steers) != 0 {
-		t.Fatalf("fixed job steer records = %#v, want none", stored.Steers)
-	}
+	run.retireTurn(store, turnOutcome{cleanup: protocol.CleanupClean})
 }
 
 func claimedResultSession(result string) *executionFakeSession {

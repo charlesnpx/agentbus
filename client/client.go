@@ -1003,6 +1003,13 @@ func (c *Client) ArtifactsPrune(ctx context.Context, params ArtifactsPruneParams
 	return out, err
 }
 
+// SessionDiscard revokes continuation for an inactive owned Codex lineage.
+func (c *Client) SessionDiscard(ctx context.Context, params SessionDiscardParams) (SessionDiscardResult, error) {
+	var out SessionDiscardResult
+	err := c.do(ctx, protocol.MethodSessionDiscard, params, &out)
+	return out, err
+}
+
 func mustMarshal(v any) json.RawMessage {
 	b, err := json.Marshal(v)
 	if err != nil {

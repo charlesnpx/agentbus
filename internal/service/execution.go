@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"log"
 	"math"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -79,6 +78,7 @@ type activeExecution struct {
 	steerWorkerStarted     bool
 	deadlineWarningCancel  context.CancelFunc
 	deadlineWarningDone    chan struct{}
+	cancelFinalized        chan struct{}
 	captureDrains          []<-chan struct{}
 }
 
@@ -691,6 +691,7 @@ func (s *Server) startQueuedJobLocked(queued queuedJob) {
 		s.dispatchQueuedLocked()
 		s.executionMu.Unlock()
 		s.activeJobs.Add(-1)
+		s.notifyQuietChange()
 	}()
 }
 
@@ -699,7 +700,15 @@ func (s *Server) startQueuedJobLocked(queued queuedJob) {
 // a provider process. The process-claim callback runs only after the retained
 // adapter has forked and execed into its own process group.
 func (s *Server) runJob(parent context.Context, record jobstore.Record, run *activeExecution) {
-	defer s.closeManagedCodexHome(record.JobID)
+	defer func() {
+		run.mu.Lock()
+		cancelFinalized := run.cancelFinalized
+		run.mu.Unlock()
+		if cancelFinalized != nil {
+			<-cancelFinalized
+		}
+		s.closeManagedCodexHome(record.JobID)
+	}()
 	if parent == nil {
 		parent = context.Background()
 	}
@@ -787,7 +796,7 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 	selection := protocol.InvocationSelection{Model: selectedModel, Effort: selectedEffort}
 	opts := engine.SessionOpts{CWD: record.CWD, Model: selectedModel, Effort: selectedEffort, Timeout: timeout}
 	if record.Backend == "codex" {
-		layout := engine.WorkspaceLayout{Root: s.stateRoot, Namespace: filepath.Join(s.stateRoot, "sessions"), Codex: filepath.Join(s.stateRoot, "sessions", "codex")}
+		layout := codexLayout(s.stateRoot)
 		if resumeTarget != nil {
 			codexHome, err := s.resumeCodexHome(store, *resumeTarget)
 			if err != nil {
@@ -979,15 +988,12 @@ func (s *Server) resumeCodexHome(store *jobstore.Store, source jobstore.Record) 
 	if threadSource.JobID == "" || filepath.Base(threadSource.JobID) != threadSource.JobID || threadSource.CWD == "" {
 		return "", errors.New("resume target has no valid managed Codex home identity")
 	}
-	path := filepath.Join(s.stateRoot, "sessions", "codex", threadSource.JobID)
-	info, err := os.Lstat(path)
+	home, err := openExistingManagedCodexHome(codexLayout(s.stateRoot), threadSource.JobID)
 	if err != nil {
 		return "", fmt.Errorf("inspect source Codex home: %w", err)
 	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-		return "", errors.New("source Codex home is not a directory")
-	}
-	return path, nil
+	defer home.close()
+	return home.path, nil
 }
 
 // resumeThreadSource follows persisted resumeJobId links to the job that
@@ -1543,14 +1549,21 @@ func (s *Server) markTerminal(store *jobstore.Store, jobID string, terminal jobs
 		} else {
 			cleanupRecord = current
 			cleanupRecord.State = terminal.State
+			if terminal.BackendSessionID != "" {
+				cleanupRecord.BackendSessionID = terminal.BackendSessionID
+			}
 		}
 	}
 	_, err := store.MarkTerminal(jobID, terminal)
 	if err == nil {
 		if home != nil {
 			cleanup, diagnostics := finalizeManagedCodexHome(home, cleanupRecord, terminal.Cleanup, terminal.Diagnostics)
-			if cleanup != terminal.Cleanup && len(diagnostics) > len(terminal.Diagnostics) {
-				log.Printf("agentbus service: job %s managed Codex home cleanup after terminal write: %s", jobID, diagnostics[len(diagnostics)-1])
+			_ = cleanup
+			if len(diagnostics) > len(terminal.Diagnostics) {
+				diagnostic := boundProviderValue(diagnostics[len(diagnostics)-1], 512)
+				if _, appendErr := store.AppendDiagnostic(jobID, diagnostic); appendErr != nil {
+					log.Printf("agentbus service: job %s managed Codex home cleanup: %s", jobID, diagnostic)
+				}
 			}
 		}
 		return

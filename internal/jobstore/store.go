@@ -665,11 +665,40 @@ func (store *Store) MarkLogsPruned(id string) (Record, error) {
 		if err != nil {
 			return err
 		}
-		if !current.State.IsTerminal() || current.Cleanup != protocol.CleanupClean {
-			return fmt.Errorf("%w: only clean terminal jobs can have logs marked pruned", ErrInvalid)
+		if !current.State.IsTerminal() {
+			return fmt.Errorf("%w: only terminal jobs can have logs marked pruned", ErrInvalid)
 		}
 		if !current.LogsPruned {
 			current.LogsPruned = true
+			if err := putRecord(jobs, current); err != nil {
+				return err
+			}
+		}
+		result = current
+		return nil
+	})
+	return result, err
+}
+
+// DiscardSession durably revokes continuation at the lineage root. It does
+// not change the job's outcome, timestamps, or observed provider identity.
+func (store *Store) DiscardSession(id string) (Record, error) {
+	if err := validateJobID(id); err != nil {
+		return Record{}, fmt.Errorf("%w: %v", ErrInvalid, err)
+	}
+	var result Record
+	err := store.update(func(tx *bolt.Tx) error {
+		jobs := tx.Bucket(bucketJobs)
+		if jobs == nil {
+			return fmt.Errorf("%w: missing jobs bucket", ErrCorrupt)
+		}
+		current, err := getRecord(jobs, id)
+		if err != nil {
+			return err
+		}
+		if current.SessionDiscardedAt == nil {
+			now := time.Now().UTC()
+			current.SessionDiscardedAt = &now
 			if err := putRecord(jobs, current); err != nil {
 				return err
 			}
@@ -916,15 +945,14 @@ func (store *Store) AppendDiagnostic(id, diagnostic string) (Record, error) {
 		if err != nil {
 			return err
 		}
-		if current.State.IsTerminal() {
-			return ErrTerminal
-		}
 		next := current
 		next.Diagnostics = append(append([]string(nil), current.Diagnostics...), diagnostic)
 		if len(next.Diagnostics) > diagnosticEntryMaxCount {
 			next.Diagnostics = append([]string(nil), next.Diagnostics[len(next.Diagnostics)-diagnosticEntryMaxCount:]...)
 		}
-		next.UpdatedAt = time.Now().UTC()
+		if !current.State.IsTerminal() {
+			next.UpdatedAt = time.Now().UTC()
+		}
 		normalizeRecord(&next)
 		if err := validateRecord(next); err != nil {
 			return err
@@ -1266,8 +1294,8 @@ func validateRecord(record Record) error {
 	if !record.Cleanup.Valid() {
 		return fmt.Errorf("%w: invalid cleanup %q", ErrInvalid, record.Cleanup)
 	}
-	if record.LogsPruned && (!record.State.IsTerminal() || record.Cleanup != protocol.CleanupClean) {
-		return fmt.Errorf("%w: pruned logs require a clean terminal job", ErrInvalid)
+	if record.LogsPruned && !record.State.IsTerminal() {
+		return fmt.Errorf("%w: pruned logs require a terminal job", ErrInvalid)
 	}
 	if record.CreatedAt.IsZero() || record.UpdatedAt.IsZero() {
 		return fmt.Errorf("%w: createdAt and updatedAt are required", ErrInvalid)

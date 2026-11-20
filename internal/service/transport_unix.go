@@ -57,10 +57,22 @@ func (c *connection) serve() {
 			})
 			continue
 		}
-		outcome := c.server.handle(c, request)
+		admitted := false
+		var outcome requestOutcome
+		if request.Method != protocol.MethodHello && c.hello {
+			admitted = c.server.beginRequest()
+		}
+		if request.Method != protocol.MethodHello && c.hello && !admitted {
+			outcome.err = protocol.NewError(protocol.ErrorDaemonDraining, "daemon is draining", protocol.ErrorData{})
+		} else {
+			outcome = c.server.handle(c, request)
+		}
 		if len(request.ID) != 0 {
 			response := protocol.Response{JSONRPC: "2.0", ID: request.ID, Result: outcome.result, Error: outcome.err}
 			_ = c.writeResponse(response)
+		}
+		if admitted {
+			c.server.endRequest()
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -89,10 +101,14 @@ func (c *connection) writeOversizedRequestResponse(response protocol.Response) e
 }
 
 func requiresRequestID(method string) bool {
-	return method == protocol.MethodHello || method == protocol.MethodBackendInspect || method == protocol.MethodArtifactsPrune
+	return method == protocol.MethodHello || method == protocol.MethodBackendInspect || method == protocol.MethodArtifactsPrune || method == protocol.MethodSessionDiscard
 }
 
 func (c *connection) writeResponse(response protocol.Response) error {
+	if err := c.conn.SetWriteDeadline(time.Now().Add(oversizedWriteTimeout)); err != nil {
+		return err
+	}
+	defer c.conn.SetWriteDeadline(time.Time{})
 	return writeFrame(c.conn, response)
 }
 
@@ -138,6 +154,8 @@ func (s *Server) handle(connection *connection, request protocol.Request) reques
 		return s.handleBackendInspect(request.Params)
 	case protocol.MethodArtifactsPrune:
 		return s.handleArtifactsPrune(request.Params)
+	case protocol.MethodSessionDiscard:
+		return s.handleSessionDiscard(request.Params)
 	case protocol.MethodJobSteer:
 		return s.handleJobSteer(request.Params)
 	default:
