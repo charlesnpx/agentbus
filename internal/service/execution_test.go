@@ -1284,7 +1284,7 @@ func TestExecutionResumeFollowsManagedHomeLineage(t *testing.T) {
 		t.Fatalf("first resumed terminal = %+v, want failed with its new recorded session", firstTerminal)
 	}
 	if _, err := os.Stat(filepath.Join(server.stateRoot, "sessions", "codex", firstResumed.JobID)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("read-only first resumed home stat = %v, want no new managed thread home", err)
+		t.Fatalf("inspect first resumed home stat = %v, want no new managed thread home", err)
 	}
 
 	secondResumed := newResumed("second-resume-workspace", "second-resume-request", firstResumed.JobID)

@@ -109,11 +109,15 @@ func TestSessionTurnSurfacesNonzeroExitAsTerminalError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	events, err := session.Turn(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "go"})
+	// Exceed the pipe capacity so the child must close stdin before the write completes.
+	events, err := session.Turn(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: strings.Repeat("go", 1<<19)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	got := collectEvents(events)
+	if len(got) == 0 || got[len(got)-1].Type != engine.EventTurnFinal || got[len(got)-1].TurnFinal == nil || !got[len(got)-1].TurnFinal.ReturnCodeKnown || got[len(got)-1].TurnFinal.ReturnCode != 7 {
+		t.Fatalf("events = %#v, want final observation with exit status 7", got)
+	}
 	got = withoutTurnFinal(got)
 	if len(got) == 0 || got[len(got)-1].Type != engine.EventTerminalError || !strings.Contains(got[len(got)-1].Text, "backend exploded") {
 		t.Fatalf("events = %#v, want terminal nonzero-exit error", got)

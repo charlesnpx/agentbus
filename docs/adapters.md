@@ -5,6 +5,9 @@ The `engine` package defines `Backend`, `Session`, `SessionOpts`, and
 The built-in common turn boundary prepends the corresponding instruction once
 on a copy of the prompt. Resume and schema correction use the same boundary;
 correction uses inspect intent, the same session, selection, and deadline.
+Inspect is an instruction, not an enforced permission boundary: both intents
+use the same host policy and can access ordinary caches, temporary files, and
+local services. Host and provider restrictions may still apply.
 
 A session's environment overlays inherited daemon values in this order:
 adapter values, then `SessionOpts.EnvOverlay`. The overlay is copied when the

@@ -6,6 +6,9 @@ there is no migration or import of old jobs, bindings, results, or sessions.
 The default root is `$XDG_STATE_HOME/agentbus/v2`, or
 `~/.local/state/agentbus/v2` when XDG_STATE_HOME is unset. An explicit
 `AGENTBUS_STATE_ROOT` selects the exact root.
+The new default root is nested under the previous default `agentbus` root.
+Follow the [fresh deployment guide](deployment-0.18.md) before archiving or
+removing older state; deleting the parent after v2 is created deletes v2 too.
 
 The root contains the owner-only token, socket, `jobs.db`, diagnostic logs,
 results under `artifacts`, and Codex homes under `sessions/codex/<root-job-id>`.
@@ -71,11 +74,12 @@ steerable jobs with a finite effective timeout and backend steering support may
 receive one best-effort warning at 90%, measured from slot acquisition. The warning uses the reserved message ID
 `agentbus-deadline-warning` and is visible in the job's steer records.
 
-There is no standalone setup command or backend probe. Admission checks only
-that the requested backend name is registered in the daemon's backend map. A
-registered backend that cannot run fails when the daemon starts its session,
-with the applicable failure class. A hello response describes configured
-backends; it does not establish that a backend can start a session.
+There is no standalone setup command. Admission checks only that the requested
+backend name is registered in the daemon's backend map; it does not probe the
+executable. `agentbus backends` explicitly inspects executable paths and
+versions. A registered backend that cannot run fails when the daemon starts its
+session, with the applicable failure class. A hello response describes
+configured backends; it does not establish that a backend can start a session.
 
 Submitting work is a typed job.submit request. The CLI intentionally has no
 submit subcommand. Use a compatible client to prepare compound identity and
@@ -175,8 +179,9 @@ receipts. Codes 8, 9, and 12 are not assigned.
 The daemon opens an existing database through a fault-isolated preflight before
 binding its socket. A corrupt, truncated, incompatible, or busy database stops
 startup rather than being repaired in place. Preserve the root for diagnosis;
-do not create a replacement database at the same path unless you have first
-performed the required version-break cleanup above.
+use a fresh root rather than creating a replacement database alongside owned
+data. Follow the [deployment guide](deployment-0.18.md) for any separately
+authorized archival or removal of earlier state.
 
 Autostart errors distinguish a busy bbolt store, an incompatible or corrupt
 store, a process that exited before readiness, and a readiness timeout. The
@@ -187,13 +192,11 @@ If the daemon process cannot be started, the error uses code
 
 ## Footprint and residual risks
 
-The code footprint is measured from the checked-out tree at release review and
-is not a stable operational property. Agentbus has 17 Go packages.
-
 If the daemon dies mid-run, a provider process can remain orphaned. Recovery
 marks recovered running work unknown and never relaunches it; the reaper signals
-a recorded process group only when its live start token exactly matches the
-recorded token. This is the deliberate trade-off for preventing duplicate work.
+a recorded process group only when its boot, root and applicable PID-namespace
+scope and exact live process identity match. This is the deliberate trade-off
+for preventing duplicate work.
 
 Result artifacts and conversation homes remain until deliberately removed;
 diagnostic pruning does not reclaim provider or tool caches.

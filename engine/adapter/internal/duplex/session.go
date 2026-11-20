@@ -797,6 +797,19 @@ func emitCompletionEvents(disposition turnDisposition, events chan<- engine.Even
 		events <- warning("backend turn timed out")
 		return
 	}
+	// A failed process can close stdin before its write finishes. In that case
+	// report the exit and stderr instead of the resulting broken-pipe error.
+	failedExit := (observation.Exit.Exited && observation.Exit.Code != 0) || observation.Exit.Signal != ""
+	if isBrokenStdinPipe(driverErr) && failedExit {
+		driverErr = nil
+		if observation.ExecutionErr == nil {
+			if observation.Exit.Signal != "" {
+				observation.ExecutionErr = fmt.Errorf("backend exited on signal %s", observation.Exit.Signal)
+			} else {
+				observation.ExecutionErr = fmt.Errorf("backend exited with status %d", observation.Exit.Code)
+			}
+		}
+	}
 	if driverErr != nil {
 		events <- terminalError(driverErr)
 	}

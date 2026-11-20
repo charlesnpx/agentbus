@@ -614,8 +614,8 @@ func TestJobSubmitReplaySurvivesDeletedWorkspace(t *testing.T) {
 func TestJobSubmitOmittedSessionRetentionPreservesReplayHash(t *testing.T) {
 	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "codex"}}})
 	workspaceKey, requestID, cwd := "workspace-omitted-retention", "request-omitted-retention", t.TempDir()
-	legacy := json.RawMessage(fmt.Sprintf(`{"workspaceKey":%q,"requestId":%q,"taskSpec":{"backend":"codex","cwd":%q,"prompt":"same task","intent":"inspect"}}`, workspaceKey, requestID, cwd))
-	first := submitResultForTest(t, server.handleJobSubmit(legacy))
+	omitted := json.RawMessage(fmt.Sprintf(`{"workspaceKey":%q,"requestId":%q,"taskSpec":{"backend":"codex","cwd":%q,"prompt":"same task","intent":"inspect"}}`, workspaceKey, requestID, cwd))
+	first := submitResultForTest(t, server.handleJobSubmit(omitted))
 
 	replay := submitResultForTest(t, submitForTest(t, server, submissionParams(workspaceKey, requestID, "codex", cwd, "same task")))
 	if !replay.Deduplicated || replay.JobID != first.JobID {

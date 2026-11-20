@@ -13,10 +13,10 @@ Agentbus version; changes to the client API require coordinated consumer updates
 `convo-relay` embeds `github.com/charlesnpx/agentbus/engine` and its adapters;
 changes to those packages or their APIs can break its build.
 
-Version 0.18.0 serves protocol version 4 and uses store format 2. The published contract is
-[docs/protocol.md](docs/protocol.md). Operator details, including the required
-state-root break for this release, are in
-[docs/operations.md](docs/operations.md).
+Version 0.18.0 serves protocol version 4 and uses store format 2. The published
+contract is [docs/protocol.md](docs/protocol.md). See
+[docs/deployment-0.18.md](docs/deployment-0.18.md) for fresh deployment and
+[docs/operations.md](docs/operations.md) for ongoing operation.
 
 ## CLI
 
@@ -78,8 +78,9 @@ Repeatable filters such as `--tag` and `--state` keep accepting multiple values.
 Successful status and transcript reads exit zero for every stored job state;
 result and cancellation commands use the outcome codes in the operations guide.
 
-Job submission uses the typed job.submit protocol method. There is no CLI submit
-command.
+Delegate submits tasks and reviews through the typed `job.submit` method;
+Agentbus provides status, result, cancel, and steer commands. There is no
+Agentbus CLI submit command.
 
 The daemon runs at most 12 jobs at once and 12 per backend by default, and keeps
 up to 64 additional jobs waiting. These are starting values, not measured
@@ -120,6 +121,8 @@ new prompt's response.
 Set `AGENTBUS_STATE_ROOT` to select daemon state. Otherwise Agentbus uses
 `$XDG_STATE_HOME/agentbus/v2` or `~/.local/state/agentbus/v2`. Format 2 starts
 with fresh state and does not import older databases.
+The new default root is nested under the old default root; see the deployment
+guide before archiving or removing any earlier state.
 Set `AGENTBUS_NO_AUTOSTART=1` to prevent client commands from starting a daemon;
 empty or `0` enables normal autostart, and other values are invalid. An explicit
 `agentbus serve` still works.
@@ -153,12 +156,13 @@ must provide separate mutable workspaces when concurrent edits could conflict.
 
 `agentbus backends` calls the read-only `backend.inspect` method. It reports
 each configured backend's resolved executable path, version, and configured
-default model/effort. JSON entries use `backend`, `executablePath`, `version`,
-`defaultModel`, `defaultEffort`, and `error` when applicable. Each version
-probe is one bounded `--version` call per
-executable path and modification time for the daemon's lifetime; a failed
-backend is reported in its own entry. It does not query accounts, billing, or
-model catalogues. Use `--json` for the protocol response shape.
+default model/effort. The JSON response also reports the connected daemon's
+release, executable path, and protocol version. Entries use `backend`,
+`executablePath`, `version`, `defaultModel`, `defaultEffort`, and `error` when
+applicable. Each version probe is one bounded `--version` call per executable
+path and modification time for the daemon's lifetime; a failed backend is
+reported in its own entry. It does not query accounts, billing, or model
+catalogues. Use `--json` for the protocol response shape.
 
 The daemon accepts intentional per-backend defaults through
 `AGENTBUS_CODEX_DEFAULT_MODEL`, `AGENTBUS_CODEX_DEFAULT_EFFORT`,

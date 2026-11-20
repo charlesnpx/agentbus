@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/command"
@@ -108,6 +109,22 @@ type Conn struct {
 	closeErr  error
 }
 
+// brokenStdinPipeError identifies write failures caused by a closed stdin pipe.
+type brokenStdinPipeError struct{ error }
+
+func (e *brokenStdinPipeError) Unwrap() error { return e.error }
+
+// Follow a single error chain so a joined, independent error is not discarded.
+func isBrokenStdinPipe(err error) bool {
+	for err != nil {
+		if _, ok := err.(*brokenStdinPipeError); ok {
+			return true
+		}
+		err = errors.Unwrap(err)
+	}
+	return false
+}
+
 func newConn(stdin io.WriteCloser, stdout io.ReadCloser, stdoutLog io.Writer, capture *captureWarningTracker, running command.RunningCommand, retirement *retirement) *Conn {
 	frames := make(chan Frame, 16)
 	decodeErrs := make(chan error, 1)
@@ -155,9 +172,7 @@ func (c *Conn) WriteJSON(v any) error {
 		return err
 	}
 	payload = append(payload, '\n')
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	_, err = c.stdin.Write(payload)
+	_, err = c.WriteStdin(payload)
 	return err
 }
 
@@ -166,7 +181,11 @@ func (c *Conn) WriteJSON(v any) error {
 func (c *Conn) WriteStdin(p []byte) (int, error) {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	return c.stdin.Write(p)
+	n, err := c.stdin.Write(p)
+	if errors.Is(err, syscall.EPIPE) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, os.ErrClosed) {
+		return n, &brokenStdinPipeError{err}
+	}
+	return n, err
 }
 
 // CloseStdin half-closes the process stdin. It is safe to call more than once.

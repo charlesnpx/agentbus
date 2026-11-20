@@ -167,7 +167,11 @@ execution slot, not when the job is submitted.
 ~~~
 
 `backend`, absolute `cwd`, nonempty `prompt`, and `intent` are required.
-Intent is `inspect` or `edit`. Optional fields are `inputMode` (`fixed` or
+Intent is `inspect` or `edit`. Both use the same host execution policy;
+`inspect` instructs the provider not to edit project source or configuration,
+but is not a filesystem, network, credential, or tool-permission boundary.
+Ordinary build/test artifacts, caches, temporary files, and local services are
+allowed. Optional fields are `inputMode` (`fixed` or
 `steerable`), `resumeJobId`, `retainSession`, `model`, `effort`, `timeoutMs`,
 `outputSchema`, and string-valued `tags`. Explicit null and unknown fields are
 invalid. Model and effort must be nonempty valid UTF-8 without control
@@ -393,9 +397,8 @@ matching items, subject to limit. A missing sidecar returns a valid empty
 transcript with itemCount zero, seven zero counts, no timestamps, and items:
 []; gap is true when capture or reading could not establish continuity, so the
 returned prefix may be incomplete rather than a claim that the job emitted no
-more activity. A sidecar captured before completion receipts existed has no
-receipt and is therefore reported as a gapped prefix, because its completeness
-cannot be established.
+more activity. A sidecar without a completion receipt is reported as a gapped
+prefix because its completeness cannot be established.
 
 When Agentbus has deliberately removed a job's log sidecars, the result also
 includes `pruned: true` and an empty transcript. This distinguishes retention
@@ -531,8 +534,8 @@ modelRequested and effortRequested preserve only values in the submitted
 TaskSpec, so they may be absent when a configured daemon default was applied.
 `requested is not executed`: these fields record intent, while modelReported
 and effortReported record the latest values observed in provider telemetry.
-modelReported retains its name for compatibility and now means latest
-observation; observed values are never filled from requested values.
+`modelReported` is the latest applicable observation; observed values are never
+filled from requested values.
 
 result exists only for a completed job with an authoritative result. Its
 resultPath, sha256, and bytes are required; text may be omitted when the result
