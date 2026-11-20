@@ -331,8 +331,8 @@ func TestListenRefusesConcurrentStaleSocketReplacement(t *testing.T) {
 		t.Fatalf("loser listen error = %v, want ErrDaemonAlreadyListening", loserListen.err)
 	}
 	var typed DaemonAlreadyListeningError
-	if !errors.As(loserListen.err, &typed) || typed.SocketPath != socketPath {
-		t.Fatalf("loser listen error = %#v, want typed socket path %q", loserListen.err, socketPath)
+	if !errors.As(loserListen.err, &typed) || typed.SocketPath != loser.socketPath {
+		t.Fatalf("loser listen error = %#v, want typed socket path %q", loserListen.err, loser.socketPath)
 	}
 	connection, err := net.DialTimeout("unix", socketPath, time.Second)
 	if err != nil {
