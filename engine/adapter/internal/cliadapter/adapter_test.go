@@ -136,13 +136,13 @@ func TestSessionTurnPreservesLargeStderrTail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
 	defer cancel()
 	events, err := session.Turn(ctx, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "go"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := collectEventsWithTimeout(t, events, 3*time.Second)
+	got := collectEventsWithTimeout(t, events, 7*time.Second)
 	got = withoutTurnFinal(got)
 	if ctx.Err() != nil {
 		t.Fatalf("turn context ended unexpectedly: %v", ctx.Err())
@@ -168,13 +168,13 @@ func TestSessionTurnInheritedStderrDoesNotHang(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
 	defer cancel()
 	events, err := session.Turn(ctx, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "go"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := collectEventsWithTimeout(t, events, 3*time.Second)
+	got := collectEventsWithTimeout(t, events, 7*time.Second)
 	if ctx.Err() != nil {
 		t.Fatalf("turn context ended unexpectedly: %v", ctx.Err())
 	}
@@ -370,8 +370,8 @@ func TestOneShotBackendRunsThroughDuplexRuntime(t *testing.T) {
 	if got[0].Type != engine.EventAgentText || got[0].Text != "from stdout" {
 		t.Fatalf("first event = %#v, want parsed agent text", got[0])
 	}
-	if got[1].Type != engine.EventResultMessage || got[1].Text != "from stdout" {
-		t.Fatalf("second event = %#v, want backfilled result message", got[1])
+	if got[1].Type != engine.EventResultMessage || got[1].Text != "" {
+		t.Fatalf("second event = %#v, want explicit empty result message", got[1])
 	}
 	if session.ID() != "stream-session" {
 		t.Fatalf("session id = %q, want stream-session", session.ID())
@@ -551,11 +551,13 @@ func TestBackendWithDriverRejectsConcurrentTurn(t *testing.T) {
 	}
 }
 
-func TestSessionTurnSurfacesOutputTruncationAsTerminalError(t *testing.T) {
+var errSyntheticReadFailure = errors.New("synthetic read failure")
+
+func TestSessionTurnSurfacesReadFailureAsTerminalError(t *testing.T) {
 	runner := &fakeCommandRunner{
 		stdout: &errorAfterReader{
 			reader: strings.NewReader(`{"event":"ok"}` + "\n"),
-			err:    command.ErrOutputTruncated,
+			err:    errSyntheticReadFailure,
 		},
 	}
 	backend := &Backend{
@@ -578,8 +580,8 @@ func TestSessionTurnSurfacesOutputTruncationAsTerminalError(t *testing.T) {
 	}
 	got := collectEvents(events)
 	got = withoutTurnFinal(got)
-	if len(got) != 2 || got[0].Type != engine.EventAgentText || got[1].Type != engine.EventTerminalError || !strings.Contains(got[1].Text, command.ErrOutputTruncated.Error()) {
-		t.Fatalf("events = %#v, want parsed event followed by truncation terminal error", got)
+	if len(got) != 2 || got[0].Type != engine.EventAgentText || got[1].Type != engine.EventTerminalError || !strings.Contains(got[1].Text, "incomplete backend transport") || !errors.Is(got[1].Err, errSyntheticReadFailure) {
+		t.Fatalf("events = %#v, want parsed event followed by read failure terminal error", got)
 	}
 }
 

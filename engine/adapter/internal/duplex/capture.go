@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"sync"
 )
@@ -75,6 +76,15 @@ func (tracker *captureWarningTracker) fail(err error) {
 	tracker.warning = &captureWarning{source: tracker.source, bytes: tracker.written, err: message}
 }
 
+func (tracker *captureWarningTracker) failOpen(path string, err error) {
+	// An append failure can leave earlier-turn evidence on disk. Report that
+	// retained byte count when it can be inspected without changing the file.
+	if info, statErr := os.Stat(path); statErr == nil && info.Mode().IsRegular() {
+		tracker.setWritten(info.Size())
+	}
+	tracker.fail(err)
+}
+
 func (tracker *captureWarningTracker) snapshot() *captureWarning {
 	if tracker == nil {
 		return nil
@@ -113,7 +123,11 @@ func (writer *tolerantCaptureWriter) Write(payload []byte) (int, error) {
 		n = len(payload)
 		err = errors.New("raw log sink returned an invalid write count")
 	}
-	writer.tracker.addWritten(n)
+	if counter, ok := writer.dst.(interface{ CapturedBytes() int64 }); ok {
+		writer.tracker.setWritten(counter.CapturedBytes())
+	} else {
+		writer.tracker.addWritten(n)
+	}
 	if err == nil && n != len(payload) {
 		err = io.ErrShortWrite
 	}

@@ -79,6 +79,7 @@ type activeExecution struct {
 	steerWorkerStarted     bool
 	deadlineWarningCancel  context.CancelFunc
 	deadlineWarningDone    chan struct{}
+	captureDrains          []<-chan struct{}
 }
 
 // activeTurn owns the one retirement receipt for a turn. A cancellation can
@@ -676,6 +677,9 @@ func (s *Server) startQueuedJobLocked(queued queuedJob) {
 		defer s.executionWG.Done()
 		defer s.touchActivity()
 		s.runJob(parent, queued.record, run)
+		// A canceled embedded adapter may close its event stream late. Keep the
+		// execution registered until its local capture writers have stopped.
+		run.waitCaptureDrains()
 		s.executionMu.Lock()
 		if s.executions[queued.record.JobID] == run {
 			delete(s.executions, queued.record.JobID)
@@ -1224,6 +1228,7 @@ type turnOutcome struct {
 	err              error
 	timedOut         bool
 	interrupted      bool
+	turnFinalSeen    bool
 	cleanup          protocol.Cleanup
 	diagnostics      []string
 }
@@ -1247,11 +1252,17 @@ func collectTurn(s *Server, ctx context.Context, run *activeExecution, events <-
 			}
 			if drainTurnEvents(s, run, events, &outcome, &assistant, &result, &hasResult, items) {
 				outcome.text = attemptFinalText(hasResult, result, assistant.String())
+				// A built-in adapter's final observation says whether the deadline
+				// was already reached when semantic completion was accepted. A
+				// later deadline during retirement cannot rewrite that result.
+				if outcome.turnFinalSeen && (hasResult || assistant.Len() > 0) && outcome.err == nil && !outcome.timedOut && !outcome.interrupted && !run.cancellationRequested() {
+					return outcome
+				}
 			} else {
 				outcome.cleanup = protocol.CleanupUncertain
 				outcome.diagnostics = append(outcome.diagnostics, "backend event stream did not close after containment grace")
 				items.writer.markIncomplete()
-				discardTurnEvents(events)
+				run.trackCaptureDrain(discardTurnEvents(events))
 			}
 			outcome.err = ctx.Err()
 			return outcome
@@ -1315,6 +1326,7 @@ func absorbTurnEvent(run *activeExecution, outcome *turnOutcome, assistant *stri
 		if event.TurnFinal == nil {
 			return
 		}
+		outcome.turnFinalSeen = true
 		if strings.TrimSpace(event.TurnFinal.BackendSessionID) != "" {
 			outcome.backendSessionID = event.TurnFinal.BackendSessionID
 		}
@@ -1334,14 +1346,29 @@ func absorbTurnEvent(run *activeExecution, outcome *turnOutcome, assistant *stri
 	}
 }
 
-func discardTurnEvents(events <-chan engine.Event) {
-	if events == nil {
-		return
-	}
+func discardTurnEvents(events <-chan engine.Event) <-chan struct{} {
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		for range events {
 		}
 	}()
+	return done
+}
+
+func (run *activeExecution) trackCaptureDrain(done <-chan struct{}) {
+	run.mu.Lock()
+	run.captureDrains = append(run.captureDrains, done)
+	run.mu.Unlock()
+}
+
+func (run *activeExecution) waitCaptureDrains() {
+	run.mu.Lock()
+	drains := append([]<-chan struct{}(nil), run.captureDrains...)
+	run.mu.Unlock()
+	for _, done := range drains {
+		<-done
+	}
 }
 
 func cleanupAfterContextStop(run *activeExecution, contextErr error) (protocol.Cleanup, []string) {

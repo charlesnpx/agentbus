@@ -120,6 +120,49 @@ func TestFailedRawLogSinkDoesNotDropTerminalFrame(t *testing.T) {
 	}
 }
 
+func TestInconsistentPriorCaptureReportsRetainedBytesAndCompletes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stdout.log")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(engine.DefaultCappedLogCapBytes); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	proc := newFakeCommand()
+	session := newFixtureSession(t, &fakeRunner{running: proc}, 0, "")
+	go func() {
+		scanner := bufio.NewScanner(proc.stdinR)
+		if scanner.Scan() {
+			writePeerJSON(t, proc.stdoutW, map[string]any{"type": "complete", "text": "done"})
+		}
+		_ = proc.stdoutW.Close()
+		_ = proc.stderrW.Close()
+		proc.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
+	}()
+	events, err := session.Turn(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, LogPaths: engine.LogPaths{Stdout: path}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	var result, warning bool
+	for _, event := range got {
+		if event.Type == engine.EventResultMessage && event.Text == "done" {
+			result = true
+		}
+		if event.Type == engine.EventWarning && event.Metadata["agentbusCaptureWarning"] == true && event.Metadata["bytesCaptured"] == engine.DefaultCappedLogCapBytes {
+			warning = true
+		}
+	}
+	info, statErr := os.Stat(path)
+	if !result || !warning || statErr != nil || info.Size() != engine.DefaultCappedLogCapBytes {
+		t.Fatalf("result=%v warning=%v file=%v stat error=%v", result, warning, info, statErr)
+	}
+}
+
 type failAfterBytesWriter struct {
 	remaining int
 }
@@ -554,8 +597,8 @@ func TestTurnTeardownBoundsRetirementAndPreservesDriverOutcome(t *testing.T) {
 				t.Fatalf("events = %#v, want final TurnFinal event", got)
 			}
 			final := got[len(got)-1].TurnFinal
-			if final.ReturnCodeKnown || final.ExecutionFailed || final.CleanupFailed {
-				t.Fatalf("forced teardown TurnFinal = %#v, want unknown non-failure observation", *final)
+			if final.ReturnCodeKnown || final.ExecutionFailed || final.CleanupFailed != !test.finishOnInterrupt {
+				t.Fatalf("forced teardown TurnFinal = %#v, want independent cleanup certainty", *final)
 			}
 		})
 	}
@@ -1080,6 +1123,31 @@ func TestFrameDropTrackerRedactsAmbiguousDiscriminator(t *testing.T) {
 	})
 	if got := tracker.snapshot().RedactedPrefix; got != "unclassified" {
 		t.Fatalf("ambiguous summary = %q, want unclassified", got)
+	}
+}
+
+func TestOrderedDropAccountsOnlyDeliveredWarnings(t *testing.T) {
+	first := &OverlongFrameError{Bytes: 129, Prefix: []byte(`{"method":"warning"`)}
+	second := &OverlongFrameError{Bytes: 257, Prefix: []byte(`{"method":"turn/completed"`)}
+	tracker := &frameDropTracker{}
+	tracker.record(first)
+	tracker.record(second)
+	events := make(chan engine.Event, 1)
+	emitter := turnEmitter(events, tracker)
+	emitter.emit(OrderedFrameDrop(first))
+	emitter.stop()
+	if event := <-events; event.Type != engine.EventWarning {
+		t.Fatalf("ordered omission = %#v, want a warning", event)
+	}
+	if remaining := tracker.snapshot(); remaining.Count != 1 || remaining.Bytes != second.Bytes {
+		t.Fatalf("unreported omissions = %#v", remaining)
+	}
+
+	// A stopped emitter could not deliver this warning; retain it for the
+	// terminal capture summary instead of silently accounting it as observed.
+	emitter.emit(OrderedFrameDrop(second))
+	if remaining := tracker.snapshot(); remaining.Count != 1 || remaining.Bytes != second.Bytes {
+		t.Fatalf("suppressed omission was lost: %#v", remaining)
 	}
 }
 
@@ -2215,4 +2283,174 @@ func (c *fakeObservedCommand) FinalObservation(context.Context) (command.FinalOb
 		<-c.finalRelease
 	}
 	return c.final, c.finalErr
+}
+
+type blockingStdinDriver struct {
+	FixtureDriver
+	started  chan struct{}
+	finished chan error
+}
+
+func (driver blockingStdinDriver) RunTurn(_ context.Context, conn *Conn, _ string, _ engine.SessionOpts, _ engine.TurnInput, _ EmitFunc) (string, error) {
+	close(driver.started)
+	_, err := conn.WriteStdin(make([]byte, 1<<20))
+	driver.finished <- err
+	return "", err
+}
+
+func TestCancellationClosesStdinWhileWriteMutexIsHeld(t *testing.T) {
+	proc := newFakeCommand()
+	defer proc.stdoutW.Close()
+	defer proc.stderrW.Close()
+	defer proc.stdinR.Close()
+	observed := newFakeObservedCommand(proc, command.FinalObservation{CleanupErr: errors.New("permission denied")}, nil)
+	driver := blockingStdinDriver{FixtureDriver: FixtureDriver{Spec: command.ExecSpec{Argv: []string{"fixture"}}}, started: make(chan struct{}), finished: make(chan error, 1)}
+	session := newSessionWithDriver(t, &fakeRunner{running: observed}, driver, 0, "")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	events, err := session.Turn(ctx, engine.TurnInput{Intent: engine.IntentInspect})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-driver.started
+	select {
+	case <-driver.finished:
+		t.Fatal("stdin write was expected to block")
+	case <-time.After(25 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case err := <-driver.finished:
+		if err == nil {
+			t.Fatal("blocked write succeeded after stdin closed")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocked stdin write was not released")
+	}
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	if len(got) == 0 || got[len(got)-1].TurnFinal == nil || !got[len(got)-1].TurnFinal.Canceled || !got[len(got)-1].TurnFinal.CleanupFailed {
+		t.Fatalf("final observation = %#v", got)
+	}
+	proc.finish(command.ExitObservation{}, nil)
+}
+
+func TestConsecutiveTurnsAppendBothRawLogs(t *testing.T) {
+	first, second := newFakeCommand(), newFakeCommand()
+	paths := engine.LogPaths{Stdout: filepath.Join(t.TempDir(), "stdout.log"), Stderr: filepath.Join(t.TempDir(), "stderr.log")}
+	session := newFixtureSession(t, &fakeRunner{running: first}, 0, "")
+	for index, proc := range []*fakeCommand{first, second} {
+		turn := index + 1
+		peerDone := make(chan error, 1)
+		go func() {
+			reader := bufio.NewReader(proc.stdinR)
+			if _, err := reader.ReadString('\n'); err != nil {
+				peerDone <- err
+				return
+			}
+			_, err := fmt.Fprintf(proc.stdoutW, "{\"type\":\"complete\",\"text\":\"turn-%d\"}\n", turn)
+			if err == nil {
+				_, err = fmt.Fprintf(proc.stderrW, "stderr-%d\n", turn)
+			}
+			_ = proc.stdoutW.Close()
+			_ = proc.stderrW.Close()
+			proc.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
+			peerDone <- err
+		}()
+		events, err := session.TurnWithRunner(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, LogPaths: paths}, &fakeRunner{running: proc})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := collectEventsWithTimeout(t, events, 2*time.Second)
+		if err := <-peerDone; err != nil {
+			t.Fatal(err)
+		}
+		if len(got) == 0 {
+			t.Fatal("turn emitted no result")
+		}
+	}
+	stdout, err := os.ReadFile(paths.Stdout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stderr, err := os.ReadFile(paths.Stderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(stdout) != "{\"type\":\"complete\",\"text\":\"turn-1\"}\n{\"type\":\"complete\",\"text\":\"turn-2\"}\n" || string(stderr) != "stderr-1\nstderr-2\n" {
+		t.Fatalf("logs = %q, %q", stdout, stderr)
+	}
+}
+
+func TestLeaderExitStartsDrainDeadlineBeforeDriverReturns(t *testing.T) {
+	runner := command.DirectCommandRunner{CancelGrace: 50 * time.Millisecond}
+	driver := FixtureDriver{Spec: command.ExecSpec{Argv: []string{"/bin/sh", "-c", `IFS= read -r prompt; printf '{"type":"message","text":"partial"}\n'; (sleep 2) & exit 0`}}}
+	session, err := NewSession(SessionConfig{Runner: runner, Driver: driver})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	events, err := session.Turn(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	if time.Since(started) > time.Second {
+		t.Fatal("turn waited for descendant instead of the drain deadline")
+	}
+	for _, event := range got {
+		if event.Type == engine.EventTerminalError && strings.Contains(event.Text, "incomplete backend transport") {
+			return
+		}
+	}
+	t.Fatalf("events = %#v, want incomplete transport", got)
+}
+
+func TestLocalReaderDeadlineClosesBothStreamsAfterRetirement(t *testing.T) {
+	stdout, stdoutWriter := io.Pipe()
+	stderr, stderrWriter := io.Pipe()
+	defer stdoutWriter.Close()
+	defer stderrWriter.Close()
+	stdoutDone := make(chan struct{})
+	stderrDone := make(chan error, 1)
+	go func() {
+		_, _ = io.Copy(io.Discard, stdout)
+		close(stdoutDone)
+	}()
+	go func() {
+		_, err := io.Copy(io.Discard, stderr)
+		stderrDone <- err
+	}()
+	deadline := make(chan time.Time, 1)
+	deadline <- time.Now()
+	done := make(chan error, 1)
+	go func() {
+		done <- waitForLocalReaders(stdout, stderr, stdoutDone, stderrDone, true, deadline)
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("forced reader close reported a transport failure: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("retired process left local capture readers blocked")
+	}
+	if _, err := stdoutWriter.Write([]byte("late")); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("stdout writer after abandonment: %v", err)
+	}
+	if _, err := stderrWriter.Write([]byte("late")); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("stderr writer after abandonment: %v", err)
+	}
+}
+
+func TestProtocolErrorTakesPrecedenceOverExitStderr(t *testing.T) {
+	protocolErr := errors.New("malformed backend stream")
+	var stderr diagnosticTail
+	_, _ = stderr.Write([]byte("Invalid model value: stale diagnostic"))
+	events := make(chan engine.Event, 3)
+	emitCompletionEvents(turnDisposition{}, events, protocolErr, false, command.FinalObservation{ExecutionErr: errors.New("exit status 1")}, &stderr, nil)
+	close(events)
+	got := collectEventsWithTimeout(t, events, time.Second)
+	if len(got) != 1 || got[0].Type != engine.EventTerminalError || !errors.Is(got[0].Err, protocolErr) {
+		t.Fatalf("events = %#v, want the protocol error", got)
+	}
 }
