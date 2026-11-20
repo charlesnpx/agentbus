@@ -22,8 +22,6 @@ type Backend struct {
 	StreamSchema     string
 	AllowedModels    map[string]struct{}
 	AllowedEfforts   map[string]struct{}
-	BuildArgs        func(resumeID string, opts engine.SessionOpts, input engine.TurnInput) ([]string, error)
-	Parse            func(map[string]any) ([]engine.Event, string, error)
 	Driver           duplex.Driver
 	VersionTransform func(string) string
 	Discover         func(context.Context, command.ProbeRunner, string) (*engine.ModelDiscovery, error)
@@ -118,16 +116,8 @@ func (b *Backend) Resume(ctx context.Context, id string, opts engine.SessionOpts
 
 func (b *Backend) newSession(id string, opts engine.SessionOpts) (engine.Session, error) {
 	session := &Session{}
-	driver := b.Driver
-	if driver == nil {
-		var err error
-		driver, err = newOneShotDriver(b)
-		if err != nil {
-			return nil, err
-		}
-	}
 	duplexSession, err := duplex.NewSession(duplex.SessionConfig{
-		Driver:   driver,
+		Driver:   b.Driver,
 		Options:  opts,
 		ResumeID: id,
 	})
@@ -135,7 +125,7 @@ func (b *Backend) newSession(id string, opts engine.SessionOpts) (engine.Session
 		return nil, err
 	}
 	session.duplexSession = duplexSession
-	if _, ok := driver.(duplex.SteerDriver); ok {
+	if _, ok := b.Driver.(duplex.SteerDriver); ok {
 		return &steerableSession{Session: session}, nil
 	}
 	return session, nil
@@ -312,15 +302,6 @@ func (s *Session) Interrupt(ctx context.Context) error {
 
 func (s *Session) NativeInterrupt(ctx context.Context) (bool, error) {
 	return s.duplexSession.NativeInterrupt(ctx)
-}
-
-func capEvent(ev engine.Event) engine.Event {
-	ev.RawText = ev.Text
-	text := engine.TruncateEventText([]byte(ev.Text), engine.DefaultEventTextCap)
-	ev.Text = text.Text
-	ev.Truncated = ev.Truncated || text.Truncated
-	ev.Metadata = engine.SanitizeEventMetadata(ev.Metadata)
-	return ev
 }
 
 func compareVersion(a, b string) int {
