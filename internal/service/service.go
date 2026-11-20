@@ -139,6 +139,7 @@ type Server struct {
 	release           string
 	stateRoot         string
 	socketPath        string
+	errorSocketPath   string
 	token             string
 	backends          map[string]engine.Backend
 	backendDefaults   map[string]BackendDefaults
@@ -234,6 +235,10 @@ func New(cfg Config) (*Server, error) {
 	if socketPath == "" {
 		socketPath = filepath.Join(root, protocol.SocketName)
 	}
+	errorSocketPath := socketPath
+	if cfg.SocketPath == "" && cfg.StateRoot != "" {
+		errorSocketPath = filepath.Join(cfg.StateRoot, protocol.SocketName)
+	}
 	ownershipStore, err := jobstore.Open(filepath.Join(root, jobStoreFilename))
 	if err != nil {
 		return nil, fmt.Errorf("validate state root before startup: %w", err)
@@ -282,6 +287,7 @@ func New(cfg Config) (*Server, error) {
 		release:           cfg.Release,
 		stateRoot:         root,
 		socketPath:        socketPath,
+		errorSocketPath:   errorSocketPath,
 		token:             token,
 		backends:          backends,
 		backendDefaults:   backendDefaults,
@@ -582,7 +588,7 @@ func (s *Server) listen() (net.Listener, socketFileIdentity, error) {
 	if _, err := os.Lstat(s.socketPath); err == nil {
 		if conn, dialErr := net.DialTimeout("unix", s.socketPath, 100*time.Millisecond); dialErr == nil {
 			_ = conn.Close()
-			return nil, socketFileIdentity{}, DaemonAlreadyListeningError{SocketPath: s.socketPath}
+			return nil, socketFileIdentity{}, DaemonAlreadyListeningError{SocketPath: s.errorSocketPath}
 		}
 		if s.beforeStaleSocketRemovalHook != nil {
 			s.beforeStaleSocketRemovalHook()
@@ -596,7 +602,7 @@ func (s *Server) listen() (net.Listener, socketFileIdentity, error) {
 	listener, identity, err := listenUnixSocketPrivate(s.socketPath)
 	if err != nil {
 		if isAddrInUse(err) {
-			return nil, socketFileIdentity{}, DaemonAlreadyListeningError{SocketPath: s.socketPath}
+			return nil, socketFileIdentity{}, DaemonAlreadyListeningError{SocketPath: s.errorSocketPath}
 		}
 		return nil, socketFileIdentity{}, err
 	}
