@@ -752,6 +752,95 @@ func TestAppServerCompletedTurnUsesLastCompletedAgentMessageAsResult(t *testing.
 	}
 }
 
+func TestAppServerCompletedTurnUsesOrderedTerminalInventory(t *testing.T) {
+	earlier := map[string]any{"id": "item-a", "type": "agentMessage", "text": "earlier A"}
+	tests := []struct {
+		name          string
+		items         []any
+		completedText *string
+		lateDelta     string
+		terminalText  *string
+		want          string
+	}{
+		{
+			name:  "last inventory item wins over observation order",
+			items: []any{earlier, map[string]any{"id": "item-b", "type": "agentMessage", "text": "final B"}},
+			want:  "final B",
+		},
+		{
+			name:  "inventory text wins over streamed delta",
+			items: []any{earlier, map[string]any{"id": "item-b", "type": "agentMessage", "text": "snapshot B"}, map[string]any{"id": "tool-c", "type": "commandExecution"}},
+			want:  "snapshot B",
+		},
+		{
+			name:  "explicit empty inventory text",
+			items: []any{earlier, map[string]any{"id": "item-b", "type": "agentMessage", "text": ""}},
+		},
+		{
+			name:  "unusable final inventory item falls back to streamed text",
+			items: []any{earlier, map[string]any{"id": "item-b", "type": "agentMessage"}},
+			want:  "final B",
+		},
+		{
+			name: "empty inventory falls back to streamed text",
+			want: "final B",
+		},
+		{
+			name:          "empty completed text wins over deltas",
+			completedText: new(string),
+			lateDelta:     "late delta",
+		},
+		{
+			name:         "explicit terminal text wins",
+			items:        []any{earlier, map[string]any{"id": "item-b", "type": "agentMessage", "text": "final B"}},
+			terminalText: new(string),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, _ command.ExecSpec) {
+				peer := newAppServerPeer(t, proc)
+				peer.handshake()
+				thread := peer.expectRequest("thread/start")
+				peer.respond(thread, threadResult("thread-1"))
+				turn := peer.expectRequest("turn/start")
+				peer.respond(turn, turnResult("turn-1"))
+				peer.notify("item/agentMessage/delta", map[string]any{"itemId": "item-b", "delta": "final B"})
+				if test.completedText != nil {
+					peer.notify("item/completed", itemParams("thread-1", "turn-1", map[string]any{"id": "item-b", "type": "agentMessage", "text": *test.completedText}))
+				}
+				if test.lateDelta != "" {
+					peer.notify("item/agentMessage/delta", map[string]any{"itemId": "item-b", "delta": test.lateDelta})
+				}
+				completed := completedParams("thread-1", "turn-1", "completed", "")
+				completed["turn"].(map[string]any)["items"] = test.items
+				if test.terminalText != nil {
+					completed["last_agent_message"] = *test.terminalText
+				}
+				peer.notify("turn/completed", completed)
+			})
+			session := startFakeCodexSession(t, engine.SessionOpts{})
+			events, err := turnWithRunner(t, session, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := collectEventsWithTimeout(t, events, 2*time.Second)
+			var results []string
+			for _, event := range got {
+				if event.Type == engine.EventResultMessage {
+					results = append(results, event.Text)
+				}
+				if event.Type == engine.EventTerminalError {
+					t.Fatalf("unexpected terminal error: %#v", event)
+				}
+			}
+			if !reflect.DeepEqual(results, []string{test.want}) {
+				t.Fatalf("result texts = %#v, want %#v", results, []string{test.want})
+			}
+		})
+	}
+}
+
 func TestAppServerWarningFrameEmitsOneOrderedEventSequence(t *testing.T) {
 	runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
 		peer := newAppServerPeer(t, proc)

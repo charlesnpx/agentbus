@@ -88,8 +88,8 @@ func TestJSONLDecodesLargeEscapedFrameUnderBackpressure(t *testing.T) {
 			close(src.release)
 		}
 	}()
-	frames, decodeErrs, done := make(chan Frame, 1), make(chan error, 1), make(chan struct{})
-	go readJSONL(src, nil, frames, decodeErrs, done, nil)
+	frames, done := make(chan Frame, 1), make(chan struct{})
+	go readJSONL(src, nil, frames, done, nil)
 	select {
 	case <-src.started:
 	case <-time.After(5 * time.Second):
@@ -110,8 +110,8 @@ func TestJSONLDecodesLargeEscapedFrameUnderBackpressure(t *testing.T) {
 		t.Fatal("JSONL decode timed out")
 	}
 	<-done
-	if err := <-decodeErrs; err != nil {
-		t.Fatal(err)
+	if frame, ok := <-frames; ok {
+		t.Fatalf("unexpected trailing frame: %#v", frame)
 	}
 	if got := <-progress; got != "done" {
 		t.Fatalf("helper status %q", got)
