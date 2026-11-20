@@ -6,10 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/charlesnpx/agentbus/engine"
@@ -24,7 +22,7 @@ func runtimeHygieneRecord(t *testing.T, server *Server, cwd, requestID string, w
 		Backend: "codex",
 		CWD:     cwd,
 		Prompt:  "runtime hygiene test",
-		Write:   write,
+		Intent:  intentFromWriteForTest(write),
 	}
 	return runtimeHygieneRecordForSpec(t, server, cwd, requestID, spec)
 }
@@ -47,7 +45,7 @@ func runtimeHygieneRecordForSpec(t *testing.T, server *Server, cwd, requestID st
 		jobstore.RequestKey{WorkspaceKey: "runtime-hygiene-" + requestID, RequestID: requestID},
 		raw,
 		func(id string) (jobstore.Record, error) {
-			return jobstore.Record{JobID: id, Backend: spec.Backend, CWD: canonicalCWD, Write: spec.Write}, nil
+			return jobstore.Record{JobID: id, Backend: spec.Backend, CWD: canonicalCWD, Intent: spec.Intent}, nil
 		},
 	)
 	if err != nil {
@@ -97,256 +95,11 @@ func TestCompletedSessionRetentionIsSharedByStoreAndService(t *testing.T) {
 			if retained != (terminal.BackendSessionID != "") {
 				t.Fatalf("store retention=%t, backend session ID=%q", retained, terminal.BackendSessionID)
 			}
-			resumeErr := validateResumeTarget(protocol.TaskSpec{Backend: terminal.Backend, ResumeJobID: terminal.JobID}, terminal)
+			resumeErr := validateResumeTarget(protocol.TaskSpec{Intent: engine.IntentInspect, Backend: terminal.Backend, ResumeJobID: terminal.JobID}, terminal)
 			if (resumeErr == nil) != retained {
 				t.Fatalf("service resume validation error=%v, shared retention=%t", resumeErr, retained)
 			}
 		})
-	}
-}
-
-func TestCodexWriteTurnUsesPrivateWritableCacheAndHostModuleCache(t *testing.T) {
-	hostModuleCache := filepath.Join(t.TempDir(), "host-mod-cache")
-	if err := os.MkdirAll(hostModuleCache, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("GOMODCACHE", hostModuleCache)
-	var started engine.SessionOpts
-	backend := &executionFakeBackend{name: "codex"}
-	backend.start = func(_ context.Context, opts engine.SessionOpts) (engine.Session, error) {
-		started = opts
-		if opts.WriteSandboxRoot == "" {
-			t.Fatal("write Codex session missing WriteSandboxRoot")
-		}
-		for _, path := range []string{
-			filepath.Join(opts.WriteSandboxRoot, "cache", "go-build"),
-			filepath.Join(opts.WriteSandboxRoot, "cache", "sccache"),
-			filepath.Join(opts.WriteSandboxRoot, "tmp"),
-			filepath.Join(opts.WriteSandboxRoot, "cache", "npm"),
-			filepath.Join(opts.WriteSandboxRoot, "cache", "corepack"),
-			filepath.Join(opts.WriteSandboxRoot, "cache", "xdg"),
-			filepath.Join(opts.WriteSandboxRoot, "cache", "pnpm"),
-			filepath.Join(opts.WriteSandboxRoot, "cache", "yarn"),
-		} {
-			info, err := os.Stat(path)
-			if err != nil {
-				t.Fatalf("write cache path %s: %v", path, err)
-			}
-			if !info.IsDir() || info.Mode().Perm() != 0o700 {
-				t.Fatalf("write cache path %s mode/type = %s, want directory 0700", path, info.Mode())
-			}
-		}
-		return claimedResultSession("write result"), nil
-	}
-	server := newTestServer(t, t.TempDir(), Config{
-		Backends:      []engine.Backend{backend},
-		CodexAuthHome: filepath.Join(t.TempDir(), "missing-auth-home"),
-	})
-	record := runtimeHygieneRecord(t, server, t.TempDir(), "write", true)
-	runExecution(t, server, record)
-
-	if started.WriteSandboxRoot == "" {
-		t.Fatal("write Codex session did not start")
-	}
-	if got := started.EnvOverlay["GOMODCACHE"]; got != hostModuleCache {
-		t.Fatalf("EnvOverlay[GOMODCACHE] = %q, want resolved host cache %q", got, hostModuleCache)
-	}
-	if relative, err := filepath.Rel(started.WriteSandboxRoot, started.EnvOverlay["GOMODCACHE"]); err == nil {
-		inside := relative == "." || (relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)))
-		if inside {
-			t.Fatalf("GOMODCACHE %q is not outside job cache root %q", started.EnvOverlay["GOMODCACHE"], started.WriteSandboxRoot)
-		}
-	}
-	if got := started.EnvOverlay["GOPROXY"]; got != "off" {
-		t.Fatalf("EnvOverlay[GOPROXY] = %q, want off", got)
-	}
-	want := map[string]string{
-		"GOCACHE":              filepath.Join(started.WriteSandboxRoot, "cache", "go-build"),
-		"TMPDIR":               filepath.Join(started.WriteSandboxRoot, "tmp"),
-		"npm_config_cache":     filepath.Join(started.WriteSandboxRoot, "cache", "npm"),
-		"COREPACK_HOME":        filepath.Join(started.WriteSandboxRoot, "cache", "corepack"),
-		"XDG_CACHE_HOME":       filepath.Join(started.WriteSandboxRoot, "cache", "xdg"),
-		"npm_config_store_dir": filepath.Join(started.WriteSandboxRoot, "cache", "pnpm"),
-		"YARN_CACHE_FOLDER":    filepath.Join(started.WriteSandboxRoot, "cache", "yarn"),
-	}
-	if len(started.WriteEnvOverlay) != len(want) {
-		t.Fatalf("WriteEnvOverlay = %#v, want exactly %#v", started.WriteEnvOverlay, want)
-	}
-	for key, path := range want {
-		if got := started.WriteEnvOverlay[key]; got != path {
-			t.Fatalf("WriteEnvOverlay[%q] = %q, want %q", key, got, path)
-		}
-		relative, err := filepath.Rel(started.WriteSandboxRoot, path)
-		if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-			t.Fatalf("WriteEnvOverlay[%q] = %q is outside sandbox root %q", key, path, started.WriteSandboxRoot)
-		}
-	}
-	get := server.handleJobGet(mustJSON(t, protocol.JobGetParams{JobID: record.JobID}))
-	if get.err != nil {
-		t.Fatalf("job.get error = %#v", get.err)
-	}
-	detail, ok := get.result.(protocol.JobRecordWire)
-	if !ok || detail.Execution == nil {
-		t.Fatalf("job.get execution posture = %#v, want persisted posture", get.result)
-	}
-	if detail.Execution.Intent != "edit" || !detail.Execution.SourceWritable || detail.Execution.Scratch != started.WriteSandboxRoot {
-		t.Fatalf("job.get execution posture = %#v, want edit posture with job scratch", detail.Execution)
-	}
-	if got := detail.Execution.Caches["GOMODCACHE"]; got != hostModuleCache {
-		t.Fatalf("job.get execution GOMODCACHE = %q, want %q", got, hostModuleCache)
-	}
-}
-
-func TestCodexWriteTurnOmitsGOMODCACHEWhenHostCacheCannotResolve(t *testing.T) {
-	t.Setenv("GOMODCACHE", "")
-	t.Setenv("PATH", t.TempDir())
-	var started engine.SessionOpts
-	backend := &executionFakeBackend{name: "codex"}
-	backend.start = func(_ context.Context, opts engine.SessionOpts) (engine.Session, error) {
-		started = opts
-		return claimedResultSession("offline result"), nil
-	}
-	server := newTestServer(t, t.TempDir(), Config{
-		Backends:      []engine.Backend{backend},
-		CodexAuthHome: filepath.Join(t.TempDir(), "missing-auth-home"),
-	})
-	record := runtimeHygieneRecord(t, server, t.TempDir(), "missing-host-module-cache", true)
-	runExecution(t, server, record)
-	if _, ok := started.EnvOverlay["GOMODCACHE"]; ok {
-		t.Fatalf("EnvOverlay unexpectedly set GOMODCACHE: %#v", started.EnvOverlay)
-	}
-	if _, ok := started.WriteEnvOverlay["GOMODCACHE"]; ok {
-		t.Fatalf("WriteEnvOverlay unexpectedly set GOMODCACHE: %#v", started.WriteEnvOverlay)
-	}
-}
-
-func TestCodexLocalIPCPathLimitsSccacheEnvironmentAndCleanup(t *testing.T) {
-	originalGOOS := localIPCGOOS
-	localIPCGOOS = "darwin"
-	t.Cleanup(func() { localIPCGOOS = originalGOOS })
-	for _, test := range []struct {
-		goos  string
-		limit int
-	}{
-		{goos: "linux", limit: 107},
-		{goos: "darwin", limit: 103},
-	} {
-		rootLength := test.limit - len(localIPCSCCacheStartupSocketSuffix)
-		fits := "/" + strings.Repeat("r", rootLength-1)
-		if err := validateLocalIPCSocketPath(fits, test.goos); err != nil {
-			t.Fatalf("%s path at %d-byte socket limit rejected: %v", test.goos, test.limit, err)
-		}
-		err := validateLocalIPCSocketPath(fits+"x", test.goos)
-		if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("%d bytes", test.limit+1)) || !strings.Contains(err.Error(), fmt.Sprintf("limit is %d bytes", test.limit)) {
-			t.Fatalf("%s one-byte-over path error = %v, want length and %d-byte limit", test.goos, err, test.limit)
-		}
-	}
-	originalTempRoot := localIPCTempRoot
-	tempRoot, err := os.MkdirTemp("/tmp", "agentbus-test-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		localIPCTempRoot = originalTempRoot
-		_ = os.RemoveAll(tempRoot)
-	})
-	localIPCTempRoot = tempRoot
-
-	var started engine.SessionOpts
-	backend := &executionFakeBackend{name: "codex"}
-	backend.start = func(_ context.Context, opts engine.SessionOpts) (engine.Session, error) {
-		started = opts
-		if opts.LocalIPCRoot == "" || opts.WriteEnvOverlay["TMPDIR"] != opts.LocalIPCRoot {
-			t.Fatalf("LocalIPCRoot=%q WriteEnvOverlay=%#v, want private TMPDIR", opts.LocalIPCRoot, opts.WriteEnvOverlay)
-		}
-		if !strings.HasPrefix(filepath.Base(opts.LocalIPCRoot), "agentbus-ipc-") {
-			t.Fatalf("LocalIPCRoot = %q, want a short agentbus-ipc directory", opts.LocalIPCRoot)
-		}
-		uds := opts.WriteEnvOverlay["SCCACHE_SERVER_UDS"]
-		if !filepath.IsAbs(uds) {
-			t.Fatalf("SCCACHE_SERVER_UDS = %q, want an absolute IPC socket path", uds)
-		}
-		udsRelative, err := filepath.Rel(opts.LocalIPCRoot, uds)
-		if err != nil || udsRelative != "sccache.sock" {
-			t.Fatalf("SCCACHE_SERVER_UDS = %q, want inside IPC root %q", uds, opts.LocalIPCRoot)
-		}
-		sccacheDir := opts.WriteEnvOverlay["SCCACHE_DIR"]
-		sccacheRelative, err := filepath.Rel(opts.WriteSandboxRoot, sccacheDir)
-		if err != nil || sccacheRelative == ".." || strings.HasPrefix(sccacheRelative, ".."+string(filepath.Separator)) {
-			t.Fatalf("SCCACHE_DIR = %q, want under scratch %q", sccacheDir, opts.WriteSandboxRoot)
-		}
-		info, err := os.Stat(opts.LocalIPCRoot)
-		if err != nil {
-			t.Fatalf("private IPC directory before launch: %v", err)
-		}
-		if !info.IsDir() || info.Mode().Perm() != 0o700 {
-			t.Fatalf("private IPC directory mode/type = %s, want directory 0700", info.Mode())
-		}
-		for key, path := range opts.WriteEnvOverlay {
-			if key == "TMPDIR" || key == "SCCACHE_SERVER_UDS" {
-				continue
-			}
-			relative, err := filepath.Rel(opts.WriteSandboxRoot, path)
-			if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-				t.Fatalf("WriteEnvOverlay[%q] = %q is outside scratch %q", key, path, opts.WriteSandboxRoot)
-			}
-		}
-		return claimedResultSession("local IPC result"), nil
-	}
-	server := newTestServer(t, t.TempDir(), Config{
-		Backends:      []engine.Backend{backend},
-		CodexAuthHome: filepath.Join(t.TempDir(), "missing-auth-home"),
-	})
-	cwd := t.TempDir()
-	record := runtimeHygieneRecordForSpec(t, server, cwd, "local-ipc-private-tmp", protocol.TaskSpec{
-		Backend: "codex", CWD: cwd, Prompt: "runtime hygiene test", Write: true, LocalIPC: true,
-	})
-	runExecution(t, server, record)
-
-	if started.LocalIPCRoot == "" {
-		t.Fatal("local IPC job did not start its backend")
-	}
-	store, err := server.ensureJobStore()
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, err := store.Get(record.JobID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.State != protocol.PublicStateCompleted || got.Execution == nil {
-		t.Fatalf("terminal record = %+v, want completed with execution posture", got)
-	}
-	if got.Execution.LocalIPC != "private-dir" || got.Execution.Caches["TMPDIR"] != started.LocalIPCRoot || got.Execution.Caches["SCCACHE_SERVER_UDS"] != started.WriteEnvOverlay["SCCACHE_SERVER_UDS"] || got.Execution.Caches["SCCACHE_DIR"] != started.WriteEnvOverlay["SCCACHE_DIR"] {
-		t.Fatalf("execution posture = %+v, want private-dir and TMPDIR %q", got.Execution, started.LocalIPCRoot)
-	}
-	if _, err := os.Stat(started.LocalIPCRoot); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("private IPC directory after completion = %v, want removed", err)
-	}
-	if _, err := os.Stat(started.WriteEnvOverlay["SCCACHE_DIR"]); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("per-job sccache cache after completion = %v, want removed with the managed scratch", err)
-	}
-}
-
-func TestCodexReadOnlyTurnReceivesNoWriteSandboxCache(t *testing.T) {
-	var started engine.SessionOpts
-	backend := &executionFakeBackend{name: "codex"}
-	backend.start = func(_ context.Context, opts engine.SessionOpts) (engine.Session, error) {
-		started = opts
-		return claimedResultSession("read result"), nil
-	}
-	server := newTestServer(t, t.TempDir(), Config{
-		Backends:      []engine.Backend{backend},
-		CodexAuthHome: filepath.Join(t.TempDir(), "missing-auth-home"),
-	})
-	record := runtimeHygieneRecord(t, server, t.TempDir(), "read", false)
-	runExecution(t, server, record)
-
-	if started.WriteSandboxRoot != "" {
-		t.Fatalf("read-only WriteSandboxRoot = %q, want empty", started.WriteSandboxRoot)
-	}
-	if started.WriteEnvOverlay != nil {
-		t.Fatalf("read-only WriteEnvOverlay = %#v, want nil", started.WriteEnvOverlay)
 	}
 }
 
@@ -399,11 +152,8 @@ func TestManagedCodexHomeIsRemovedAfterCleanCompletion(t *testing.T) {
 	backend := &executionFakeBackend{name: "codex"}
 	backend.start = func(_ context.Context, opts engine.SessionOpts) (engine.Session, error) {
 		home = opts.EnvOverlay["CODEX_HOME"]
-		marker := filepath.Join(opts.WriteSandboxRoot, "cache", "npm", "cached-module")
+		marker := filepath.Join(home, "provider-state")
 		if err := os.WriteFile(marker, []byte("cached"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Chmod(filepath.Dir(marker), 0o555); err != nil {
 			t.Fatal(err)
 		}
 		return claimedResultSession("clean completion"), nil
@@ -429,7 +179,7 @@ func TestManagedCodexHomeIsRemovedAfterCleanCompletion(t *testing.T) {
 	if _, err := os.Stat(home); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("clean terminal managed home stat = %v, want removed", err)
 	}
-	resumeSpec := protocol.TaskSpec{Backend: "codex", ResumeJobID: record.JobID}
+	resumeSpec := protocol.TaskSpec{Intent: engine.IntentInspect, Backend: "codex", ResumeJobID: record.JobID}
 	const wantResumeReason = "completed jobs are not resumable unless submitted with session retention; submit a new job"
 	if err := validateResumeTarget(resumeSpec, got); err == nil || err.Error() != wantResumeReason {
 		t.Fatalf("resume completed job error = %v, want %q", err, wantResumeReason)
@@ -527,10 +277,7 @@ func TestManagedCodexHomeRetainedWhenCleanupUncertainAndResultSurvives(t *testin
 
 func TestManagedCodexHomeIdentityMismatchIsRetained(t *testing.T) {
 	server := newTestServer(t, t.TempDir(), Config{})
-	layout, err := engine.LayoutForWorkspace(server.stateRoot, t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	layout := engine.WorkspaceLayout{Root: server.stateRoot, Namespace: filepath.Join(server.stateRoot, "sessions"), Codex: filepath.Join(server.stateRoot, "sessions", "codex")}
 	home, err := createManagedCodexHome(layout, "job_identity")
 	if err != nil {
 		t.Fatal(err)
@@ -547,9 +294,9 @@ func TestManagedCodexHomeIdentityMismatchIsRetained(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cleanup, _ := finalizeManagedCodexHome(home, jobstore.Record{State: protocol.PublicStateCompleted}, protocol.CleanupClean, nil)
-	if cleanup != protocol.CleanupUncertain {
-		t.Fatalf("cleanup = %q, want %q", cleanup, protocol.CleanupUncertain)
+	cleanup, diagnostics := finalizeManagedCodexHome(home, jobstore.Record{State: protocol.PublicStateCompleted}, protocol.CleanupClean, nil)
+	if cleanup != protocol.CleanupClean || len(diagnostics) == 0 {
+		t.Fatalf("cleanup = %q diagnostics=%v, want clean with deletion diagnostic", cleanup, diagnostics)
 	}
 	if _, err := os.Stat(marker); err != nil {
 		t.Fatalf("replacement managed home marker stat = %v, want retained", err)
@@ -581,5 +328,30 @@ func TestPreSpawnFilesystemFailureStaysBackendError(t *testing.T) {
 	err := &os.PathError{Op: "open", Path: "/missing/job.stderr", Err: os.ErrNotExist}
 	if got := classifyExecutionFailure(err); got != protocol.FailureClassBackendError {
 		t.Fatalf("failure class = %q, want %q", got, protocol.FailureClassBackendError)
+	}
+}
+
+func intentFromWriteForTest(write bool) engine.Intent {
+	if write {
+		return engine.IntentEdit
+	}
+	return engine.IntentInspect
+}
+
+func TestCursorModelRejectionClassification(t *testing.T) {
+	tests := []struct {
+		message string
+		want    protocol.FailureClass
+	}{
+		{"Invalid model value: missing", protocol.FailureClassModelUnavailable},
+		{"Invalid params: Invalid model value: missing", protocol.FailureClassModelUnavailable},
+		{"Invalid params", protocol.FailureClassBackendError},
+		{"Invalid model value: missing; content policy violation", protocol.FailureClassContentPolicy},
+	}
+	for _, test := range tests {
+		err := &engine.ProviderFailureError{Evidence: engine.ProviderFailureEvidence{Code: "-32602", Message: test.message}, Cause: errors.New(test.message)}
+		if got := classifyExecutionFailure(err); got != test.want {
+			t.Errorf("%q: got %q, want %q", test.message, got, test.want)
+		}
 	}
 }

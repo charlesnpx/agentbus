@@ -8,6 +8,7 @@ import (
 // ProcessInfo is the observed identity of an operating-system process.
 type ProcessInfo struct {
 	PID       int
+	PGID      int
 	StartTime string
 }
 

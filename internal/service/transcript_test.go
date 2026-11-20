@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/internal/jobstore"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 )
@@ -128,8 +129,8 @@ func TestJobTranscriptReportsGapAndMissingSidecar(t *testing.T) {
 	item := transcriptTestItem(1, time.Date(2026, time.August, 20, 12, 0, 0, 0, time.UTC), "message")
 	normal := transcriptTestRecord(t, server, "gap-normal")
 	writeTranscriptSidecar(t, normal, []protocol.TranscriptItem{item}, false)
-	legacyStopped := transcriptTestRecord(t, server, "gap-present")
-	writeTranscriptSidecar(t, legacyStopped, []protocol.TranscriptItem{item}, true)
+	incomplete := transcriptTestRecord(t, server, "gap-present")
+	writeTranscriptSidecar(t, incomplete, []protocol.TranscriptItem{item}, true)
 	missing := transcriptTestRecord(t, server, "gap-missing")
 	neverStarted := transcriptTestRecord(t, server, "gap-never-started")
 	unopenable := transcriptTestRecord(t, server, "gap-unopenable")
@@ -171,6 +172,9 @@ func TestJobTranscriptReportsGapAndMissingSidecar(t *testing.T) {
 	decodeFailure := transcriptTestRecord(t, server, "gap-decode-failure")
 	writeTranscriptSidecar(t, decodeFailure, []protocol.TranscriptItem{item}, false)
 	appendBytes(decodeFailure, []byte(`{"ordinal":`))
+	invalidRecord := transcriptTestRecord(t, server, "gap-invalid-record")
+	writeTranscriptSidecar(t, invalidRecord, []protocol.TranscriptItem{item}, true)
+	appendBytes(invalidRecord, []byte("{\"unexpected\":true}\n{\"captureComplete\":true}\n"))
 
 	store, err := server.ensureJobStore()
 	if err != nil {
@@ -221,11 +225,12 @@ func TestJobTranscriptReportsGapAndMissingSidecar(t *testing.T) {
 		wantTerminal  bool
 	}{
 		{name: "clear", record: normal, wantGap: false, wantItemCount: 1, wantOrdinals: []int{1}},
-		{name: "legacy append-stopped", record: legacyStopped, wantGap: true, wantItemCount: 1, wantOrdinals: []int{1}},
+		{name: "missing completion receipt", record: incomplete, wantGap: true, wantItemCount: 1, wantOrdinals: []int{1}},
 		{name: "missing terminal", record: missing, wantGap: true, wantItemCount: 0, wantOrdinals: []int{}, wantTerminal: true},
 		{name: "missing terminal before starting", record: neverStarted, wantGap: false, wantItemCount: 0, wantOrdinals: []int{}, wantTerminal: true},
 		{name: "unopenable", record: unopenable, wantGap: true, wantItemCount: 0, wantOrdinals: []int{}},
 		{name: "decode failure keeps prefix", record: decodeFailure, params: protocol.JobTranscriptParams{Kinds: []string{"message"}}, wantGap: true, wantItemCount: 1, wantOrdinals: []int{1}, wantTerminal: true},
+		{name: "invalid record keeps prefix", record: invalidRecord, wantGap: true, wantItemCount: 1, wantOrdinals: []int{1}},
 	} {
 		test.params.JobID = test.record.JobID
 		result := transcriptResultForTest(t, server, test.params)
@@ -347,7 +352,7 @@ func transcriptTestRecord(t *testing.T, server *Server, requestID string) jobsto
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, err := json.Marshal(protocol.TaskSpec{Backend: "fake", CWD: t.TempDir(), Prompt: "transcript", Write: false})
+	raw, err := json.Marshal(protocol.TaskSpec{Backend: "fake", CWD: t.TempDir(), Prompt: "transcript", Intent: engine.IntentInspect})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -355,7 +360,7 @@ func transcriptTestRecord(t *testing.T, server *Server, requestID string) jobsto
 		jobstore.RequestKey{WorkspaceKey: "transcript-workspace", RequestID: requestID},
 		raw,
 		func(id string) (jobstore.Record, error) {
-			return jobstore.Record{JobID: id, Backend: "fake", CWD: t.TempDir(), Write: false}, nil
+			return jobstore.Record{JobID: id, Backend: "fake", CWD: t.TempDir(), Intent: engine.IntentInspect}, nil
 		},
 	)
 	if err != nil {
@@ -394,13 +399,11 @@ func writeTranscriptSidecar(t *testing.T, record jobstore.Record, items []protoc
 			t.Fatal(err)
 		}
 	}
-	control := transcriptItemCompleteLine
-	if gap {
-		control = transcriptItemStopLine
-	}
-	if _, err := file.Write(control); err != nil {
-		_ = file.Close()
-		t.Fatal(err)
+	if !gap {
+		if _, err := file.Write(transcriptItemCompleteLine); err != nil {
+			_ = file.Close()
+			t.Fatal(err)
+		}
 	}
 	if err := file.Close(); err != nil {
 		t.Fatal(err)

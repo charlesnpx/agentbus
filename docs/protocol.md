@@ -1,10 +1,10 @@
 # Agentbus wire protocol
 
-Agentbus protocol version 3 is a JSON-RPC 2.0 service over a local,
+Agentbus protocol version 4 is a JSON-RPC 2.0 service over a local,
 newline-delimited Unix socket. Each frame is one JSON object followed by a
-newline. The daemon accepts only protocol version 3.
+newline. The daemon accepts only protocol version 4.
 
-The wire surface has nine methods:
+The wire surface has ten methods:
 
 | Method | Purpose |
 | --- | --- |
@@ -17,6 +17,7 @@ The wire surface has nine methods:
 | job.cancel | Request cancellation of one job. |
 | artifacts.prune | Preview or remove eligible Agentbus-owned diagnostic artifacts. |
 | job.steer | Submit one bounded follow-up instruction to an active steerable job. |
+| session.discard | Revoke continuation for an inactive owned Codex conversation and remove its home. |
 
 A client must call protocol.hello successfully before any other method on the
 connection. A second hello on the same connection is invalid. Unknown methods
@@ -45,7 +46,7 @@ An error response has this shape:
     "data": {
       "code": "stable_error_code",
       "jobId": "optional job id",
-      "serverProtocolVersion": 3
+      "serverProtocolVersion": 4
     }
   }
 }
@@ -58,11 +59,13 @@ Agentbus errors. The stable data.code values are:
 | --- | --- |
 | unauthorized | Hello was omitted or its token was invalid. |
 | protocol_version_mismatch | The hello request used another major version. serverProtocolVersion identifies the server version. |
-| method_not_found | The requested method is not part of the version-3 surface. |
+| method_not_found | The requested method is not part of the version-4 surface. |
 | backend_unavailable | The daemon cannot use the requested backend or its job store. |
 | invalid_task_spec | Parameters, identity, task specification, or inline schema are invalid. |
 | queue_full | The new submission would exceed the daemon's bounded waiting queue. |
 | unknown_job | No job has the requested jobId. |
+| daemon_draining | The daemon has stopped admitting methods and is releasing its store. |
+| session_discard_refused | The conversation cannot be discarded; data.reason identifies why. |
 
 jobId is included when the error relates to a known or requested job. Clients
 should branch on data.code, not on message text.
@@ -71,17 +74,21 @@ should branch on data.code, not on message text.
 
 ~~~json
 {
-  "clientProtocolVersion": 3,
+  "clientProtocolVersion": 4,
+  "clientRelease": "0.18.0",
   "token": "state-root token"
 }
 ~~~
 
-The result confirms the version and reports configured backend names with any
-available model and effort metadata:
+A mismatch reports the client and server protocol versions, client and daemon
+releases, and daemon executable path when known. The result confirms the version
+and reports daemon identity and configured backend metadata:
 
 ~~~json
 {
-  "protocolVersion": 3,
+  "protocolVersion": 4,
+  "daemonRelease": "0.18.0",
+  "daemonExecutable": "/usr/local/bin/agentbus",
   "backends": [
     {
       "backend": "codex",
@@ -103,6 +110,9 @@ backend independently:
 
 ~~~json
 {
+  "protocolVersion": 4,
+  "daemonRelease": "0.18.0",
+  "daemonExecutable": "/usr/local/bin/agentbus",
   "backends": [
     {
       "backend": "codex",
@@ -138,131 +148,56 @@ execution slot, not when the job is submitted.
 
 ~~~json
 {
-  "workspaceKey": "string",
-  "requestId": "string",
+  "workspaceKey": "project",
+  "requestId": "request-1",
   "taskSpec": {
     "backend": "codex",
     "cwd": "/absolute/path",
-    "write": true,
-    "prompt": "string",
-    "inputMode": "steerable",
-    "localIPC": true,
-    "resumeJobId": "job_previous",
+    "intent": "inspect",
+    "prompt": "Review the change and report findings.",
+    "inputMode": "fixed",
     "retainSession": true,
-    "model": "string",
-    "effort": "string",
+    "model": "provider-model-id",
+    "effort": "high",
     "outputSchema": {},
     "tags": {"key": "value"},
-    "timeoutMs": 1800000
+    "timeoutMs": 7200000
   }
 }
 ~~~
 
-backend, cwd, write, and prompt are required task fields. inputMode, localIPC,
-verify, resumeJobId, retainSession, model, effort, outputSchema, tags, and
-timeoutMs are optional.
-inputMode accepts `fixed` or `steerable`. Omission means `fixed`; this value is
-stored with the immutable task specification and participates in identified
-replay hashing. Because it uses `omitempty`, omission preserves the existing
-hash for every prior request. A daemon that does not recognize the field
-rejects it as `invalid_task_spec` through strict unknown-field decoding, so no
-protocol major-version bump is needed. The field is independent of `write` and
-does not infer review intent from prompt text.
-`localIPC` is also immutable request data; omitting it preserves existing replay
-hashes. This optional request is supported for Codex write and verify jobs on
-macOS and Linux. Set it to true only for those jobs.
-On macOS, Unix sockets are limited to a short, private per-job IPC directory,
-and TCP loopback is shared with the host. The macOS profile grants no Docker
-socket access or outbound domains. On Linux, the profile allows connections to
-any host Unix socket at a path the job can read, except masked paths:
-`/run/user/<uid>`, `/run/docker.sock`, `/var/run/docker.sock`, the directory of
-`$SSH_AUTH_SOCK` (or the socket file when that directory is shared with a job
-writable path), and the Agentbus daemon socket and token file. Linux abstract
-sockets, host loopback TCP and external network connections remain blocked.
-Linux's Unix socket access is broader than macOS's private-directory access.
+`backend`, absolute `cwd`, nonempty `prompt`, and `intent` are required.
+Intent is `inspect` or `edit`. Both use the same host execution policy;
+`inspect` instructs the provider not to edit project source or configuration,
+but is not a filesystem, network, credential, or tool-permission boundary.
+Ordinary build/test artifacts, caches, temporary files, and local services are
+allowed. Optional fields are `inputMode` (`fixed` or
+`steerable`), `resumeJobId`, `retainSession`, `model`, `effort`, `timeoutMs`,
+`outputSchema`, and string-valued `tags`. Explicit null and unknown fields are
+invalid. Model and effort must be nonempty valid UTF-8 without control
+characters. Cursor model values must be exact provider-advertised ACP model IDs.
 
-The private IPC directory is used as `TMPDIR`. Local-IPC jobs set
-`SCCACHE_SERVER_UDS=<ipc>/sccache.sock` and
-`SCCACHE_DIR=<scratch>/cache/sccache`. Each sandboxed command starts its own
-sccache server, which exits with the command. The cache persists for the job.
-It is removed with the managed home when the job completes without
-`--retain-session`; failed, canceled and unknown jobs keep it with the
-resumable session until prune. Before launch, Agentbus checks the
-longest expected sccache startup socket path under the resolved IPC directory,
-`<resolved-ipc>/sccacheXXXXXX/sock`. If its byte length exceeds 107 bytes on
-Linux or 103 bytes on macOS, the job fails with
-`backend_unavailable`.
+Omitted `inputMode` means fixed. `timeoutMs` defaults to 7,200,000 ms, zero
+means unlimited, and positive values cannot exceed 14,400,000 ms. The deadline
+starts at execution-slot acquisition and includes a possible correction.
+`outputSchema` is an object or boolean JSON Schema Draft 2020-12 value.
 
-For Linux, Agentbus checks before launch that the Codex sandbox can bind a Unix
-socket with the job's profile. If the check fails, the job fails with
-`backend_unavailable` and a diagnostic beginning `local IPC is unsupported by
-the Codex sandbox on this host:`; there is no weaker fallback. Agentbus caches
-the result per Codex executable path and version. The IPC directory is removed
-on completion, cancellation, timeout and restart recovery. Agentbus does not
-run `sccache --stop-server`. Claude and Cursor requests are rejected. A resumed
-job follows its new TaskSpec value and does not inherit IPC permission from the
-target job.
-`verify` is immutable request data; omission preserves existing replay hashes.
-Set it to true only with `backend: "codex"` and `write: false`. The submitted
-`cwd` must be inside a Git work tree. Verify cannot use `resumeJobId` or retain
-a backend session. Claude and Cursor are rejected because their configured
-modes do not enforce a read-only boundary for a copy outside the submitted
-source. `localIPC` may be combined with Verify on both macOS and Linux.
+`workspaceKey` and `requestId` are nonempty UTF-8 tokens of at most 256 bytes
+without whitespace or controls. Agentbus canonicalizes the exact submitted
+TaskSpec and binds its hash to this pair. It resolves a matching binding before
+filesystem, backend, queue, and resume availability checks. A conflicting replay
+returns `invalid_task_spec` with the original `jobId` and changes nothing.
+Omitted and explicitly supplied defaults have different canonical requests.
 
-A Verify task spec has this shape:
-
-~~~json
-{
-  "backend": "codex",
-  "cwd": "/absolute/git/worktree",
-  "write": false,
-  "prompt": "run the project checks",
-  "verify": true
-}
-~~~
-
-Before launch, Agentbus copies tracked and untracked, non-ignored files from
-`cwd` into `<scratch>/src`, skipping tracked files deleted on disk. It preserves
-regular-file mode bits and recreates symlinks without following them. The copy
-has no `.git` metadata; the execution posture reports `gitMetadata: "none"`.
-Copies are limited to 2 GiB and 200,000 entries; exceeding either fixed bound
-fails before launch. Codex runs with `cwd` at the copy and an OS sandbox whose
-writable roots are the copy and managed scratch, plus the private IPC directory
-when requested. Network access is denied apart from requested local IPC. The
-submitted source is not a writable root. A disposable copy is workflow
-protection by itself, not an OS security boundary for a process running as the
-same user without a sandbox; Verify therefore refuses backends without the
-required Codex sandbox.
-The copy is removed with managed scratch when the job finishes.
-outputSchema is one inline Draft 2020-12 JSON Schema value: an object or a
-boolean. timeoutMs is a non-negative integer no greater than four hours; zero
-means no deadline.
-
-workspaceKey is an opaque, submitter-chosen namespace. Agentbus cannot derive
-another tool's workspaceKey, even when that tool submits work for the same
-directory.
-
-resumeJobId names a prior job, never a backend thread ID. For a new submission,
-the target must be terminal, use the same backend, and have a recorded backend
-session ID at turn retirement. A target without that ID returns
-`invalid_task_spec` with its jobId; Agentbus never falls back to a fresh thread.
-A completed target is resumable only when its original submission included
-`retainSession: true`. Failed, canceled, and unknown terminal jobs keep their
-backend session without session retention because their session homes are kept
-by the terminal-state retention rule. Eligibility still requires a recorded
-backend session ID; that ID is not exposed on the job record. The managed
-Codex session home for an eligible target remains in place and is never cleaned
-automatically. An operator may remove
-`<state-root>/workspaces/<workspace-hash>/codex/<job-id>` after no further
-resume is needed.
-
-A resume creates a new job with a new id, record, transcript sidecar, result,
-and fresh deadline. It replays the prior backend thread as history; it does not
-continue the old job or extend its deadline. Under the normal managed Codex
-configuration, the new job uses the retained CODEX_HOME at the root of the
-resume lineage so the backend can see that thread. Different resumeJobId values
-are different task specifications for identified replay, even when workspaceKey
-and requestId are the same.
+`resumeJobId` names a prior job with a recorded provider session. A resumed
+Codex job uses the root conversation home under
+`<state-root>/sessions/codex/<root-job-id>`; a missing or symlinked home is not
+recreated. Agentbus rejects a new continuation if any member of the lineage is
+queued, running, still locally active, or has uncertain cleanup. A completed
+target must have requested retention; an unsuccessful target may be resumed
+when its provider session ID is known and the lineage is clean. Matching replay
+is resolved before these availability checks. Embedded callers must serialize
+their own separate Session objects that share a conversation.
 
 The result always includes the resolved timeout:
 
@@ -270,6 +205,7 @@ The result always includes the resolved timeout:
 {
   "jobId": "string",
   "state": "queued",
+  "intent": "inspect",
   "deduplicated": false,
   "timeout": {
     "requested": 1800000,
@@ -377,7 +313,7 @@ reason, log paths, or process claims.
 Workspace filtering is scoping, not ownership. The local Unix socket has no
 stable authenticated caller identity, so Agentbus cannot enforce who owns a
 job. workspaceKey is an opaque, submitter-chosen namespace, and Agentbus
-cannot derive another tool's key. Therefore, status without --job sends no
+cannot derive another tool's key. Therefore, status without a job ID sends no
 workspace filter and lists every workspace; a caller that knows a key can use
 --workspace-key <key> to filter the list.
 
@@ -461,9 +397,8 @@ matching items, subject to limit. A missing sidecar returns a valid empty
 transcript with itemCount zero, seven zero counts, no timestamps, and items:
 []; gap is true when capture or reading could not establish continuity, so the
 returned prefix may be incomplete rather than a claim that the job emitted no
-more activity. A sidecar captured before completion receipts existed has no
-receipt and is therefore reported as a gapped prefix, because its completeness
-cannot be established.
+more activity. A sidecar without a completion receipt is reported as a gapped
+prefix because its completeness cannot be established.
 
 When Agentbus has deliberately removed a job's log sidecars, the result also
 includes `pruned: true` and an empty transcript. This distinguishes retention
@@ -484,13 +419,34 @@ Thresholds use Go duration syntax and default to `168h` for completed jobs and
 }
 ~~~
 
-The result contains `wouldRemove` and `wouldRemoveBytes` for a dry-run,
-`removed` and `removedBytes` after an apply pass, and `skipped` entries with a
-job ID, optional path, and reason. The method removes only clean terminal jobs'
-raw log sidecars and Agentbus-created Codex `cache`/`tmp` directories after the
-age threshold for their state. Retained sessions, resumable sessions, resume
-targets of non-terminal jobs, and all other unsafe or ineligible paths are
-skipped. Job records, request identity, and result artifacts are preserved.
+The result contains `wouldRemove` and `wouldRemoveBytes` for a dry run,
+`removed` and `removedBytes` for an apply pass, and `skipped` entries with a
+job ID and reason. The corresponding `wouldRemoveCount`, `removedCount`, and
+`skippedCount` cover the full pass. Each detail list is limited to 128 entries;
+`detailsTruncated` is true when entries were omitted. Diagnostic pruning
+preserves durable records, request bindings, results, and conversation homes.
+Retained sessions and uncertain process cleanup do not prevent pruning after
+local capture writers have retired. Automatic passes run after readiness and
+every 24 hours unless `serve --prune-interval 0` disables them.
+
+## session.discard
+
+`session.discard` takes `{"jobId":"string"}` naming any member of an owned
+Codex conversation. Under the same admission lock as resume, the daemon refuses
+an active or cleanup-uncertain lineage and commits one root
+`sessionDiscardedAt` timestamp before attempting home removal. A new resume
+then fails with `invalid_task_spec` and `data.reason: session_discarded`;
+matching request replay still returns the original job. Detailed records for
+all members project the root timestamp without modifying their history,
+results, terminal timestamps, or observed provider session IDs.
+
+The result is `{rootJobId, sessionDiscardedAt, homeRemoval}`, where
+`homeRemoval` is `removed`, `already_absent`, or `failed`; failures include a
+bounded `diagnostic` and can be retried without changing the timestamp. Unknown
+jobs return `unknown_job`. Other refusals use `session_discard_refused` and a
+`data.reason` of `unsupported_backend`, `invalid_lineage`, `active_lineage`, or
+`cleanup_uncertain`, with a blocking job ID when applicable. This operation
+never removes Claude or Cursor homes, source credentials, or normal tool caches.
 
 ## job.get
 
@@ -514,23 +470,10 @@ invalid_task_spec parameter error rather than a list request.
   "createdAt": "2026-08-20T12:00:00Z",
   "queuedAt": "2026-08-20T12:00:00Z",
   "startedAt": "2026-08-20T12:00:01Z",
-  "execution": {
-    "intent": "edit",
-    "sourceWritable": true,
-    "scratch": "/state-root/workspaces/key/codex/job_id",
-    "caches": {
-      "GOCACHE": "/state-root/workspaces/key/codex/job_id/cache/go-build",
-      "TMPDIR": "/var/folders/.../T/agentbus-ipc-ab12cd",
-      "GOMODCACHE": "/home/user/go/pkg/mod"
-    },
-    "shell": "sandboxed",
-    "network": "denied",
-    "localIPC": "private-dir",
-    "gitMetadata": "read-only",
-    "enforcement": "os-sandbox"
-  },
+  "intent": "inspect",
+  "selection": {"model": "provider-model-id", "effort": "high"},
   "timeout": {
-    "effective": 1800000,
+    "effective": 7200000,
     "source": "daemon_default"
   },
   "deadline": "2026-08-20T12:30:01Z",
@@ -566,41 +509,13 @@ limit; `running`/`limit` report the daemon-wide counts and limit. The field is
 omitted for running or terminal jobs, and for queued records that were
 recovered or are otherwise absent from this daemon's in-memory queue.
 
-jobId, workspaceKey, requestId, backend, inputMode, state, cleanup, createdAt,
-queuedAt, timeout, and steers are always present. Older stored jobs without
-inputMode project as `fixed`; steers is an empty array when there are no
-steering receipts. Each steer summary contains messageId, status, mechanism,
-and time; mechanism is empty unless delivery was confirmed. `execution` appears
-after the job starts and is recorded atomically with its starting transition.
-It contains intent (`inspect`, `verify`, or `edit`), the selected source write
-mode, optional scratch and cache paths, shell
-policy, local IPC, network policy, Git metadata access, and enforcement
-strength. Verify posture also includes `frozenCopy` (the absolute copy path) and
-`frozenSource`, an object with the captured Git `head` commit and `dirty` status.
-For Verify, `sourceWritable` is false, `gitMetadata` is `none`, and
-`enforcement` is `os-sandbox`. `localIPC` is `denied` for Codex jobs using the
-ordinary sandbox, `all-unix-sockets` for Linux Codex jobs using the local IPC
-profile, `private-dir` for macOS Codex jobs using that profile, and `unenforced`
-for trusted full-access Codex writes and Claude/Cursor. Linux's
-`all-unix-sockets` posture is not equivalent to macOS's `private-dir` posture.
-The `shell` field is
-`sandboxed` for Codex jobs using the OS sandbox, `restricted` for Claude
-read-only jobs (the adapter's allowed/denied shell tool lists), and
-`unenforced` for trusted full-access Codex writes, Claude write, and Cursor
-jobs. The posture is descriptive:
-`sourceWritable` reports the selected mode, while `enforcement` identifies
-whether the backend uses an OS sandbox, agent permissions, or no filesystem
-boundary. Verify turns do not get the sandbox's implicit `/tmp` and `TMPDIR`
-writable grants; managed scratch remains writable through its explicit root.
-Before a sandboxed Codex job, including every Verify job, launches
-app-server, Agentbus runs a bounded `codex sandbox -- true` check. A failure
-records `backend_unavailable` with the sandbox diagnostic and does not fall
-back to a weaker mode. For Codex
-edit jobs using the `workspaceWrite` sandbox,
-`gitMetadata` is `read-only` because the granted writable roots do not include
-the Git metadata directory. `logsPruned` is true after the daemon removes this
-job's raw log sidecars. diagnostics appears when the job has recorded
-operational diagnostics.
+The response includes immutable `intent`. `selection` is absent before the
+starting transition, `{}` when the provider chooses both values, and otherwise
+contains the model and/or effort chosen at that transition. Explicit task values
+match the corresponding selection members. Daemon defaults apply independently
+when task values are omitted. `modelReported` and `effortReported` are provider
+observations and never change this selection. `logsPruned` indicates removed raw
+log sidecars; diagnostics report operational problems.
 
 startedAt, finishedAt, deadline, remainingMs, tags, result, contract, failure,
 cancellationReason, logPaths, modelRequested, effortRequested, modelReported,
@@ -611,15 +526,16 @@ promise that the provider will accept the resume. Eligibility requires a
 recorded backend session ID, which is not exposed on the job record. The
 human-readable `reason` explains which retention rule applied; clients should
 not depend on its exact wording. deadline and remainingMs are present for a
-running job with a finite effective timeout. deadline is derived from startedAt
-plus timeout.effective; remainingMs is the current time left, clamped at zero.
+running job with a finite effective timeout. The deadline is measured from
+execution-slot acquisition; remainingMs is the current time left, clamped at
+zero.
 
 modelRequested and effortRequested preserve only values in the submitted
 TaskSpec, so they may be absent when a configured daemon default was applied.
 `requested is not executed`: these fields record intent, while modelReported
 and effortReported record the latest values observed in provider telemetry.
-modelReported retains its name for compatibility and now means latest
-observation; observed values are never filled from requested values.
+`modelReported` is the latest applicable observation; observed values are never
+filled from requested values.
 
 result exists only for a completed job with an authoritative result. Its
 resultPath, sha256, and bytes are required; text may be omitted when the result
@@ -671,7 +587,7 @@ The result reports the durable public state after the cancellation request:
 
 If the job is already terminal, cancellation returns that existing state. A
 race with completion also returns the first terminal state recorded by the
-daemon. Read job.get or `agentbus status --job <id>` for the persisted
+daemon. Read job.get or `agentbus status <job-id>` for the persisted
 cancellationReason.
 
 ## job.steer
@@ -720,14 +636,16 @@ return `backend_unsupported`.
 restart, an admitted steer without a recorded outcome becomes
 `unknown`/`delivery_unconfirmed`; it is never sent again automatically.
 Deduplication is client-request identity, not provider exactly-once delivery.
-For a steerable job with a finite effective timeout, a session that supports
-steering receives one daemon warning steer when 90% of the timeout has elapsed
+For a fixed or steerable job with a finite effective timeout, a session that supports
+steering may receive one daemon warning steer when 90% of the timeout has elapsed
 since slot acquisition. It uses the reserved message ID
 `agentbus-deadline-warning` and appears in the job's `steers` records like any
 other steer. Client requests that could collide with this reserved ID are
-rejected with invalid params. No warning is recorded for fixed-mode jobs, jobs
-without a timeout, or sessions without steering support. If 90% has elapsed
-before the provider turn becomes active, the warning is not sent.
+rejected with invalid params in either mode. No warning is sent for unlimited
+jobs, sessions without steering support, or during correction or retirement.
+If initialization crosses the threshold and time remains when the initial turn
+accepts control, the warning is sent immediately. Delivery is best effort and
+does not change the deadline or add review evidence.
 The daemon does not promise simultaneous interruption across backends, provider
 compliance with the new instruction, a stable provider turn ID across an
 interrupt-and-continue, rollback of already-started tools, a fresh-session
@@ -800,6 +718,8 @@ reasons.
 
 A task has zero or one inline JSON Schema. Agentbus evaluates the final result
 against it. If the first result is noncompliant, Agentbus may make one
-read-only correction attempt with its own fixed prompt. A successful correction
+read-only correction attempt with its own fixed prompt, only after capture has
+closed, the process claim is durable, cleanup is clean, and the original
+deadline still permits execution. A successful compliant correction
 becomes the result. A failed correction preserves the original completed result
 and records a noncompliant contract verdict.

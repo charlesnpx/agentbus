@@ -53,8 +53,7 @@ func readTranscriptItems(t *testing.T, record jobstore.Record) []TranscriptItem 
 		if err != nil {
 			t.Fatal(err)
 		}
-		if bytes.Equal(line, transcriptItemStopLine[:len(transcriptItemStopLine)-1]) ||
-			bytes.Equal(line, transcriptItemCompleteLine[:len(transcriptItemCompleteLine)-1]) {
+		if bytes.Equal(line, transcriptItemCompleteLine[:len(transcriptItemCompleteLine)-1]) {
 			continue
 		}
 		var item TranscriptItem
@@ -294,9 +293,6 @@ func TestItemSidecarWriterStopsAtSmallFileCap(t *testing.T) {
 	}
 	if int64(len(contents)) > fileCap {
 		t.Fatalf("sidecar size = %d, want at most %d", len(contents), fileCap)
-	}
-	if bytes.Contains(contents, transcriptItemStopLine) {
-		t.Fatalf("sidecar = %q, want no append-stopped marker", contents)
 	}
 	if bytes.Contains(contents, transcriptItemCompleteLine) {
 		t.Fatalf("sidecar = %q, want no completion receipt after the cap", contents)
@@ -755,8 +751,8 @@ func TestCanceledTranscriptReportsGapWhenSidecarSyncFailsAfterTerminal(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bytes.Contains(sidecar, transcriptItemStopLine) || bytes.Contains(sidecar, transcriptItemCompleteLine) {
-		t.Fatalf("sidecar = %q, want no terminal control record for the sync failure", sidecar)
+	if bytes.Contains(sidecar, transcriptItemCompleteLine) {
+		t.Fatalf("sidecar = %q, want no completion receipt for the sync failure", sidecar)
 	}
 
 	result := transcriptResultForTest(t, server, protocol.JobTranscriptParams{JobID: record.JobID})

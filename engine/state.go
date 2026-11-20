@@ -9,10 +9,13 @@ import (
 )
 
 // ResolveStateRoot returns the agentbus state root using the protocol-defined
-// XDG fallback: $XDG_STATE_HOME/agentbus or ~/.local/state/agentbus.
+// XDG fallback: $XDG_STATE_HOME/agentbus/v2 or ~/.local/state/agentbus/v2.
 func ResolveStateRoot() (string, error) {
+	if root := os.Getenv("AGENTBUS_STATE_ROOT"); root != "" {
+		return root, nil
+	}
 	if xdg := os.Getenv("XDG_STATE_HOME"); xdg != "" {
-		return filepath.Join(xdg, "agentbus"), nil
+		return filepath.Join(xdg, "agentbus", "v2"), nil
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -21,7 +24,7 @@ func ResolveStateRoot() (string, error) {
 	if home == "" {
 		return "", errors.New("home directory is empty")
 	}
-	return filepath.Join(home, ".local", "state", "agentbus"), nil
+	return filepath.Join(home, ".local", "state", "agentbus", "v2"), nil
 }
 
 // CanonicalWorkspace returns an absolute workspace path with symlinks resolved.
@@ -39,40 +42,11 @@ func WorkspaceKey(canonicalCWD string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// WorkspaceLayout contains protocol state paths for one workspace namespace.
+// WorkspaceLayout names the directories used by artifact and owned-home helpers.
 type WorkspaceLayout struct {
 	Root      string
-	Workspace string
-	Key       string
 	Namespace string
-	Jobs      string
 	Logs      string
 	Results   string
-	Inputs    string
-	// Codex contains per-job managed homes and execution caches. It is created
-	// only for workspaces that need per-job backend state.
-	Codex      string
-	Quarantine string
-}
-
-// LayoutForWorkspace resolves and describes the state layout for cwd.
-func LayoutForWorkspace(root, cwd string) (WorkspaceLayout, error) {
-	canon, err := CanonicalWorkspace(cwd)
-	if err != nil {
-		return WorkspaceLayout{}, err
-	}
-	key := WorkspaceKey(canon)
-	ns := filepath.Join(root, "workspaces", key)
-	return WorkspaceLayout{
-		Root:       root,
-		Workspace:  canon,
-		Key:        key,
-		Namespace:  ns,
-		Jobs:       filepath.Join(ns, "jobs"),
-		Logs:       filepath.Join(ns, "logs"),
-		Results:    filepath.Join(ns, "results"),
-		Inputs:     filepath.Join(ns, "inputs"),
-		Codex:      filepath.Join(ns, "codex"),
-		Quarantine: filepath.Join(ns, "quarantine"),
-	}, nil
+	Codex     string
 }

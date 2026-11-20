@@ -22,34 +22,6 @@ import (
 	"github.com/charlesnpx/agentbus/engine/command"
 )
 
-func TestCapEventKeepsRawTextOutOfJSONMetadata(t *testing.T) {
-	raw := strings.Repeat("a", engine.DefaultEventTextCap) + "SECRET_RAW_TAIL"
-	ev := capEvent(engine.Event{
-		Type: engine.EventAgentText,
-		Text: raw,
-		Metadata: map[string]any{
-			"agentbusRawText": raw,
-			"text":            raw,
-			"nested": map[string]any{
-				"content": raw,
-			},
-		},
-	})
-	if ev.RawText != raw {
-		t.Fatal("raw text was not preserved in the non-JSON field")
-	}
-	if !ev.Truncated || strings.Contains(ev.Text, "SECRET_RAW_TAIL") {
-		t.Fatalf("event text was not capped: truncated=%v len=%d", ev.Truncated, len(ev.Text))
-	}
-	wire, err := json.Marshal(ev)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(wire), "agentbusRawText") || strings.Contains(string(wire), "SECRET_RAW_TAIL") {
-		t.Fatalf("wire event leaked raw text metadata: %s", wire)
-	}
-}
-
 func TestTurnFinalPayloadDoesNotChangeEventJSON(t *testing.T) {
 	event := engine.Event{
 		Type: engine.EventTurnFinal,
@@ -70,25 +42,19 @@ func TestSessionTurnSurfacesMalformedStreamAsTerminalError(t *testing.T) {
 	fake := fakeTerminalErrorCLI(t)
 	backend := &Backend{
 		NameValue: "fake",
-		Binary:    fake,
-		BuildArgs: func(string, engine.SessionOpts, engine.TurnInput) ([]string, error) {
-			return []string{"malformed"}, nil
-		},
-		Parse: func(map[string]any) ([]engine.Event, string, error) {
-			return nil, "", nil
-		},
+		Driver:    duplex.FixtureDriver{Spec: command.ExecSpec{Argv: []string{fake, "malformed"}}},
 	}
 	session, err := backend.Start(context.Background(), engine.SessionOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "go"})
+	events, err := session.Turn(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "go"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	got := collectEvents(events)
 	got = withoutTurnFinal(got)
-	if len(got) == 0 || got[len(got)-1].Type != engine.EventTerminalError || !strings.Contains(got[len(got)-1].Text, "malformed backend stream") {
+	if len(got) == 0 || got[len(got)-1].Type != engine.EventTerminalError || !strings.Contains(got[len(got)-1].Text, "malformed duplex stdout") {
 		t.Fatalf("events = %#v, want terminal malformed-stream error", got)
 	}
 }
@@ -97,23 +63,21 @@ func TestSessionTurnSurfacesNonzeroExitAsTerminalError(t *testing.T) {
 	fake := fakeTerminalErrorCLI(t)
 	backend := &Backend{
 		NameValue: "fake",
-		Binary:    fake,
-		BuildArgs: func(string, engine.SessionOpts, engine.TurnInput) ([]string, error) {
-			return []string{"fail"}, nil
-		},
-		Parse: func(map[string]any) ([]engine.Event, string, error) {
-			return nil, "", nil
-		},
+		Driver:    duplex.FixtureDriver{Spec: command.ExecSpec{Argv: []string{fake, "fail"}}},
 	}
 	session, err := backend.Start(context.Background(), engine.SessionOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "go"})
+	// Exceed the pipe capacity so the child must close stdin before the write completes.
+	events, err := session.Turn(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: strings.Repeat("go", 1<<19)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	got := collectEvents(events)
+	if len(got) == 0 || got[len(got)-1].Type != engine.EventTurnFinal || got[len(got)-1].TurnFinal == nil || !got[len(got)-1].TurnFinal.ReturnCodeKnown || got[len(got)-1].TurnFinal.ReturnCode != 7 {
+		t.Fatalf("events = %#v, want final observation with exit status 7", got)
+	}
 	got = withoutTurnFinal(got)
 	if len(got) == 0 || got[len(got)-1].Type != engine.EventTerminalError || !strings.Contains(got[len(got)-1].Text, "backend exploded") {
 		t.Fatalf("events = %#v, want terminal nonzero-exit error", got)
@@ -124,25 +88,19 @@ func TestSessionTurnPreservesLargeStderrTail(t *testing.T) {
 	fake := fakeTerminalErrorCLI(t)
 	backend := &Backend{
 		NameValue: "fake",
-		Binary:    fake,
-		BuildArgs: func(string, engine.SessionOpts, engine.TurnInput) ([]string, error) {
-			return []string{"large-stderr"}, nil
-		},
-		Parse: func(map[string]any) ([]engine.Event, string, error) {
-			return nil, "", nil
-		},
+		Driver:    duplex.FixtureDriver{Spec: command.ExecSpec{Argv: []string{fake, "large-stderr"}}},
 	}
 	session, err := backend.Start(context.Background(), engine.SessionOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
 	defer cancel()
-	events, err := session.Turn(ctx, engine.TurnInput{Prompt: "go"})
+	events, err := session.Turn(ctx, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "go"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := collectEventsWithTimeout(t, events, 3*time.Second)
+	got := collectEventsWithTimeout(t, events, 7*time.Second)
 	got = withoutTurnFinal(got)
 	if ctx.Err() != nil {
 		t.Fatalf("turn context ended unexpectedly: %v", ctx.Err())
@@ -156,25 +114,19 @@ func TestSessionTurnInheritedStderrDoesNotHang(t *testing.T) {
 	fake := fakeTerminalErrorCLI(t)
 	backend := &Backend{
 		NameValue: "fake",
-		Binary:    fake,
-		BuildArgs: func(string, engine.SessionOpts, engine.TurnInput) ([]string, error) {
-			return []string{"inherited-stderr"}, nil
-		},
-		Parse: func(map[string]any) ([]engine.Event, string, error) {
-			return []engine.Event{{Type: engine.EventAgentText, Text: "ok"}}, "", nil
-		},
+		Driver:    duplex.FixtureDriver{Spec: command.ExecSpec{Argv: []string{fake, "inherited-stderr"}}},
 	}
 	session, err := backend.Start(context.Background(), engine.SessionOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
 	defer cancel()
-	events, err := session.Turn(ctx, engine.TurnInput{Prompt: "go"})
+	events, err := session.Turn(ctx, engine.TurnInput{Intent: engine.IntentInspect, Prompt: "go"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := collectEventsWithTimeout(t, events, 3*time.Second)
+	got := collectEventsWithTimeout(t, events, 7*time.Second)
 	if ctx.Err() != nil {
 		t.Fatalf("turn context ended unexpectedly: %v", ctx.Err())
 	}
@@ -221,24 +173,24 @@ func TestBackendMetadataListsHelloAcceptedValuesInStableOrder(t *testing.T) {
 	}
 }
 
+func TestBackendRequiresDriver(t *testing.T) {
+	backend := &Backend{NameValue: "fake"}
+	if _, err := backend.Start(context.Background(), engine.SessionOpts{}); err == nil || err.Error() != "duplex driver is required" {
+		t.Fatalf("Start error = %v, want missing driver error", err)
+	}
+	if _, err := backend.Resume(context.Background(), "resume-id", engine.SessionOpts{}); err == nil || err.Error() != "duplex driver is required" {
+		t.Fatalf("Resume error = %v, want missing driver error", err)
+	}
+}
+
 func TestSessionTurnTimeoutKillsDescendantHoldingStdout(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("process group signal assertions are unix-only")
 	}
-	const script = `sleep 30 & printf '%s\n' '{"event":"ready","text":"READY"}'; exit 0`
+	const script = `IFS= read -r prompt; sleep 30 & printf '%s\n' '{"type":"message","text":"READY"}'; exit 0`
 	backend := &Backend{
 		NameValue: "sh",
-		Binary:    "/bin/sh",
-		BuildArgs: func(string, engine.SessionOpts, engine.TurnInput) ([]string, error) {
-			return []string{"-c", script}, nil
-		},
-		Parse: func(obj map[string]any) ([]engine.Event, string, error) {
-			if obj["event"] != "ready" {
-				return nil, "", nil
-			}
-			text, _ := obj["text"].(string)
-			return []engine.Event{{Type: engine.EventAgentText, Text: text}}, "", nil
-		},
+		Driver:    duplex.FixtureDriver{Spec: command.ExecSpec{Argv: []string{"/bin/sh", "-c", script}}},
 	}
 	session, err := backend.Start(context.Background(), engine.SessionOpts{})
 	if err != nil {
@@ -248,7 +200,7 @@ func TestSessionTurnTimeoutKillsDescendantHoldingStdout(t *testing.T) {
 	defer cancel()
 	var processGroup int
 	started := time.Now()
-	events, err := session.Turn(ctx, engine.TurnInput{
+	events, err := session.Turn(ctx, engine.TurnInput{Intent: engine.IntentInspect,
 		Prompt: "go",
 		OnProcessStart: func(ref engine.ProcessRef, _ int) {
 			processGroup = ref.PGID
@@ -293,96 +245,35 @@ func TestSessionTurnTimeoutKillsDescendantHoldingStdout(t *testing.T) {
 func TestSessionTurnUsesCommandRunnerExecSpec(t *testing.T) {
 	runner := &fakeCommandRunner{}
 	marker := filepath.Join(t.TempDir(), "direct-exec-marker")
+	binary := markerCLI(t, marker)
+	cwd := t.TempDir()
 	backend := &Backend{
 		NameValue: "fake",
-		Binary:    markerCLI(t, marker),
-		BuildArgs: func(string, engine.SessionOpts, engine.TurnInput) ([]string, error) {
-			return []string{"run", "--json"}, nil
-		},
-		Parse: func(map[string]any) ([]engine.Event, string, error) {
-			return []engine.Event{{Type: engine.EventAgentText, Text: "ok"}}, "stream-session", nil
-		},
+		Driver:    duplex.FixtureDriver{Spec: command.ExecSpec{Argv: []string{binary, "run", "--json"}, Dir: cwd}},
 	}
-	cwd := t.TempDir()
 	session, err := backend.Start(context.Background(), engine.SessionOpts{CWD: cwd})
 	if err != nil {
 		t.Fatal(err)
 	}
-	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "hello"}, runner)
+	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
 	got := collectEvents(events)
 	got = withoutTurnFinal(got)
-	if len(got) != 1 || got[0].Type != engine.EventAgentText || got[0].Text != "ok" {
-		t.Fatalf("events = %#v, want parsed adapter event", got)
+	if len(got) != 2 || got[0].Type != engine.EventAgentText || got[0].Text != "ok" || got[1].Type != engine.EventResultMessage {
+		t.Fatalf("events = %#v, want agent and result events", got)
 	}
 	if session.ID() != "stream-session" {
 		t.Fatalf("session id = %q, want stream-session", session.ID())
 	}
-	if strings.Join(runner.spec.Argv, "\x00") != strings.Join([]string{backend.Binary, "run", "--json"}, "\x00") {
+	if strings.Join(runner.spec.Argv, "\x00") != strings.Join([]string{binary, "run", "--json"}, "\x00") {
 		t.Fatalf("argv = %#v", runner.spec.Argv)
 	}
 	if runner.spec.Dir != cwd {
 		t.Fatalf("dir = %q, want %q", runner.spec.Dir, cwd)
 	}
 	assertFileMissing(t, marker)
-}
-
-func TestOneShotBackendRunsThroughDuplexRuntime(t *testing.T) {
-	stdin := &recordingWriteCloser{}
-	runner := &fakeCommandRunner{
-		stdin:  stdin,
-		stdout: io.NopCloser(strings.NewReader(`{"event":"agent","text":"from stdout"}` + "\n" + `{"event":"result"}` + "\n")),
-	}
-	backend := &Backend{
-		NameValue: "fake",
-		Binary:    "fake-bin",
-		BuildArgs: func(string, engine.SessionOpts, engine.TurnInput) ([]string, error) {
-			return []string{"run", "--json"}, nil
-		},
-		Parse: func(obj map[string]any) ([]engine.Event, string, error) {
-			switch obj["event"] {
-			case "agent":
-				text, _ := obj["text"].(string)
-				return []engine.Event{{Type: engine.EventAgentText, Text: text}}, "stream-session", nil
-			case "result":
-				return []engine.Event{{Type: engine.EventResultMessage}}, "", nil
-			default:
-				return nil, "", nil
-			}
-		},
-	}
-	session, err := backend.Start(context.Background(), engine.SessionOpts{})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "hello prompt"}, runner)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := collectEventsWithTimeout(t, events, 2*time.Second)
-	got = withoutTurnFinal(got)
-	if len(got) != 2 {
-		t.Fatalf("events = %#v, want agent text and result", got)
-	}
-	if got[0].Type != engine.EventAgentText || got[0].Text != "from stdout" {
-		t.Fatalf("first event = %#v, want parsed agent text", got[0])
-	}
-	if got[1].Type != engine.EventResultMessage || got[1].Text != "from stdout" {
-		t.Fatalf("second event = %#v, want backfilled result message", got[1])
-	}
-	if session.ID() != "stream-session" {
-		t.Fatalf("session id = %q, want stream-session", session.ID())
-	}
-	written, closed := stdin.snapshot()
-	if written != "hello prompt" || !closed {
-		t.Fatalf("stdin = %q closed=%v, want prompt write and close", written, closed)
-	}
-	if strings.Join(runner.spec.Argv, "\x00") != strings.Join([]string{"fake-bin", "run", "--json"}, "\x00") {
-		t.Fatalf("argv = %#v", runner.spec.Argv)
-	}
 }
 
 func TestBackendWithDriverRunsDuplexTurn(t *testing.T) {
@@ -404,20 +295,20 @@ func TestBackendWithDriverRunsDuplexTurn(t *testing.T) {
 		t.Fatal("session does not implement TurnWithRunner")
 	}
 
-	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "hello"}, runner)
+	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
 	got := collectEventsWithTimeout(t, events, 2*time.Second)
 	got = withoutTurnFinal(got)
-	if len(got) != 2 || got[0].Type != engine.EventAgentText || got[0].Text != "duplex:hello" || got[1].Type != engine.EventResultMessage {
+	if len(got) != 2 || got[0].Type != engine.EventAgentText || !strings.HasSuffix(got[0].Text, "\n\nhello") || got[1].Type != engine.EventResultMessage {
 		t.Fatalf("events = %#v, want duplex agent text and result", got)
 	}
 	if session.ID() != "resume-1" {
 		t.Fatalf("session id = %q, want resume-1", session.ID())
 	}
 	spec := runner.lastSpec()
-	if strings.Join(spec.Argv, "\x00") != strings.Join([]string{"duplex-fake", "hello"}, "\x00") {
+	if len(spec.Argv) != 2 || spec.Argv[0] != "duplex-fake" || !strings.HasSuffix(spec.Argv[1], "\n\nhello") || strings.Count(spec.Argv[1], "Inspect the task and report your findings.") != 1 {
 		t.Fatalf("argv = %#v", spec.Argv)
 	}
 	if spec.Dir != "/tmp/work" {
@@ -434,12 +325,12 @@ func TestBackendWithDriverThreadsResumeIDAcrossTurns(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "first"}, runner)
+	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "first"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = collectEventsWithTimeout(t, events, 2*time.Second)
-	events, err = session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "second"}, runner)
+	events, err = session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "second"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -466,12 +357,12 @@ func TestBackendWithDriverInterruptForwardsToActiveDuplexTurn(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "hello"}, runner)
+	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
 	first := receiveEventWithTimeout(t, events, 2*time.Second)
-	if first.Type != engine.EventAgentText || first.Text != "duplex:hello" {
+	if first.Type != engine.EventAgentText || !strings.HasSuffix(first.Text, "\n\nhello") {
 		t.Fatalf("first event = %#v, want duplex start event", first)
 	}
 	if err := session.Interrupt(context.Background()); err != nil {
@@ -498,12 +389,12 @@ func TestBackendWithDriverNativeInterruptReportsSettlement(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "hello"}, runner)
+	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
 	first := receiveEventWithTimeout(t, events, 2*time.Second)
-	if first.Type != engine.EventAgentText || first.Text != "duplex:hello" {
+	if first.Type != engine.EventAgentText || !strings.HasSuffix(first.Text, "\n\nhello") {
 		t.Fatalf("first event = %#v, want duplex start event", first)
 	}
 	settled, err := session.(*Session).NativeInterrupt(context.Background())
@@ -531,15 +422,15 @@ func TestBackendWithDriverRejectsConcurrentTurn(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "first"}, runner)
+	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "first"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
 	first := receiveEventWithTimeout(t, events, 2*time.Second)
-	if first.Type != engine.EventAgentText || first.Text != "duplex:first" {
+	if first.Type != engine.EventAgentText || !strings.HasSuffix(first.Text, "\n\nfirst") {
 		t.Fatalf("first event = %#v, want duplex start event", first)
 	}
-	_, err = session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "second"}, runner)
+	_, err = session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "second"}, runner)
 	if err == nil || err.Error() != "session_busy" {
 		t.Fatalf("concurrent turn error = %v, want session_busy", err)
 	}
@@ -551,35 +442,42 @@ func TestBackendWithDriverRejectsConcurrentTurn(t *testing.T) {
 	}
 }
 
-func TestSessionTurnSurfacesOutputTruncationAsTerminalError(t *testing.T) {
+var errSyntheticReadFailure = errors.New("synthetic read failure")
+
+func TestSessionTurnSurfacesReadFailureAsTerminalError(t *testing.T) {
+	release := make(chan struct{})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
 	runner := &fakeCommandRunner{
 		stdout: &errorAfterReader{
-			reader: strings.NewReader(`{"event":"ok"}` + "\n"),
-			err:    command.ErrOutputTruncated,
+			reader:  strings.NewReader(`{"type":"message","text":"ok"}` + "\n"),
+			err:     errSyntheticReadFailure,
+			release: release,
 		},
 	}
 	backend := &Backend{
 		NameValue: "fake",
-		Binary:    "/bin/fake",
-		BuildArgs: func(string, engine.SessionOpts, engine.TurnInput) ([]string, error) {
-			return []string{"run"}, nil
-		},
-		Parse: func(map[string]any) ([]engine.Event, string, error) {
-			return []engine.Event{{Type: engine.EventAgentText, Text: "ok"}}, "", nil
-		},
+		Driver:    duplex.FixtureDriver{Spec: command.ExecSpec{Argv: []string{"/bin/fake", "run"}}},
 	}
 	session, err := backend.Start(context.Background(), engine.SessionOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "hello"}, runner)
+	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Intent: engine.IntentInspect, Prompt: "hello"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := collectEvents(events)
+	first := receiveEventWithTimeout(t, events, 2*time.Second)
+	close(release)
+	got := append([]engine.Event{first}, collectEvents(events)...)
 	got = withoutTurnFinal(got)
-	if len(got) != 2 || got[0].Type != engine.EventAgentText || got[1].Type != engine.EventTerminalError || !strings.Contains(got[1].Text, command.ErrOutputTruncated.Error()) {
-		t.Fatalf("events = %#v, want parsed event followed by truncation terminal error", got)
+	if len(got) != 2 || got[0].Type != engine.EventAgentText || got[1].Type != engine.EventTerminalError || !strings.Contains(got[1].Text, "incomplete backend transport") || !errors.Is(got[1].Err, errSyntheticReadFailure) {
+		t.Fatalf("events = %#v, want parsed event followed by read failure terminal error", got)
 	}
 }
 
@@ -588,9 +486,10 @@ func fakeTerminalErrorCLI(t *testing.T) string {
 	path := filepath.Join(t.TempDir(), "fakecli")
 	script := `#!/bin/sh
 case "$1" in
-  malformed) printf 'not-json\n'; exit 0 ;;
+  malformed) IFS= read -r prompt; printf 'not-json\n'; exit 0 ;;
   fail) printf 'backend exploded\n' >&2; exit 7 ;;
   large-stderr)
+    IFS= read -r prompt
     i=0
     while [ "$i" -lt 4096 ]; do
       printf '0123456789abcdef0123456789abcdef\n' >&2
@@ -600,8 +499,10 @@ case "$1" in
     exit 9
     ;;
   inherited-stderr)
+    IFS= read -r prompt
     (sleep 5 >/dev/null &)
-    printf '{"event":"ok"}\n'
+    printf '{"type":"message","text":"ok"}\n'
+    printf '{"type":"complete"}\n'
     exit 0
     ;;
 esac
@@ -615,15 +516,11 @@ exit 0
 
 func markerBackendForLifecycleTest(t *testing.T, marker string) *Backend {
 	t.Helper()
+	binary := markerCLI(t, marker)
 	return &Backend{
 		NameValue: "fake",
-		Binary:    markerCLI(t, marker),
-		BuildArgs: func(string, engine.SessionOpts, engine.TurnInput) ([]string, error) {
-			return []string{"run"}, nil
-		},
-		Parse: func(map[string]any) ([]engine.Event, string, error) {
-			return []engine.Event{{Type: engine.EventAgentText, Text: "ok"}}, "", nil
-		},
+		Binary:    binary,
+		Driver:    duplex.FixtureDriver{Spec: command.ExecSpec{Argv: []string{binary, "run"}}},
 	}
 }
 
@@ -705,7 +602,6 @@ func receiveEventWithTimeout(t *testing.T, ch <-chan engine.Event, timeout time.
 
 type fakeCommandRunner struct {
 	spec   command.ExecSpec
-	stdin  io.WriteCloser
 	stdout io.ReadCloser
 }
 
@@ -713,42 +609,13 @@ func (r *fakeCommandRunner) Start(_ context.Context, spec command.ExecSpec) (com
 	r.spec = spec
 	stdout := r.stdout
 	if stdout == nil {
-		stdout = io.NopCloser(strings.NewReader(`{"event":"ok"}` + "\n"))
-	}
-	stdin := r.stdin
-	if stdin == nil {
-		stdin = discardWriteCloser{}
+		stdout = io.NopCloser(strings.NewReader(`{"type":"message","text":"ok"}` + "\n" + `{"type":"complete","resumeId":"stream-session"}` + "\n"))
 	}
 	return &fakeRunningCommand{
-		stdin:  stdin,
+		stdin:  discardWriteCloser{},
 		stdout: stdout,
 		stderr: io.NopCloser(strings.NewReader("")),
 	}, nil
-}
-
-type recordingWriteCloser struct {
-	mu     sync.Mutex
-	buf    strings.Builder
-	closed bool
-}
-
-func (w *recordingWriteCloser) Write(p []byte) (int, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.buf.Write(p)
-}
-
-func (w *recordingWriteCloser) Close() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.closed = true
-	return nil
-}
-
-func (w *recordingWriteCloser) snapshot() (string, bool) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.buf.String(), w.closed
 }
 
 type fakeRunningCommand struct {
@@ -788,13 +655,15 @@ func (discardWriteCloser) Close() error {
 }
 
 type errorAfterReader struct {
-	reader io.Reader
-	err    error
+	reader  io.Reader
+	err     error
+	release <-chan struct{}
 }
 
 func (r *errorAfterReader) Read(p []byte) (int, error) {
 	n, err := r.reader.Read(p)
 	if err == io.EOF {
+		<-r.release
 		return 0, r.err
 	}
 	return n, err

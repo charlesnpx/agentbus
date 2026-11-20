@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -215,6 +216,10 @@ func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
 			}
 			return requestOutcome{result: protocol.JobCancelResult{JobID: current.JobID, State: projectedState(current)}}
 		}
+		run.mu.Lock()
+		cancelFinalized := run.cancelFinalized
+		run.mu.Unlock()
+		defer close(cancelFinalized)
 		defer s.finishSteering(store, run)
 	}
 	cleanup, diagnostics := s.cancelActiveOrRecordedProcess(store, record)
@@ -233,7 +238,6 @@ func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
 		diagnostics = append(diagnostics, run.itemSidecarDiagnostics()...)
 	}
 	diagnostics = appendRecordDiagnostics(record.Diagnostics, diagnostics)
-	cleanup, diagnostics = s.cleanupVerifyFrozenCopyForRecord(record, cleanup, diagnostics)
 	terminal, err := store.MarkTerminal(record.JobID, jobstore.TerminalUpdate{
 		State:              protocol.PublicStateCanceled,
 		Cleanup:            cleanup,
@@ -248,14 +252,22 @@ func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
 			// wins, so return that durable fact without overwriting it.
 			current, getErr := store.Get(record.JobID)
 			if getErr == nil {
-				s.discardRecordedLocalIPCRoot(current)
 				return requestOutcome{result: protocol.JobCancelResult{JobID: current.JobID, State: projectedState(current)}}
 			}
 			return jobStoreUnavailable("read concurrent terminal cancellation", getErr)
 		}
 		return jobStoreUnavailable("persist cancellation", err)
 	}
-	s.discardRecordedLocalIPCRoot(terminal)
+	if home := s.takeManagedCodexHome(record.JobID); home != nil {
+		_, homeDiagnostics := finalizeManagedCodexHome(home, terminal, terminal.Cleanup, nil)
+		for _, diagnostic := range homeDiagnostics {
+			diagnostic = boundProviderValue(diagnostic, 512)
+			if _, err := store.AppendDiagnostic(record.JobID, diagnostic); err != nil {
+				log.Printf("agentbus service: job %s: %s", record.JobID, diagnostic)
+			}
+		}
+	}
+
 	return requestOutcome{result: protocol.JobCancelResult{JobID: terminal.JobID, State: projectedState(terminal)}}
 }
 
@@ -276,7 +288,7 @@ func (s *Server) cancelQueuedJob(store *jobstore.Store, record jobstore.Record) 
 			break
 		}
 	}
-	cleanup, diagnostics := s.cleanupVerifyFrozenCopyForRecord(record, protocol.CleanupClean, record.Diagnostics)
+	cleanup, diagnostics := protocol.CleanupClean, record.Diagnostics
 	terminal, err := store.MarkTerminal(record.JobID, jobstore.TerminalUpdate{
 		State:              protocol.PublicStateCanceled,
 		Cleanup:            cleanup,
@@ -288,7 +300,6 @@ func (s *Server) cancelQueuedJob(store *jobstore.Store, record jobstore.Record) 
 		if errors.Is(err, jobstore.ErrTerminal) {
 			current, getErr := store.Get(record.JobID)
 			if getErr == nil && current.State.IsTerminal() {
-				s.discardRecordedLocalIPCRoot(current)
 				if index >= 0 {
 					s.removeQueuedJobLocked(index)
 					s.activeJobs.Add(-1)
@@ -309,8 +320,9 @@ func (s *Server) cancelQueuedJob(store *jobstore.Store, record jobstore.Record) 
 	if index >= 0 {
 		s.removeQueuedJobLocked(index)
 		s.activeJobs.Add(-1)
+		s.notifyQuietChange()
 	}
-	s.discardRecordedLocalIPCRoot(terminal)
+
 	s.dispatchQueuedLocked()
 	s.executionMu.Unlock()
 	return requestOutcome{result: protocol.JobCancelResult{JobID: terminal.JobID, State: projectedState(terminal)}}, true
@@ -365,6 +377,14 @@ func (s *Server) jobRecordWire(record jobstore.Record) (protocol.JobRecordWire, 
 	modelRequested := cloneRequestedValue(spec.Model)
 	effortRequested := cloneRequestedValue(spec.Effort)
 	modelReported, effortReported := s.projectedSelection(record)
+	store, err := s.ensureJobStore()
+	if err != nil {
+		return protocol.JobRecordWire{}, err
+	}
+	root, err := resumeThreadSource(store, record)
+	if err != nil {
+		return protocol.JobRecordWire{}, err
+	}
 	wire := protocol.JobRecordWire{
 		JobID:              record.JobID,
 		WorkspaceKey:       record.WorkspaceKey,
@@ -392,7 +412,9 @@ func (s *Server) jobRecordWire(record jobstore.Record) (protocol.JobRecordWire, 
 		LogPaths:           projectLogPaths(record),
 		ModelReported:      modelReported,
 		EffortReported:     effortReported,
-		Execution:          record.Execution,
+		Intent:             record.Intent,
+		Selection:          record.Selection,
+		SessionDiscardedAt: root.SessionDiscardedAt,
 		Steers:             steers,
 		CancellationReason: record.CancellationReason,
 	}
@@ -486,13 +508,19 @@ func (s *Server) jobDeadlineProjection(record jobstore.Record, timeout *engine.T
 func (s *Server) resumableProjection(record jobstore.Record) *protocol.ResumableProjection {
 	spec := protocol.TaskSpec{Backend: record.Backend, ResumeJobID: record.JobID}
 	reason := resumeTargetIneligibilityReason(spec, record)
-	if reason == "" && record.Backend == "codex" {
-		if err := s.validateCodexResumeHome(); err != nil {
-			reason = err.Error()
-		}
-	}
 	if reason != "" {
 		return &protocol.ResumableProjection{Eligible: false, Reason: reason}
+	}
+	store, err := s.ensureJobStore()
+	if err != nil {
+		return &protocol.ResumableProjection{Eligible: false, Reason: err.Error()}
+	}
+	records, active, err := s.lineageSnapshot(store)
+	if err == nil {
+		err = s.validateResumeLineage(spec, records, active)
+	}
+	if err != nil {
+		return &protocol.ResumableProjection{Eligible: false, Reason: err.Error()}
 	}
 	if record.State == protocol.PublicStateCompleted {
 		return &protocol.ResumableProjection{
@@ -575,7 +603,12 @@ func projectLogPaths(record jobstore.Record) *protocol.LogPathsWire {
 	}
 	stdoutExists := fileExists(paths.Stdout)
 	stderrExists := fileExists(paths.Stderr)
-	if !stdoutExists && !stderrExists {
+	stdoutFailed, stderrFailed := false, false
+	for _, diagnostic := range record.Diagnostics {
+		stdoutFailed = stdoutFailed || strings.HasPrefix(diagnostic, "capture warning: raw stdout log stopped after ")
+		stderrFailed = stderrFailed || strings.HasPrefix(diagnostic, "capture warning: raw stderr log stopped after ")
+	}
+	if !stdoutExists && !stderrExists && (!stdoutFailed && !stderrFailed || record.LogsPruned) {
 		return nil
 	}
 	wire := &protocol.LogPathsWire{}
@@ -586,6 +619,14 @@ func projectLogPaths(record jobstore.Record) *protocol.LogPathsWire {
 	if stderrExists {
 		wire.Stderr = paths.Stderr
 		wire.StderrTruncated = logEndsWithTruncationMarker(paths.Stderr)
+	}
+	// Capture failures mean the log is incomplete or its durability is unknown,
+	// including when a correction later appended to the same file.
+	if stdoutFailed {
+		wire.StdoutTruncated = &stdoutFailed
+	}
+	if stderrFailed {
+		wire.StderrTruncated = &stderrFailed
 	}
 	return wire
 }
@@ -611,7 +652,7 @@ func logEndsWithTruncationMarker(path string) *bool {
 	}
 	marker := engine.TruncationMarker()
 	truncated := false
-	if info.Size() < int64(len(marker)) {
+	if info.Size() != engine.DefaultCappedLogCapBytes {
 		return &truncated
 	}
 	if _, err := file.Seek(-int64(len(marker)), io.SeekEnd); err != nil {
@@ -654,7 +695,7 @@ func (s *Server) reconcileRecoveredJobs(store *jobstore.Store) error {
 				Cleanup:       protocol.CleanupClean,
 				FailureClass:  protocol.FailureClassInternal,
 				FailureReason: "daemon restarted before job launch",
-				Diagnostics:   []string{"restart reconciliation: queued job was never relaunched"},
+				Diagnostics:   appendRecordDiagnostics(record.Diagnostics, []string{"restart reconciliation: queued job was never relaunched"}),
 				FinishedAt:    time.Now().UTC(),
 			}
 		case record.Starting || record.State == protocol.PublicStateRunning:
@@ -663,24 +704,21 @@ func (s *Server) reconcileRecoveredJobs(store *jobstore.Store) error {
 				State:            protocol.PublicStateUnknown,
 				Cleanup:          cleanup,
 				BackendSessionID: record.BackendSessionID,
-				Diagnostics: append([]string{
+				Diagnostics: appendRecordDiagnostics(record.Diagnostics, append([]string{
 					"restart reconciliation: no relaunch",
-				}, diagnostics...),
+				}, diagnostics...)),
 				FinishedAt: time.Now().UTC(),
 			}
 		default:
 			// A terminal record is deliberately untouched. In particular, do
 			// not use MarkTerminal here: even a logically equivalent rewrite
 			// would violate the byte-for-byte preservation requirement.
-			s.discardRecordedLocalIPCRoot(record)
 			continue
 		}
-		terminal.Cleanup, terminal.Diagnostics = s.cleanupVerifyFrozenCopyForRecord(record, terminal.Cleanup, terminal.Diagnostics)
 		_, err = store.MarkTerminal(record.JobID, terminal)
 		if err != nil && !errors.Is(err, jobstore.ErrTerminal) {
 			return fmt.Errorf("reconcile recovered job %s: %w", record.JobID, err)
 		}
-		s.discardRecordedLocalIPCRoot(record)
 	}
 	return nil
 }
@@ -807,7 +845,14 @@ func (s *Server) exactClaimDiagnostic(claim *jobstore.ProcessClaim) processClaim
 			liveness: protocol.LivenessUnknown,
 		}
 	}
-	if claim.PID <= 0 || claim.PGID <= 0 || claim.StartToken == "" {
+	currentScope, scopeErr := s.currentProcessScope()
+	if scopeErr != nil {
+		return processClaimDiagnostic{message: "orphan reaper: process scope is unreadable; no signal sent: " + scopeErr.Error(), liveness: protocol.LivenessUnknown}
+	}
+	if claim.Scope.Validate() != nil || currentScope.Validate() != nil || claim.Scope != currentScope {
+		return processClaimDiagnostic{message: "orphan reaper: process scope mismatch; no signal sent", liveness: protocol.LivenessUnknown}
+	}
+	if claim.PID <= 0 || claim.PGID != claim.PID || claim.StartToken == "" {
 		return processClaimDiagnostic{
 			message:  "orphan reaper: process claim is incomplete; no signal sent",
 			liveness: protocol.LivenessUnknown,
@@ -836,7 +881,7 @@ func (s *Server) exactClaimDiagnostic(claim *jobstore.ProcessClaim) processClaim
 			liveness: protocol.LivenessUnknown,
 		}
 	}
-	if info.StartTime != claim.StartToken {
+	if info.PID != claim.PID || info.PGID != claim.PGID || info.StartTime != claim.StartToken {
 		return processClaimDiagnostic{
 			message:  "orphan reaper: leader start token mismatch; no signal sent",
 			liveness: protocol.LivenessGone,

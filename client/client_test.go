@@ -113,7 +113,7 @@ func clientTestSkipOrFailBindDenied(t *testing.T, context string, detail any) {
 }
 
 func TestClientHelloParsesBackendMetadata(t *testing.T) {
-	hello := runClientHello(t, `{"protocolVersion":3,"backends":[{"backend":"codex","models":["gpt-5"],"efforts":["high"]}]}`)
+	hello := runClientHello(t, `{"protocolVersion":4,"backends":[{"backend":"codex","models":["gpt-5"],"efforts":["high"]}]}`)
 
 	if hello.ProtocolVersion != protocol.Version {
 		t.Fatalf("hello = %+v", hello)
@@ -136,8 +136,72 @@ func TestClientHelloRejectsProtocolVersionMismatch(t *testing.T) {
 	if !errors.As(err, &mismatch) || mismatch.Received != 1 {
 		t.Fatalf("clientHello mismatch = %#v, want server version 1", mismatch)
 	}
-	if !strings.Contains(err.Error(), "expected 3") || !strings.Contains(err.Error(), "received 1") {
+	if !strings.Contains(err.Error(), "expected 4") || !strings.Contains(err.Error(), "received 1") {
 		t.Fatalf("clientHello error message = %q, want expected and received versions", err.Error())
+	}
+}
+
+func TestDisabledAutostartNeverStartsForConnectOrReconnect(t *testing.T) {
+	starts := 0
+	opts := Options{
+		StateRoot:        t.TempDir(),
+		DisableAutoStart: true,
+		CommandPath:      "/selected/agentbus",
+		Starter: func(context.Context, StartOptions) (StartResult, error) {
+			starts++
+			return StartResult{}, errors.New("unexpected daemon start")
+		},
+	}
+	if connected, err := Connect(context.Background(), opts); err == nil {
+		connected.Close()
+		t.Fatal("connect to an absent daemon unexpectedly succeeded")
+	}
+	client, err := newClient(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.reconnect(context.Background()); err == nil {
+		t.Fatal("reconnect to an absent daemon unexpectedly succeeded")
+	}
+	if starts != 0 {
+		t.Fatalf("disabled autostart launched %d daemons", starts)
+	}
+}
+
+func TestDrainingResponseDoesNotAutostartOrReplay(t *testing.T) {
+	starts := 0
+	client, err := newClient(Options{StateRoot: t.TempDir(), Starter: func(context.Context, StartOptions) (StartResult, error) {
+		starts++
+		return StartResult{}, errors.New("unexpected daemon start")
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientConn, serverConn := net.Pipe()
+	client.conn = clientConn
+	client.reader = bufio.NewReader(clientConn)
+	go client.readLoop(clientConn, client.reader)
+	defer client.Close()
+	served := make(chan error, 1)
+	go func() {
+		defer serverConn.Close()
+		var request protocol.Request
+		if err := json.NewDecoder(serverConn).Decode(&request); err != nil {
+			served <- err
+			return
+		}
+		served <- json.NewEncoder(serverConn).Encode(protocol.Response{
+			JSONRPC: "2.0", ID: request.ID,
+			Error: protocol.NewError(protocol.ErrorDaemonDraining, "daemon is draining", protocol.ErrorData{}),
+		})
+	}()
+	_, err = client.JobGet(context.Background(), JobGetParams{JobID: "job-1"})
+	var rpcErr *protocol.RPCError
+	if !errors.As(err, &rpcErr) || rpcErr.Object.Data.Code != protocol.ErrorDaemonDraining || starts != 0 {
+		t.Fatalf("draining request: err=%v starts=%d", err, starts)
+	}
+	if err := <-served; err != nil {
+		t.Fatal(err)
 	}
 }
 

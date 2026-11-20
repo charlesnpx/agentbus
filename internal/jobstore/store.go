@@ -1,4 +1,4 @@
-// Package jobstore persists version-3 jobs and their immutable replay bindings.
+// Package jobstore persists format-2 jobs and their immutable replay bindings.
 package jobstore
 
 import (
@@ -10,18 +10,21 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 	bolt "go.etcd.io/bbolt"
 )
 
 const (
-	storeFormatVersion      = "1"
+	storeFormatVersion      = "2"
 	diagnosticEntryMaxRunes = 512
 	diagnosticEntryMaxCount = 64
 	// defaultOpenTimeout bounds how long Open waits for the database file lock.
@@ -54,6 +57,7 @@ var (
 	bucketRequests = []byte("requests")
 	bucketJobs     = []byte("jobs")
 	keyFormat      = []byte("format")
+	keyOwnerRoot   = []byte("ownerRoot")
 )
 
 // RequestKey is the public compound idempotency identity. Both fields are
@@ -102,17 +106,24 @@ type ArtifactPaths struct {
 	Result string `json:"result,omitempty"`
 }
 
-// ProcessClaim identifies the process group created for a job. StartToken is
-// used with PID and PGID to distinguish a recycled PID from the launched
-// process group during recovery.
+// ProcessScope binds a process claim to a boot, directory instance, and PID namespace.
+type ProcessScope struct {
+	BootID       string `json:"bootId"`
+	RootDevice   string `json:"rootDevice"`
+	RootInode    string `json:"rootInode"`
+	PIDNamespace string `json:"pidNamespace,omitempty"`
+}
+
+// ProcessClaim identifies a process group and its exact leader during recovery.
 type ProcessClaim struct {
-	PID        int    `json:"pid"`
-	PGID       int    `json:"pgid"`
-	StartToken string `json:"startToken"`
+	PID        int          `json:"pid"`
+	PGID       int          `json:"pgid"`
+	StartToken string       `json:"startToken"`
+	Scope      ProcessScope `json:"scope"`
 }
 
 // Record is the durable job record. State, cleanup, failure class, and contract
-// deliberately use the protocol's v3 types rather than parallel store types.
+// deliberately use the protocol types rather than parallel store types.
 // Starting is the private persisted no-relaunch marker; its public projection
 // is always State=running.
 type Record struct {
@@ -120,21 +131,20 @@ type Record struct {
 	WorkspaceKey string `json:"workspaceKey"`
 	RequestID    string `json:"requestId"`
 	Backend      string `json:"backend"`
-	// InputMode snapshots the immutable task mode. Empty legacy records mean fixed.
+	// InputMode snapshots the immutable task mode.
 	InputMode protocol.InputMode `json:"inputMode,omitempty"`
 	// BackendSessionID is assigned only from a backend's turn-final
 	// observation. An omitted value means the job never produced a resumable
 	// backend session; it is not an unknown-session marker.
-	BackendSessionID string                     `json:"backendSessionId,omitempty"`
-	RetainSession    bool                       `json:"retainSession,omitempty"`
-	Model            string                     `json:"model,omitempty"`
-	ModelReported    string                     `json:"modelReported,omitempty"`
-	EffortReported   string                     `json:"effortReported,omitempty"`
-	CWD              string                     `json:"cwd,omitempty"`
-	Write            bool                       `json:"write"`
-	Execution        *protocol.ExecutionPosture `json:"execution,omitempty"`
-	Effort           string                     `json:"effort,omitempty"`
-	TaskSpec         json.RawMessage            `json:"taskSpec,omitempty"`
+	BackendSessionID   string                        `json:"backendSessionId,omitempty"`
+	SessionDiscardedAt *time.Time                    `json:"sessionDiscardedAt,omitempty"`
+	RetainSession      bool                          `json:"retainSession,omitempty"`
+	ModelReported      string                        `json:"modelReported,omitempty"`
+	EffortReported     string                        `json:"effortReported,omitempty"`
+	CWD                string                        `json:"cwd,omitempty"`
+	Intent             engine.Intent                 `json:"intent"`
+	Selection          *protocol.InvocationSelection `json:"selection,omitempty"`
+	TaskSpec           json.RawMessage               `json:"taskSpec,omitempty"`
 	// Steers contains text-free delivery metadata separate from immutable TaskSpec.
 	Steers                 []protocol.SteerRecord      `json:"steers,omitempty"`
 	State                  protocol.PublicState        `json:"state"`
@@ -252,16 +262,25 @@ type artifactLayout struct {
 type Store struct {
 	db        *bolt.DB
 	path      string
+	ownerRoot string
 	artifacts artifactLayout
 }
 
-// Open opens or creates one version-3 jobstore database at path. Existing
+// Open opens or creates one format-2 jobstore database at path. Existing
 // databases receive a fault-isolated preflight before bbolt can mmap them.
 func Open(path string) (*Store, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, fmt.Errorf("%w: database path is required", ErrInvalid)
 	}
-	path = filepath.Clean(path)
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	root, err := filepath.EvalSymlinks(filepath.Dir(path))
+	if err != nil {
+		return nil, fmt.Errorf("resolve state root: %w", err)
+	}
+	path = filepath.Join(root, filepath.Base(path))
 
 	fresh := false
 	info, err := os.Lstat(path)
@@ -280,6 +299,26 @@ func Open(path string) (*Store, error) {
 			return nil, typedOpenError(path, err)
 		}
 	case errors.Is(err, os.ErrNotExist):
+		for _, rel := range []string{"artifacts/logs", "artifacts/results", "sessions/codex"} {
+			owned := filepath.Join(root, rel)
+			info, statErr := os.Lstat(owned)
+			if errors.Is(statErr, os.ErrNotExist) {
+				continue
+			}
+			if statErr != nil {
+				return nil, fmt.Errorf("inspect owned data %s: %w", owned, statErr)
+			}
+			if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+				return nil, fmt.Errorf("%w: missing database alongside owned data %s", ErrIncompatible, owned)
+			}
+			entries, readErr := os.ReadDir(owned)
+			if readErr != nil {
+				return nil, fmt.Errorf("inspect owned data %s: %w", owned, readErr)
+			}
+			if len(entries) != 0 {
+				return nil, fmt.Errorf("%w: missing database alongside owned data %s", ErrIncompatible, owned)
+			}
+		}
 		fresh = true
 	default:
 		return nil, err
@@ -291,8 +330,9 @@ func Open(path string) (*Store, error) {
 	}
 
 	store := &Store{
-		db:   db,
-		path: path,
+		db:        db,
+		path:      path,
+		ownerRoot: root,
 		artifacts: artifactLayout{
 			logs:    filepath.Join(filepath.Dir(path), "artifacts", "logs"),
 			results: filepath.Join(filepath.Dir(path), "artifacts", "results"),
@@ -333,7 +373,10 @@ func (store *Store) initialize() error {
 		if _, err := tx.CreateBucket(bucketJobs); err != nil {
 			return err
 		}
-		return meta.Put(keyFormat, []byte(storeFormatVersion))
+		if err := meta.Put(keyFormat, []byte(storeFormatVersion)); err != nil {
+			return err
+		}
+		return meta.Put(keyOwnerRoot, []byte(store.ownerRoot))
 	})
 }
 
@@ -360,6 +403,23 @@ func (store *Store) verifyInitialized() error {
 		meta := tx.Bucket(bucketMeta)
 		if meta == nil || string(meta.Get(keyFormat)) != storeFormatVersion {
 			return fmt.Errorf("%w: unsupported or missing store format", ErrIncompatible)
+		}
+		owner := string(meta.Get(keyOwnerRoot))
+		if owner == "" || owner != store.ownerRoot {
+			return fmt.Errorf("%w: state root ownership mismatch: stored %q, selected %q", ErrIncompatible, owner, store.ownerRoot)
+		}
+		count := 0
+		if err := meta.ForEach(func(k, v []byte) error {
+			count++
+			if v == nil || (string(k) != string(keyFormat) && string(k) != string(keyOwnerRoot)) {
+				return fmt.Errorf("%w: unexpected owner metadata %q", ErrIncompatible, k)
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		if count != 2 {
+			return fmt.Errorf("%w: incomplete owner metadata", ErrIncompatible)
 		}
 		return nil
 	})
@@ -605,8 +665,8 @@ func (store *Store) MarkLogsPruned(id string) (Record, error) {
 		if err != nil {
 			return err
 		}
-		if !current.State.IsTerminal() || current.Cleanup != protocol.CleanupClean {
-			return fmt.Errorf("%w: only clean terminal jobs can have logs marked pruned", ErrInvalid)
+		if !current.State.IsTerminal() {
+			return fmt.Errorf("%w: only terminal jobs can have logs marked pruned", ErrInvalid)
 		}
 		if !current.LogsPruned {
 			current.LogsPruned = true
@@ -620,16 +680,45 @@ func (store *Store) MarkLogsPruned(id string) (Record, error) {
 	return result, err
 }
 
+// DiscardSession durably revokes continuation at the lineage root. It does
+// not change the job's outcome, timestamps, or observed provider identity.
+func (store *Store) DiscardSession(id string) (Record, error) {
+	if err := validateJobID(id); err != nil {
+		return Record{}, fmt.Errorf("%w: %v", ErrInvalid, err)
+	}
+	var result Record
+	err := store.update(func(tx *bolt.Tx) error {
+		jobs := tx.Bucket(bucketJobs)
+		if jobs == nil {
+			return fmt.Errorf("%w: missing jobs bucket", ErrCorrupt)
+		}
+		current, err := getRecord(jobs, id)
+		if err != nil {
+			return err
+		}
+		if current.SessionDiscardedAt == nil {
+			now := time.Now().UTC()
+			current.SessionDiscardedAt = &now
+			if err := putRecord(jobs, current); err != nil {
+				return err
+			}
+		}
+		result = current
+		return nil
+	})
+	return result, err
+}
+
 // MarkStarting commits the private no-relaunch marker before a caller spawns
 // a backend process. Only queued jobs may make this transition.
 func (store *Store) MarkStarting(id string) (Record, error) {
-	return store.MarkStartingWithExecution(id, nil)
+	return store.MarkStartingWithSelection(id, protocol.InvocationSelection{})
 }
 
-// MarkStartingWithExecution commits the starting marker and its effective
-// execution posture atomically before a caller spawns a backend process.
+// MarkStartingWithSelection commits the starting marker and immutable invocation
+// selection atomically before a caller spawns a backend process.
 // Only queued jobs may make this transition.
-func (store *Store) MarkStartingWithExecution(id string, execution *protocol.ExecutionPosture) (Record, error) {
+func (store *Store) MarkStartingWithSelection(id string, selection protocol.InvocationSelection) (Record, error) {
 	if err := validateJobID(id); err != nil {
 		return Record{}, fmt.Errorf("%w: %v", ErrInvalid, err)
 	}
@@ -653,6 +742,16 @@ func (store *Store) MarkStartingWithExecution(id string, execution *protocol.Exe
 		if current.State != protocol.PublicStateQueued {
 			return fmt.Errorf("%w: queued state is required to start job", ErrInvalid)
 		}
+		var requested struct {
+			Model  *string `json:"model"`
+			Effort *string `json:"effort"`
+		}
+		if err := json.Unmarshal(current.TaskSpec, &requested); err != nil {
+			return fmt.Errorf("%w: invalid stored task spec: %v", ErrCorrupt, err)
+		}
+		if (requested.Model != nil && *requested.Model != selection.Model) || (requested.Effort != nil && *requested.Effort != selection.Effort) {
+			return fmt.Errorf("%w: invocation selection disagrees with task", ErrInvalid)
+		}
 
 		next := current
 		now := time.Now().UTC()
@@ -660,7 +759,7 @@ func (store *Store) MarkStartingWithExecution(id string, execution *protocol.Exe
 		next.Starting = true
 		next.StartedAt = &now
 		next.UpdatedAt = now
-		next.Execution = execution
+		next.Selection = &selection
 		normalizeRecord(&next)
 		if err := validateRecord(next); err != nil {
 			return err
@@ -709,6 +808,7 @@ func (store *Store) RecordProcessClaim(id string, claim ProcessClaim) (Record, e
 			PID:        claim.PID,
 			PGID:       claim.PGID,
 			StartToken: claim.StartToken,
+			Scope:      claim.Scope,
 		}
 		next.UpdatedAt = time.Now().UTC()
 		normalizeRecord(&next)
@@ -845,15 +945,14 @@ func (store *Store) AppendDiagnostic(id, diagnostic string) (Record, error) {
 		if err != nil {
 			return err
 		}
-		if current.State.IsTerminal() {
-			return ErrTerminal
-		}
 		next := current
 		next.Diagnostics = append(append([]string(nil), current.Diagnostics...), diagnostic)
 		if len(next.Diagnostics) > diagnosticEntryMaxCount {
 			next.Diagnostics = append([]string(nil), next.Diagnostics[len(next.Diagnostics)-diagnosticEntryMaxCount:]...)
 		}
-		next.UpdatedAt = time.Now().UTC()
+		if !current.State.IsTerminal() {
+			next.UpdatedAt = time.Now().UTC()
+		}
 		normalizeRecord(&next)
 		if err := validateRecord(next); err != nil {
 			return err
@@ -1187,19 +1286,16 @@ func validateRecord(record Record) error {
 	if record.Starting && record.State != protocol.PublicStateRunning {
 		return fmt.Errorf("%w: starting marker requires running public state", ErrInvalid)
 	}
-	if record.ProcessClaim != nil {
-		if err := record.ProcessClaim.validate(); err != nil {
-			return err
-		}
-	}
+	// A malformed stored claim must remain readable so recovery can report
+	// uncertain cleanup without signaling. New claims are validated on write.
 	if record.BackendSessionID != "" && strings.TrimSpace(record.BackendSessionID) == "" {
 		return fmt.Errorf("%w: backend session id cannot be whitespace", ErrInvalid)
 	}
 	if !record.Cleanup.Valid() {
 		return fmt.Errorf("%w: invalid cleanup %q", ErrInvalid, record.Cleanup)
 	}
-	if record.LogsPruned && (!record.State.IsTerminal() || record.Cleanup != protocol.CleanupClean) {
-		return fmt.Errorf("%w: pruned logs require a clean terminal job", ErrInvalid)
+	if record.LogsPruned && !record.State.IsTerminal() {
+		return fmt.Errorf("%w: pruned logs require a terminal job", ErrInvalid)
 	}
 	if record.CreatedAt.IsZero() || record.UpdatedAt.IsZero() {
 		return fmt.Errorf("%w: createdAt and updatedAt are required", ErrInvalid)
@@ -1276,10 +1372,36 @@ func (claim ProcessClaim) validate() error {
 	if claim.PID <= 0 {
 		return fmt.Errorf("%w: process PID must be positive", ErrInvalid)
 	}
-	if claim.PGID <= 0 {
-		return fmt.Errorf("%w: process PGID must be positive", ErrInvalid)
+	if claim.PGID != claim.PID {
+		return fmt.Errorf("%w: process must be its group leader", ErrInvalid)
 	}
-	return validateOpaqueIdentityPart("process start token", claim.StartToken)
+	if err := validateOpaqueIdentityPart("process start token", claim.StartToken); err != nil {
+		return err
+	}
+	return claim.Scope.Validate()
+}
+
+// Validate checks the complete platform-specific process scope before use.
+func (scope ProcessScope) Validate() error {
+	for name, value := range map[string]string{"bootId": scope.BootID, "rootDevice": scope.RootDevice, "rootInode": scope.RootInode} {
+		if err := validateOpaqueIdentityPart(name, value); err != nil {
+			return err
+		}
+	}
+	for name, value := range map[string]string{"rootDevice": scope.RootDevice, "rootInode": scope.RootInode} {
+		n, err := strconv.ParseUint(value, 10, 64)
+		if err != nil || strconv.FormatUint(n, 10) != value {
+			return fmt.Errorf("%w: %s must be an unsigned decimal string", ErrInvalid, name)
+		}
+	}
+	if runtime.GOOS == "linux" {
+		if err := validateOpaqueIdentityPart("pidNamespace", scope.PIDNamespace); err != nil {
+			return err
+		}
+	} else if runtime.GOOS == "darwin" && scope.PIDNamespace != "" {
+		return fmt.Errorf("%w: pidNamespace is not applicable on macOS", ErrInvalid)
+	}
+	return nil
 }
 
 func validPublicState(state protocol.PublicState) bool {

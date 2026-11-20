@@ -25,7 +25,6 @@ const (
 )
 
 var (
-	transcriptItemStopLine     = []byte("{\"appendStopped\":true}\n")
 	transcriptItemCompleteLine = []byte("{\"captureComplete\":true}\n")
 	closeItemSidecarFile       = func(file *os.File) error { return file.Close() }
 	syncItemSidecarDirectory   = func(dir string) error {

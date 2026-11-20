@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -26,7 +27,7 @@ func TestVersionReportsBothVersions(t *testing.T) {
 	if code != 0 || stderr != "" {
 		t.Fatalf("version exit=%d stderr=%q", code, stderr)
 	}
-	if stdout != "agentbus test protocol 3\n" {
+	if stdout != "agentbus test protocol 4\n" {
 		t.Fatalf("human version output = %q", stdout)
 	}
 
@@ -38,6 +39,27 @@ func TestVersionReportsBothVersions(t *testing.T) {
 	decodeJSON(t, stdout, &got)
 	if got.Version != "test" || got.Schema != cliJSONSchema || got.ProtocolVersion != protocol.Version {
 		t.Fatalf("version output = %+v", got)
+	}
+}
+
+func TestReleaseNoticeAndEmptyConfiguredDefault(t *testing.T) {
+	var out bytes.Buffer
+	printReleaseNotice(&out, "0.18.0", agentclient.HelloResult{ProtocolVersion: 4, DaemonRelease: "0.18.0", DaemonExecutable: "/agentbus"})
+	if out.Len() != 0 {
+		t.Fatalf("matching release notice: %q", out.String())
+	}
+	printReleaseNotice(&out, "0.18.0", agentclient.HelloResult{ProtocolVersion: 4, DaemonRelease: "0.18.1", DaemonExecutable: "/agentbus"})
+	if !strings.Contains(out.String(), "0.18.0") || !strings.Contains(out.String(), "0.18.1") || !strings.Contains(out.String(), "/agentbus") {
+		t.Fatalf("release notice: %q", out.String())
+	}
+	out.Reset()
+	printReleaseNotice(&out, "dev", agentclient.HelloResult{ProtocolVersion: 4, DaemonRelease: "unknown"})
+	if !strings.Contains(out.String(), "unknown") {
+		t.Fatalf("unknown release notice: %q", out.String())
+	}
+	t.Setenv("AGENTBUS_CODEX_DEFAULT_MODEL", "")
+	if _, err := configuredBackendDefaults(); err == nil {
+		t.Fatal("empty configured model was accepted")
 	}
 }
 
@@ -86,7 +108,7 @@ func TestBareWaitDurationRejectedWithUnitSuggestions(t *testing.T) {
 		t.Fatal("invalid duration attempted to connect to the daemon")
 		return nil, nil
 	}
-	code, stdout, stderr := runTestCLI(t, a, []string{"result", "--job", "job-1", "--wait", "--wait-timeout=2400"})
+	code, stdout, stderr := runTestCLI(t, a, []string{"result", "job-1", "--wait", "--wait-timeout=2400"})
 	if code != 2 || stdout != "" || !strings.Contains(stderr, "2400 is ambiguous") || !strings.Contains(stderr, "2400s") || !strings.Contains(stderr, "40m") {
 		t.Fatalf("bare duration=(%d,%q,%q), want actionable usage error", code, stdout, stderr)
 	}
@@ -96,7 +118,7 @@ func TestResultWaitExpiryReportsRecordWithoutCanceling(t *testing.T) {
 	client := &fakeProtocolClient{records: map[string]agentclient.JobGetResult{"job-1": detailedRecord(protocol.PublicStateRunning)}}
 	a := testApp(t)
 	a.clientConnect = fakeConnector(client)
-	code, stdout, stderr := runTestCLI(t, a, []string{"result", "--job", "job-1", "--wait", "--wait-timeout", "1ns", "--json"})
+	code, stdout, stderr := runTestCLI(t, a, []string{"result", "job-1", "--wait", "--wait-timeout", "1ns", "--json"})
 	if code != cliExitObservationTimeout || stderr != "" {
 		t.Fatalf("wait expiry=(%d,%q,%q), want observation timeout and record", code, stdout, stderr)
 	}
@@ -126,7 +148,7 @@ func TestResultWaitExpiryDuringFirstLookupReturnsObservationTimeout(t *testing.T
 	resultCh := make(chan result, 1)
 	go func() {
 		var stdout, stderr bytes.Buffer
-		code := a.run(callerCtx, []string{"result", "--job", "job-1", "--wait", "--wait-timeout", "1ms", "--json"}, strings.NewReader(""), &stdout, &stderr)
+		code := a.run(callerCtx, []string{"result", "job-1", "--wait", "--wait-timeout", "1ms", "--json"}, strings.NewReader(""), &stdout, &stderr)
 		resultCh <- result{code: code, stdout: stdout.String(), stderr: stderr.String()}
 	}()
 	startGuard := time.NewTimer(5 * time.Second)
@@ -167,7 +189,7 @@ func TestTranscriptFollowDrainsFullPageToTerminalAndReportsGap(t *testing.T) {
 	}
 	a := testApp(t)
 	a.clientConnect = fakeConnector(client)
-	code, stdout, stderr := runTestCLI(t, a, []string{"transcript", "--job", "job-1", "--follow", "--kind", "message", "--json"})
+	code, stdout, stderr := runTestCLI(t, a, []string{"transcript", "job-1", "--follow", "--kind", "message", "--json"})
 	if code != 0 || stderr != "" {
 		t.Fatalf("follow=(%d,%q), want completed with no error", code, stderr)
 	}
@@ -194,7 +216,7 @@ func TestTranscriptFollowSummaryWriteErrorExitsNonzero(t *testing.T) {
 	a := testApp(t)
 	a.clientConnect = fakeConnector(client)
 	var stderr bytes.Buffer
-	code := a.run(context.Background(), []string{"transcript", "--job", "job-1", "--follow"}, strings.NewReader(""), failingWriter{}, &stderr)
+	code := a.run(context.Background(), []string{"transcript", "job-1", "--follow"}, strings.NewReader(""), failingWriter{}, &stderr)
 	if code != 1 || !strings.Contains(stderr.String(), "write failed") {
 		t.Fatalf("follow summary write=(%d,%q), want output error", code, stderr.String())
 	}
@@ -231,44 +253,50 @@ func TestDuplicateSingletonFlagIsUsageError(t *testing.T) {
 		t.Fatal("duplicate flag attempted to connect to the daemon")
 		return nil, nil
 	}
-	code, stdout, stderr := runTestCLI(t, a, []string{"status", "--job", "job-a", "--job", "job-b"})
-	if code != 2 || stdout != "" || !strings.Contains(stderr, "--job specified more than once") {
+	code, stdout, stderr := runTestCLI(t, a, []string{"status", "job-a", "job-b"})
+	if code != 2 || stdout != "" || !strings.Contains(stderr, "provide exactly one job ID") {
 		t.Fatalf("duplicate singleton=(%d,%q,%q), want usage error", code, stdout, stderr)
 	}
 }
 
 func TestDeletedCommandIsUnknown(t *testing.T) {
-	a := testApp(t)
-	code, _, stderr := runTestCLI(t, a, []string{"setup"})
-	if code != 2 || !strings.Contains(stderr, "unknown command") {
-		t.Fatalf("exit=%d stderr=%q, want unknown-command usage error", code, stderr)
+	for _, command := range []string{"setup", "--version", "-version", "-V"} {
+		t.Run(command, func(t *testing.T) {
+			a := testApp(t)
+			code, stdout, stderr := runTestCLI(t, a, []string{command})
+			if code != 2 || stdout != "" || !strings.Contains(stderr, "unknown command") {
+				t.Fatalf("exit=%d stdout=%q stderr=%q, want unknown-command usage error", code, stdout, stderr)
+			}
+		})
 	}
 }
 
 func TestStatusAndResultJSONAreByteIdentical(t *testing.T) {
-	digest := strings.Repeat("a", sha256.Size*2)
 	record := detailedRecord(protocol.PublicStateCompleted)
-	record.Result = &protocol.ResultInfoWire{
-		Text:       "the result",
-		ResultPath: "/state/results/job-1",
-		SHA256:     digest,
-		Bytes:      10,
-	}
+	record.Result = verifiedResultForTest(t, "the result")
+	digest := record.Result.SHA256
 	a := testApp(t)
 	a.clientConnect = func(context.Context, agentclient.Options) (protocolClient, error) {
 		return &fakeProtocolClient{records: map[string]agentclient.JobGetResult{"job-1": record}}, nil
 	}
 
-	statusCode, statusJSON, statusErr := runTestCLI(t, a, []string{"status", "--job", "job-1", "--json"})
-	resultCode, resultJSON, resultErr := runTestCLI(t, a, []string{"result", "--job", "job-1", "--json"})
+	statusCode, statusJSON, statusErr := runTestCLI(t, a, []string{"status", "job-1", "--json"})
+	resultCode, resultJSON, resultErr := runTestCLI(t, a, []string{"result", "job-1", "--json"})
 	if statusCode != 0 || resultCode != 0 || statusErr != "" || resultErr != "" {
 		t.Fatalf("status=(%d,%q) result=(%d,%q)", statusCode, statusErr, resultCode, resultErr)
 	}
 	if statusJSON != resultJSON {
 		t.Fatalf("status JSON = %q\nresult JSON = %q\nwant byte-identical job.get records", statusJSON, resultJSON)
 	}
-	if !strings.Contains(statusJSON, `"result":{"text":"the result","resultPath":"/state/results/job-1","sha256":"`+digest+`","bytes":10}`) {
-		t.Fatalf("result JSON shape = %q, want bare lowercase SHA-256 value", statusJSON)
+	var decoded struct {
+		Result struct {
+			SHA256 string `json:"sha256"`
+			Bytes  int64  `json:"bytes"`
+		} `json:"result"`
+	}
+	decodeJSON(t, statusJSON, &decoded)
+	if decoded.Result.SHA256 != digest || decoded.Result.Bytes != 10 {
+		t.Fatalf("result JSON shape = %q, want bare lowercase SHA-256 value and length 10", statusJSON)
 	}
 }
 
@@ -290,6 +318,8 @@ func TestStatusHumanProjectionIncludesOperatorFieldsAndNeverResultText(t *testin
 	record.ModelReported = "gpt-5"
 	record.EffortReported = "high"
 	record.Resumable = &protocol.ResumableProjection{Eligible: false, Reason: "session is not retained"}
+	discarded := finished.Add(2 * time.Minute)
+	record.SessionDiscardedAt = &discarded
 	record.CancellationReason = protocol.CancellationReasonOperator
 	record.Result = &protocol.ResultInfoWire{
 		Text:       "secret result text",
@@ -300,9 +330,8 @@ func TestStatusHumanProjectionIncludesOperatorFieldsAndNeverResultText(t *testin
 	record.Failure = &protocol.JobFailureWire{Class: protocol.FailureClassBackendError, Reason: "provider stopped"}
 	record.Contract = &protocol.ContractResult{Evaluated: true, Compliant: false}
 	record.LogPaths = &protocol.LogPathsWire{Stdout: "/logs/out", Stderr: "/logs/err"}
-	record.Execution = &protocol.ExecutionPosture{
-		Intent: "inspect", Shell: "sandboxed", Network: "denied", LocalIPC: "denied", GitMetadata: "read-only", Enforcement: "os-sandbox",
-	}
+	record.Intent = engine.IntentInspect
+	record.Selection = &protocol.InvocationSelection{Model: "gpt-5", Effort: "high"}
 	record.Steers = []protocol.SteerSummaryWire{{
 		MessageID: "message-1", Status: protocol.SteerStatusDelivered,
 		Mechanism: "native", Time: finished.Add(time.Minute),
@@ -310,8 +339,8 @@ func TestStatusHumanProjectionIncludesOperatorFieldsAndNeverResultText(t *testin
 	a := testApp(t)
 	a.clientConnect = fakeConnector(&fakeProtocolClient{records: map[string]agentclient.JobGetResult{"job-1": record}})
 
-	code, stdout, stderr := runTestCLI(t, a, []string{"status", "--job", "job-1"})
-	if code != 4 || stderr != "" {
+	code, stdout, stderr := runTestCLI(t, a, []string{"status", "job-1"})
+	if code != 0 || stderr != "" {
 		t.Fatalf("status exit=%d stderr=%q", code, stderr)
 	}
 	for _, want := range []string{
@@ -320,12 +349,12 @@ func TestStatusHumanProjectionIncludesOperatorFieldsAndNeverResultText(t *testin
 		"startedAt=2026-01-02T03:05:05Z",
 		"finishedAt=2026-01-02T03:06:05Z",
 		"timeout.effective=1800000 timeout.source=client",
-		"inputMode=fixed deadline=2026-01-02T03:35:05Z remainingMs=1799999 model.requested=\"requested-model\" effort.requested=\"medium\" model.reported=\"gpt-5\" effort.reported=\"high\" tags=a=first,z=last resumable.eligible=false resumable.reason=\"session is not retained\" cancellationReason=operator",
+		"inputMode=fixed deadline=2026-01-02T03:35:05Z remainingMs=1799999 model.requested=\"requested-model\" effort.requested=\"medium\" model.reported=\"gpt-5\" effort.reported=\"high\" tags=a=first,z=last resumable.eligible=false resumable.reason=\"session is not retained\" sessionDiscardedAt=2026-01-02T03:08:05Z cancellationReason=operator",
 		"result.bytes=18 result.sha256=sha256:aaaaaaaaaaaa",
 		"failure.class=backend_error failure.reason=provider stopped",
 		"contract.evaluated=true contract.compliant=false",
 		"logPaths.stdout=/logs/out logPaths.stderr=/logs/err",
-		`execution={"intent":"inspect","sourceWritable":false,"shell":"sandboxed","network":"denied","localIPC":"denied","gitMetadata":"read-only","enforcement":"os-sandbox"}`,
+		`intent=inspect`,
 		"steer.messageId=message-1 status=delivered mechanism=native time=2026-01-02T03:07:05Z",
 	} {
 		if !strings.Contains(stdout, want) {
@@ -349,8 +378,8 @@ func TestStatusHumanProjectionIncludesQueuedPositionAndLimits(t *testing.T) {
 	a := testApp(t)
 	a.clientConnect = fakeConnector(&fakeProtocolClient{records: map[string]agentclient.JobGetResult{"job-1": record}})
 
-	code, stdout, stderr := runTestCLI(t, a, []string{"status", "--job", "job-1"})
-	if code != 2 || stderr != "" {
+	code, stdout, stderr := runTestCLI(t, a, []string{"status", "job-1"})
+	if code != 0 || stderr != "" {
 		t.Fatalf("status=(%d,%q), want queued status without error", code, stderr)
 	}
 	want := "queue: position 3 for backend codex (12/12 running for codex; 12/12 total)"
@@ -379,7 +408,7 @@ func TestSteerCommandReceiptAndExitCodes(t *testing.T) {
 			a.clientConnect = fakeConnector(client)
 			var stdout, stderr bytes.Buffer
 			code := a.run(context.Background(), []string{
-				"steer", "--job", "job-1", "--request-id", "message-1", "--message-file", "-", "--json",
+				"steer", "job-1", "--request-id", "message-1", "--message-file", "-", "--json",
 			}, strings.NewReader("follow-up"), &stdout, &stderr)
 			if code != test.want || stderr.Len() != 0 {
 				t.Fatalf("steer exit=%d stderr=%q, want exit=%d", code, stderr.String(), test.want)
@@ -388,6 +417,31 @@ func TestSteerCommandReceiptAndExitCodes(t *testing.T) {
 			decodeJSON(t, stdout.String(), &receipt)
 			if receipt.Status != test.status || client.steerParams.JobID != "job-1" || client.steerParams.MessageID != "message-1" || client.steerParams.Text != "follow-up" {
 				t.Fatalf("steer receipt=%#v params=%#v", receipt, client.steerParams)
+			}
+		})
+	}
+}
+
+func TestSessionDiscardCommandAndExitCodes(t *testing.T) {
+	for _, test := range []struct {
+		removal string
+		want    int
+	}{
+		{removal: protocol.HomeRemovalRemoved, want: 0},
+		{removal: protocol.HomeRemovalAlreadyAbsent, want: 0},
+		{removal: protocol.HomeRemovalFailed, want: 1},
+	} {
+		t.Run(test.removal, func(t *testing.T) {
+			client := &fakeProtocolClient{discard: agentclient.SessionDiscardResult{
+				RootJobID: "root", SessionDiscardedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), HomeRemoval: test.removal,
+			}}
+			a := testApp(t)
+			a.clientConnect = fakeConnector(client)
+			code, stdout, stderr := runTestCLI(t, a, []string{"session", "discard", "descendant", "--json"})
+			var result agentclient.SessionDiscardResult
+			decodeJSON(t, stdout, &result)
+			if code != test.want || stderr != "" || result.HomeRemoval != test.removal || client.discardParams.JobID != "descendant" {
+				t.Fatalf("discard=(%d,%q,%q), params=%+v", code, stdout, stderr, client.discardParams)
 			}
 		})
 	}
@@ -521,10 +575,10 @@ func TestTranscriptForwardsSelectorsAndPrintsDigest(t *testing.T) {
 	a.clientConnect = fakeConnector(client)
 
 	code, stdout, stderr := runTestCLI(t, a, []string{
-		"transcript", "--job", "job-1", "--kind", "message", "--kind", "error",
+		"transcript", "job-1", "--kind", "message", "--kind", "error",
 		"--since", since.Format(time.RFC3339Nano), "--since-ordinal", "6", "--last", "3", "--limit", "2",
 	})
-	if code != 2 || stderr != "" {
+	if code != 0 || stderr != "" {
 		t.Fatalf("selected transcript = (%d,%q)", code, stderr)
 	}
 	if len(client.transcriptParams) != 1 {
@@ -545,13 +599,13 @@ func TestTranscriptForwardsSelectorsAndPrintsDigest(t *testing.T) {
 		t.Fatalf("selected transcript unexpectedly printed digest counts: %q", stdout)
 	}
 
-	code, stdout, stderr = runTestCLI(t, a, []string{"transcript", "--job", "job-1"})
-	if code != 2 || stderr != "" || !strings.Contains(stdout, "counts message=1 reasoning=1 tool=1 toolResult=1 fileChange=0 warning=0 error=1") {
+	code, stdout, stderr = runTestCLI(t, a, []string{"transcript", "job-1"})
+	if code != 0 || stderr != "" || !strings.Contains(stdout, "counts message=1 reasoning=1 tool=1 toolResult=1 fileChange=0 warning=0 error=1") {
 		t.Fatalf("digest transcript = (%d,%q,%q)", code, stdout, stderr)
 	}
 
-	code, stdout, stderr = runTestCLI(t, a, []string{"transcript", "--job", "job-1", "--json"})
-	if code != 2 || stderr != "" {
+	code, stdout, stderr = runTestCLI(t, a, []string{"transcript", "job-1", "--json"})
+	if code != 0 || stderr != "" {
 		t.Fatalf("JSON transcript = (%d,%q)", code, stderr)
 	}
 	var decoded agentclient.JobTranscriptResult
@@ -569,13 +623,14 @@ func TestTranscriptShowsPrunedIndication(t *testing.T) {
 	}
 	a := testApp(t)
 	a.clientConnect = fakeConnector(client)
-	code, stdout, stderr := runTestCLI(t, a, []string{"transcript", "--job", "job-1"})
+	code, stdout, stderr := runTestCLI(t, a, []string{"transcript", "job-1"})
 	if code != 0 || stderr != "" || !strings.Contains(stdout, "pruned=true") {
 		t.Fatalf("pruned transcript=(%d,%q,%q)", code, stdout, stderr)
 	}
 }
 
 func TestResultHumanProjection(t *testing.T) {
+	pipeResult := verifiedResultForTest(t, "pipe me")
 	tests := []struct {
 		name       string
 		record     agentclient.JobGetResult
@@ -584,9 +639,9 @@ func TestResultHumanProjection(t *testing.T) {
 		wantStderr string
 	}{
 		{
-			name:     "text is pipeable and newline terminated",
-			record:   withResult(detailedRecord(protocol.PublicStateCompleted), &protocol.ResultInfoWire{Text: "pipe me", SHA256: strings.Repeat("a", sha256.Size*2), Bytes: 7}),
-			wantCode: 0, wantStdout: "pipe me\n",
+			name:     "text is pipeable without an added newline",
+			record:   withResult(detailedRecord(protocol.PublicStateCompleted), pipeResult),
+			wantCode: 0, wantStdout: "pipe me",
 		},
 		{
 			name:       "completed without result is unavailable",
@@ -610,7 +665,7 @@ func TestResultHumanProjection(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			a := testApp(t)
 			a.clientConnect = fakeConnector(&fakeProtocolClient{records: map[string]agentclient.JobGetResult{"job-1": tt.record}})
-			code, stdout, stderr := runTestCLI(t, a, []string{"result", "--job", "job-1"})
+			code, stdout, stderr := runTestCLI(t, a, []string{"result", "job-1"})
 			if code != tt.wantCode || stdout != tt.wantStdout || !strings.Contains(stderr, tt.wantStderr) {
 				t.Fatalf("result=(code=%d stdout=%q stderr=%q), want code=%d stdout=%q stderr containing %q", code, stdout, stderr, tt.wantCode, tt.wantStdout, tt.wantStderr)
 			}
@@ -633,9 +688,32 @@ func TestResultStreamsVerifiedArtifact(t *testing.T) {
 	a := testApp(t)
 	a.clientConnect = fakeConnector(&fakeProtocolClient{records: map[string]agentclient.JobGetResult{"job-1": record}})
 
-	code, stdout, stderr := runTestCLI(t, a, []string{"result", "--job", "job-1"})
+	code, stdout, stderr := runTestCLI(t, a, []string{"result", "job-1"})
 	if code != 0 || stdout != string(artifactBytes) || stderr != "" {
 		t.Fatalf("result=(code=%d stdout=%d bytes stderr=%q), want verified artifact bytes and success", code, len(stdout), stderr)
+	}
+}
+
+func TestResultPreservesEmptyAndTrailingNewlineBytes(t *testing.T) {
+	for _, content := range []string{"", "line\n\n"} {
+		t.Run(fmt.Sprintf("bytes=%d", len(content)), func(t *testing.T) {
+			record := withResult(detailedRecord(protocol.PublicStateCompleted), verifiedResultForTest(t, content))
+			a := testApp(t)
+			a.clientConnect = fakeConnector(&fakeProtocolClient{records: map[string]agentclient.JobGetResult{"job-1": record}})
+			code, stdout, stderr := runTestCLI(t, a, []string{"result", "job-1"})
+			if code != 0 || stdout != content || stderr != "" {
+				t.Fatalf("result=(%d,%q,%q), want exact bytes %q", code, stdout, stderr, content)
+			}
+			code, stdout, stderr = runTestCLI(t, a, []string{"result", "job-1", "--json"})
+			var envelope struct {
+				Result map[string]json.RawMessage `json:"result"`
+			}
+			decodeJSON(t, stdout, &envelope)
+			var text string
+			if err := json.Unmarshal(envelope.Result["text"], &text); code != 0 || stderr != "" || err != nil || text != content {
+				t.Fatalf("JSON result=(%d,%q,%q), text=%q err=%v", code, stdout, stderr, text, err)
+			}
+		})
 	}
 }
 
@@ -654,7 +732,7 @@ func TestResultRejectsPrefixedDigest(t *testing.T) {
 	a := testApp(t)
 	a.clientConnect = fakeConnector(&fakeProtocolClient{records: map[string]agentclient.JobGetResult{"job-1": record}})
 
-	code, stdout, stderr := runTestCLI(t, a, []string{"result", "--job", "job-1"})
+	code, stdout, stderr := runTestCLI(t, a, []string{"result", "job-1"})
 	if code != cliExitResultUnavailable || stdout != "" || !strings.Contains(stderr, "SHA-256 check failed") {
 		t.Fatalf("result=(code=%d stdout=%q stderr=%q), want prefixed digest rejection", code, stdout, stderr)
 	}
@@ -670,7 +748,7 @@ func TestResultMissingArtifactReturnsExit15WithoutStdout(t *testing.T) {
 	a := testApp(t)
 	a.clientConnect = fakeConnector(&fakeProtocolClient{records: map[string]agentclient.JobGetResult{"job-1": record}})
 
-	code, stdout, stderr := runTestCLI(t, a, []string{"result", "--job", "job-1"})
+	code, stdout, stderr := runTestCLI(t, a, []string{"result", "job-1"})
 	if code != 15 || stdout != "" || !strings.Contains(stderr, artifactPath) || !strings.Contains(stderr, "missing") {
 		t.Fatalf("result=(code=%d stdout=%q stderr=%q), want exit 15, empty stdout, and missing artifact diagnostic", code, stdout, stderr)
 	}
@@ -728,8 +806,8 @@ func TestResultJSONRetainsRecordButUsesExit15ForUnusableArtifact(t *testing.T) {
 			a := testApp(t)
 			a.clientConnect = fakeConnector(&fakeProtocolClient{records: map[string]agentclient.JobGetResult{"job-1": record}})
 
-			statusCode, statusJSON, statusErr := runTestCLI(t, a, []string{"status", "--job", "job-1", "--json"})
-			resultCode, resultJSON, resultErr := runTestCLI(t, a, []string{"result", "--job", "job-1", "--json"})
+			statusCode, statusJSON, statusErr := runTestCLI(t, a, []string{"status", "job-1", "--json"})
+			resultCode, resultJSON, resultErr := runTestCLI(t, a, []string{"result", "job-1", "--json"})
 			if statusCode != 0 || statusErr != "" || resultCode != cliExitResultUnavailable || resultErr != "" {
 				t.Fatalf("status=(%d,%q) result=(%d,%q), want status success and result exit %d", statusCode, statusErr, resultCode, resultErr, cliExitResultUnavailable)
 			}
@@ -741,7 +819,8 @@ func TestResultJSONRetainsRecordButUsesExit15ForUnusableArtifact(t *testing.T) {
 }
 
 func TestExitCodesUseStateFailureAndContract(t *testing.T) {
-	completedNoncompliant := detailedRecord(protocol.PublicStateCompleted)
+	completed := withResult(detailedRecord(protocol.PublicStateCompleted), verifiedResultForTest(t, "complete"))
+	completedNoncompliant := completed
 	completedNoncompliant.Contract = &protocol.ContractResult{Evaluated: true, Compliant: false}
 	tests := []struct {
 		name   string
@@ -750,7 +829,7 @@ func TestExitCodesUseStateFailureAndContract(t *testing.T) {
 	}{
 		{"queued", detailedRecord(protocol.PublicStateQueued), 2},
 		{"running", detailedRecord(protocol.PublicStateRunning), 2},
-		{"completed", detailedRecord(protocol.PublicStateCompleted), 0},
+		{"completed", completed, 0},
 		{"completed noncompliant", completedNoncompliant, 3},
 		{"failed default", detailedRecord(protocol.PublicStateFailed), 4},
 		{"failed timeout", withFailure(detailedRecord(protocol.PublicStateFailed), protocol.FailureClassTimeout, "timeout"), 5},
@@ -767,11 +846,11 @@ func TestExitCodesUseStateFailureAndContract(t *testing.T) {
 			}
 			a := testApp(t)
 			a.clientConnect = fakeConnector(client)
-			statusCode, _, _ := runTestCLI(t, a, []string{"status", "--job", "job-1", "--json"})
-			resultCode, _, _ := runTestCLI(t, a, []string{"result", "--job", "job-1", "--json"})
-			transcriptCode, _, _ := runTestCLI(t, a, []string{"transcript", "--job", "job-1", "--json"})
-			cancelCode, _, _ := runTestCLI(t, a, []string{"cancel", "--job", "job-1", "--json"})
-			if statusCode != tt.want || resultCode != tt.want || transcriptCode != tt.want || cancelCode != tt.want {
+			statusCode, _, _ := runTestCLI(t, a, []string{"status", "job-1", "--json"})
+			resultCode, _, _ := runTestCLI(t, a, []string{"result", "job-1", "--json"})
+			transcriptCode, _, _ := runTestCLI(t, a, []string{"transcript", "job-1", "--json"})
+			cancelCode, _, _ := runTestCLI(t, a, []string{"cancel", "job-1", "--json"})
+			if statusCode != 0 || resultCode != tt.want || transcriptCode != 0 || cancelCode != tt.want {
 				t.Fatalf("selected-job exits: status=%d result=%d transcript=%d cancel=%d, want %d", statusCode, resultCode, transcriptCode, cancelCode, tt.want)
 			}
 		})
@@ -786,7 +865,7 @@ func TestCancelFetchesRecordForContractExitCode(t *testing.T) {
 		records: map[string]agentclient.JobGetResult{"job-1": record},
 		cancels: map[string]agentclient.JobCancelResult{"job-1": {JobID: "job-1", State: protocol.PublicStateCompleted}},
 	})
-	code, stdout, stderr := runTestCLI(t, a, []string{"cancel", "--job", "job-1", "--json"})
+	code, stdout, stderr := runTestCLI(t, a, []string{"cancel", "job-1", "--json"})
 	if code != 3 || stderr != "" {
 		t.Fatalf("cancel exit=%d stderr=%q", code, stderr)
 	}
@@ -811,7 +890,7 @@ func TestProtocolErrorsAndStartupFailuresKeepTypedExitCodes(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			a := testApp(t)
 			a.clientConnect = func(context.Context, agentclient.Options) (protocolClient, error) { return nil, tt.err }
-			code, stdout, stderr := runTestCLI(t, a, []string{"status", "--job", "missing"})
+			code, stdout, stderr := runTestCLI(t, a, []string{"status", "missing"})
 			if code != tt.want || stdout != "" || stderr == "" {
 				t.Fatalf("status=(%d,%q,%q), want code %d and diagnostics", code, stdout, stderr, tt.want)
 			}
@@ -909,7 +988,7 @@ func TestPruneDefaultsToDryRunAndSupportsApply(t *testing.T) {
 func TestServeConcurrencyFlagsReachBackgroundDaemon(t *testing.T) {
 	a := testApp(t)
 	a.daemonLauncher = func(_ context.Context, opts daemonlaunch.Options) (daemonlaunch.Result, error) {
-		want := []string{"serve", "--foreground", "--max-jobs", "3", "--max-jobs-per-backend", "1", "--max-queued", "9"}
+		want := []string{"serve", "--foreground", "--max-jobs", "3", "--max-jobs-per-backend", "1", "--max-queued", "9", "--prune-interval", "24h0m0s"}
 		if !slices.Equal(opts.Args, want) {
 			t.Fatalf("launch args = %v, want %v", opts.Args, want)
 		}
@@ -921,13 +1000,50 @@ func TestServeConcurrencyFlagsReachBackgroundDaemon(t *testing.T) {
 	}
 }
 
-func TestCodexHomeSettingsPreferInheritance(t *testing.T) {
-	t.Setenv("AGENTBUS_CODEX_HOME", "/override")
-	t.Setenv("AGENTBUS_CODEX_HOME_INHERIT", "1")
-	t.Setenv("CODEX_HOME", "/auth")
-	override, inherit, authHome := codexHomeSettings()
-	if override != "/override" || !inherit || authHome != "/auth" {
-		t.Fatalf("settings=(%q,%t,%q)", override, inherit, authHome)
+func TestServeForwardsZeroPruneInterval(t *testing.T) {
+	a := testApp(t)
+	a.daemonLauncher = func(_ context.Context, opts daemonlaunch.Options) (daemonlaunch.Result, error) {
+		if got := opts.Args[len(opts.Args)-2:]; !slices.Equal(got, []string{"--prune-interval", "0s"}) {
+			t.Fatalf("launch prune interval = %v, want zero", got)
+		}
+		return daemonlaunch.Result{PID: 4242, CanonicalStateRoot: a.stateRoot}, nil
+	}
+	code, stdout, stderr := runTestCLI(t, a, []string{"serve", "--prune-interval", "0"})
+	if code != 0 || stdout != "" || stderr != "" {
+		t.Fatalf("serve = (%d, %q, %q)", code, stdout, stderr)
+	}
+}
+
+func TestNoAutostartConfiguration(t *testing.T) {
+	for _, test := range []struct {
+		value   string
+		disable bool
+		valid   bool
+	}{
+		{value: "", valid: true},
+		{value: "0", valid: true},
+		{value: "1", disable: true, valid: true},
+		{value: "yes"},
+	} {
+		t.Run("value="+test.value, func(t *testing.T) {
+			t.Setenv("AGENTBUS_NO_AUTOSTART", test.value)
+			a := testApp(t)
+			called := false
+			a.clientConnect = func(_ context.Context, opts agentclient.Options) (protocolClient, error) {
+				called = true
+				if opts.DisableAutoStart != test.disable || opts.StateRoot != a.stateRoot || opts.CommandPath == "" {
+					t.Fatalf("client options = %+v", opts)
+				}
+				return &fakeProtocolClient{}, nil
+			}
+			code, _, stderr := runTestCLI(t, a, []string{"backends"})
+			if test.valid && (code != 0 || !called) {
+				t.Fatalf("valid configuration: exit=%d called=%t stderr=%q", code, called, stderr)
+			}
+			if !test.valid && (code == 0 || called || !strings.Contains(stderr, "AGENTBUS_NO_AUTOSTART")) {
+				t.Fatalf("invalid configuration: exit=%d called=%t stderr=%q", code, called, stderr)
+			}
+		})
 	}
 }
 
@@ -988,6 +1104,8 @@ type fakeProtocolClient struct {
 	pruneParams      []agentclient.ArtifactsPruneParams
 	steer            agentclient.JobSteerResult
 	steerParams      agentclient.JobSteerParams
+	discard          agentclient.SessionDiscardResult
+	discardParams    agentclient.SessionDiscardParams
 	cancelParams     []agentclient.JobCancelParams
 	err              error
 }
@@ -1064,6 +1182,14 @@ func (c *fakeProtocolClient) Steer(_ context.Context, params agentclient.JobStee
 	return c.steer, nil
 }
 
+func (c *fakeProtocolClient) SessionDiscard(_ context.Context, params agentclient.SessionDiscardParams) (agentclient.SessionDiscardResult, error) {
+	if c.err != nil {
+		return agentclient.SessionDiscardResult{}, c.err
+	}
+	c.discardParams = params
+	return c.discard, nil
+}
+
 func (c *fakeProtocolClient) Close() error { return nil }
 
 type failingWriter struct{}
@@ -1075,4 +1201,15 @@ func decodeJSON(t *testing.T, raw string, target any) {
 	if err := json.Unmarshal([]byte(raw), target); err != nil {
 		t.Fatalf("decode JSON %q: %v", raw, err)
 	}
+}
+
+// verifiedResultForTest constructs the same artifact metadata returned by the daemon.
+func verifiedResultForTest(t *testing.T, value string) *protocol.ResultInfoWire {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "result.txt")
+	if err := os.WriteFile(path, []byte(value), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte(value))
+	return &protocol.ResultInfoWire{Text: value, ResultPath: path, SHA256: hex.EncodeToString(sum[:]), Bytes: int64(len(value))}
 }

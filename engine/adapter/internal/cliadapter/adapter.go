@@ -7,6 +7,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/adapter/internal/duplex"
@@ -20,8 +22,6 @@ type Backend struct {
 	StreamSchema     string
 	AllowedModels    map[string]struct{}
 	AllowedEfforts   map[string]struct{}
-	BuildArgs        func(resumeID string, opts engine.SessionOpts, input engine.TurnInput) ([]string, error)
-	Parse            func(map[string]any) ([]engine.Event, string, error)
 	Driver           duplex.Driver
 	VersionTransform func(string) string
 	Discover         func(context.Context, command.ProbeRunner, string) (*engine.ModelDiscovery, error)
@@ -32,8 +32,6 @@ type StaticBackendDescriptor struct {
 	Binary                 string
 	MinimumVersion         string
 	StreamSchema           string
-	AllowedModels          map[string]struct{}
-	AllowedEfforts         map[string]struct{}
 	DiscoveredModels       []string
 	DiscoveredEfforts      []string
 	DiscoverySource        string
@@ -97,11 +95,10 @@ func (b *Backend) Start(ctx context.Context, opts engine.SessionOpts) (engine.Se
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	warning, err := b.validateOptions(opts)
-	if err != nil {
+	if err := b.validateOptions(opts); err != nil {
 		return nil, err
 	}
-	return b.newSession("", opts, warning, false)
+	return b.newSession("", opts)
 }
 
 func (b *Backend) Resume(ctx context.Context, id string, opts engine.SessionOpts) (engine.Session, error) {
@@ -111,30 +108,16 @@ func (b *Backend) Resume(ctx context.Context, id string, opts engine.SessionOpts
 	if strings.TrimSpace(id) == "" {
 		return nil, errors.New("resume session id is required")
 	}
-	warning, err := b.validateOptions(opts)
-	if err != nil {
+	if err := b.validateOptions(opts); err != nil {
 		return nil, err
 	}
-	return b.newSession(id, opts, warning, false)
+	return b.newSession(id, opts)
 }
 
-func (b *Backend) newSession(id string, opts engine.SessionOpts, validationWarning string, suppressValidationWarning bool) (engine.Session, error) {
-	session := &Session{
-		backend:                   b,
-		opts:                      opts,
-		validationWarning:         validationWarning,
-		suppressValidationWarning: suppressValidationWarning,
-	}
-	driver := b.Driver
-	if driver == nil {
-		var err error
-		driver, err = newOneShotDriver(b)
-		if err != nil {
-			return nil, err
-		}
-	}
+func (b *Backend) newSession(id string, opts engine.SessionOpts) (engine.Session, error) {
+	session := &Session{}
 	duplexSession, err := duplex.NewSession(duplex.SessionConfig{
-		Driver:   driver,
+		Driver:   b.Driver,
 		Options:  opts,
 		ResumeID: id,
 	})
@@ -142,7 +125,7 @@ func (b *Backend) newSession(id string, opts engine.SessionOpts, validationWarni
 		return nil, err
 	}
 	session.duplexSession = duplexSession
-	if _, ok := driver.(duplex.SteerDriver); ok {
+	if _, ok := b.Driver.(duplex.SteerDriver); ok {
 		return &steerableSession{Session: session}, nil
 	}
 	return session, nil
@@ -169,8 +152,6 @@ func (b *Backend) staticDescriptor() StaticBackendDescriptor {
 		Binary:           b.binary(),
 		MinimumVersion:   b.MinimumVersion,
 		StreamSchema:     b.StreamSchema,
-		AllowedModels:    cloneStringSet(b.AllowedModels),
-		AllowedEfforts:   cloneStringSet(b.AllowedEfforts),
 		VersionTransform: b.VersionTransform,
 		Discover:         b.Discover,
 	}
@@ -243,33 +224,21 @@ func normalizeVersionWith(s string, transform func(string) string) string {
 	return strings.TrimPrefix(s, "v")
 }
 
-func (b *Backend) validateOptions(opts engine.SessionOpts) (string, error) {
-	return ValidateStaticOptions(b.staticDescriptor(), opts)
-}
-
-func ValidateStaticOptions(descriptor StaticBackendDescriptor, opts engine.SessionOpts) (string, error) {
-	if opts.Model != "" {
-		if _, ok := descriptor.AllowedModels[opts.Model]; !ok && len(descriptor.AllowedModels) > 0 {
-			return "", fmt.Errorf("unsupported model %q for %s", opts.Model, descriptor.NameValue)
+func (b *Backend) validateOptions(opts engine.SessionOpts) error {
+	for name, value := range map[string]string{"model": opts.Model, "effort": opts.Effort} {
+		if value == "" {
+			continue
+		}
+		if !utf8.ValidString(value) || strings.TrimSpace(value) == "" {
+			return fmt.Errorf("%s must contain valid non-whitespace UTF-8", name)
+		}
+		for _, r := range value {
+			if unicode.IsControl(r) {
+				return fmt.Errorf("%s must not contain control characters", name)
+			}
 		}
 	}
-	if opts.Effort != "" {
-		if _, ok := descriptor.AllowedEfforts[opts.Effort]; !ok && len(descriptor.AllowedEfforts) > 0 {
-			return "", fmt.Errorf("unsupported effort %q for %s", opts.Effort, descriptor.NameValue)
-		}
-	}
-	return "", nil
-}
-
-func cloneStringSet(in map[string]struct{}) map[string]struct{} {
-	if in == nil {
-		return nil
-	}
-	out := make(map[string]struct{}, len(in))
-	for value := range in {
-		out[value] = struct{}{}
-	}
-	return out
+	return nil
 }
 
 func sortedStringSet(values map[string]struct{}) []string {
@@ -293,17 +262,13 @@ func (b *Backend) discoveryWarning(probe ProbedBackendDescriptor) string {
 		return probe.DiscoveryWarning
 	}
 	if probe.DiscoverySource == "" && len(probe.DiscoveredModels) == 0 && len(probe.DiscoveredEfforts) == 0 {
-		return "model discovery unavailable; using static known-good validation lists"
+		return "model discovery unavailable; provider validates selections"
 	}
 	return ""
 }
 
 type Session struct {
-	backend                   *Backend
-	opts                      engine.SessionOpts
-	validationWarning         string
-	suppressValidationWarning bool
-	duplexSession             *duplex.Session
+	duplexSession *duplex.Session
 }
 
 func (s *Session) ID() string {
@@ -318,36 +283,17 @@ func (s *Session) TurnWithRunner(ctx context.Context, input engine.TurnInput, ru
 	if runner == nil {
 		return nil, errors.New("command runner is required")
 	}
-	warningText, err := s.backend.validateOptions(s.opts)
-	if err != nil {
-		return nil, err
+	var instruction string
+	switch input.Intent {
+	case engine.IntentInspect:
+		instruction = "Inspect the task and report your findings. Do not edit project source or configuration. You may run commands that produce ordinary build and test artifacts, use caches and temporary files, and start local services needed for the task. Write requested evidence artifacts only where directed."
+	case engine.IntentEdit:
+		instruction = "Make the changes requested by the task. Keep source, configuration, and other changes within the task's scope."
+	default:
+		return nil, fmt.Errorf("invalid turn intent %q", input.Intent)
 	}
-	if warningText == "" {
-		warningText = s.validationWarning
-	}
-	if s.suppressValidationWarning {
-		warningText = ""
-	}
-	return s.turnWithDuplexRunner(ctx, input, runner, warningText)
-}
-
-func (s *Session) turnWithDuplexRunner(ctx context.Context, input engine.TurnInput, runner command.Runner, warningText string) (<-chan engine.Event, error) {
-	events, err := s.duplexSession.TurnWithRunner(ctx, input, runner)
-	if err != nil {
-		return nil, err
-	}
-	if warningText == "" {
-		return events, nil
-	}
-	out := make(chan engine.Event, 16)
-	go func() {
-		defer close(out)
-		out <- warning(warningText)
-		for ev := range events {
-			out <- ev
-		}
-	}()
-	return out, nil
+	input.Prompt = instruction + "\n\n" + input.Prompt
+	return s.duplexSession.TurnWithRunner(ctx, input, runner)
 }
 
 func (s *Session) Interrupt(ctx context.Context) error {
@@ -356,19 +302,6 @@ func (s *Session) Interrupt(ctx context.Context) error {
 
 func (s *Session) NativeInterrupt(ctx context.Context) (bool, error) {
 	return s.duplexSession.NativeInterrupt(ctx)
-}
-
-func capEvent(ev engine.Event) engine.Event {
-	ev.RawText = ev.Text
-	text := engine.TruncateEventText([]byte(ev.Text), engine.DefaultEventTextCap)
-	ev.Text = text.Text
-	ev.Truncated = ev.Truncated || text.Truncated
-	ev.Metadata = engine.SanitizeEventMetadata(ev.Metadata)
-	return ev
-}
-
-func warning(text string) engine.Event {
-	return engine.Event{Type: engine.EventWarning, Text: text}
 }
 
 func compareVersion(a, b string) int {

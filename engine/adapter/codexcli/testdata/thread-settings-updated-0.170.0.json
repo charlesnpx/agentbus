@@ -1,0 +1,1 @@
+{"method":"thread/settings/updated","params":{"threadId":"thread-sanitized","threadSettings":{"approvalPolicy":"never","approvalsReviewer":"user","collaborationMode":{"mode":"default","settings":{"model":"gpt-6-luna","reasoning_effort":"max"}},"cwd":"/workspace","model":"gpt-6-luna","modelProvider":"openai","sandboxPolicy":{"type":"dangerFullAccess"},"effort":"max"}}}

@@ -32,12 +32,10 @@ type acpDriver struct {
 type activeACPTurn struct {
 	mu                 sync.Mutex
 	sessionID          string
-	write              bool
 	promptActive       bool
 	interruptRequested bool
 	jobCancelled       bool
 	finished           bool
-	steerRequested     bool
 	pendingSteer       *acpSteerRequest
 }
 
@@ -230,12 +228,6 @@ func (t *activeACPTurn) finish() {
 	}
 }
 
-func (t *activeACPTurn) hasSteerRequest() bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.steerRequested
-}
-
 func newACPDriver(binary string) *acpDriver {
 	return &acpDriver{
 		binary:         binary,
@@ -270,7 +262,7 @@ func (d *acpDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resumeID str
 		return resumeID, err
 	}
 
-	active := &activeACPTurn{sessionID: info.sessionID, write: input.Write}
+	active := &activeACPTurn{sessionID: info.sessionID}
 	d.setActive(conn, active)
 	defer func() {
 		active.finish()
@@ -279,15 +271,15 @@ func (d *acpDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resumeID str
 
 	model := info.currentModel()
 	if opts.Model != "" {
-		model = resolveModelID(opts.Model, anySlice(info.models["availableModels"]))
-		if err := rpc.setModel(ctx, info.sessionID, model); err != nil {
+		model = ""
+		if err := rpc.setModel(ctx, info.sessionID, opts.Model); err != nil {
 			return info.sessionID, fmt.Errorf("could not select Cursor model: %w", err)
 		}
 	}
 	if model != "" && emit != nil {
 		emit(engine.Event{Type: engine.EventModelReported, ModelReported: model})
 	}
-	if err := rpc.setMode(ctx, info.sessionID, cursorMode(input.Write)); err != nil {
+	if err := rpc.setMode(ctx, info.sessionID, "agent"); err != nil {
 		return info.sessionID, fmt.Errorf("could not verify Cursor mode: %w", err)
 	}
 
@@ -314,13 +306,9 @@ func (d *acpDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resumeID str
 			if jobCancelled {
 				// Preserve the existing empty result for an explicit job cancel;
 				// never expose the cancelled segment's partial text as a result.
-				if active.hasSteerRequest() {
-					observer.emitEvent(duplex.ResultSegmentBoundary())
-				}
 				observer.emitEvent(engine.Event{Type: engine.EventResultMessage})
 				return info.sessionID, nil
 			}
-			observer.emitEvent(duplex.ResultSegmentBoundary())
 			observer = &acpTurnObserver{emit: emit}
 			result, err = active.prompt(ctx, rpc, continuation.text, observer, continuation)
 		default:
@@ -370,7 +358,6 @@ func (d *acpDriver) Steer(ctx context.Context, conn *duplex.Conn, msg engine.Ste
 		return engine.SteerDelivery{}, err
 	}
 	active.interruptRequested = true
-	active.steerRequested = true
 	active.mu.Unlock()
 
 	select {
@@ -633,9 +620,6 @@ func (c *acpRPC) handlePermissionRequest(id any, params map[string]any) error {
 	}
 
 	wantKind := "allow_once"
-	if !active.write {
-		wantKind = "reject_once"
-	}
 	for _, raw := range anySlice(params["options"]) {
 		option, ok := raw.(map[string]any)
 		if !ok || firstString(option, "kind") != wantKind {
@@ -699,31 +683,6 @@ func parseSessionInfo(result any) (acpSessionInfo, error) {
 
 func (i acpSessionInfo) currentModel() string {
 	return firstString(i.models, "currentModelId")
-}
-
-func resolveModelID(requested string, availableModels []any) string {
-	for _, raw := range availableModels {
-		model, ok := raw.(map[string]any)
-		if !ok {
-			continue
-		}
-		name, _ := model["name"].(string)
-		modelID, _ := model["modelId"].(string)
-		if name == requested && modelID != "" {
-			return modelID
-		}
-	}
-	for _, raw := range availableModels {
-		model, ok := raw.(map[string]any)
-		if !ok {
-			continue
-		}
-		modelID, _ := model["modelId"].(string)
-		if modelID == requested {
-			return modelID
-		}
-	}
-	return requested
 }
 
 type acpTurnObserver struct {
@@ -885,13 +844,6 @@ func absoluteCWD(cwd string) (string, error) {
 		}
 	}
 	return filepath.Abs(cwd)
-}
-
-func cursorMode(write bool) string {
-	if write {
-		return "agent"
-	}
-	return "plan"
 }
 
 func sessionUpdate(params map[string]any) map[string]any {

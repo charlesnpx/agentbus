@@ -1,20 +1,23 @@
 # Agentbus ADR index
 
-ADR-14 is the sole normative decision record for the current release.
+ADR-15 records the release decision. Earlier ADRs are historical, including
+ADR-14's conflicting protocol, sandbox, cache, retention, and deployment rules.
+No additional release decision is delegated to an earlier ADR.
 
 ## Current
 
 | ADR | Decision |
 | --- | --- |
-| [ADR-14](ADR-14-simplified-core.md) | Simplified core: one bbolt job service, four RPC methods, six public states, inline JSON Schema validation, and process-group supervision. |
+| [ADR-15](ADR-15-protocol4-intent.md) | Protocol 4, format 2, explicit intent, one execution policy, normal caches, and owned conversation homes. |
 
 ## Historical
 
-Every record below is retained as the decision history and is superseded by
-ADR-14.
+These records are retained as decision history. ADR-14 superseded earlier
+decisions in its time; ADR-15 defines the current release.
 
 | ADR | Historical decision |
 | --- | --- |
+| [ADR-14](ADR-14-simplified-core.md) | Simplified core and the earlier protocol, cache, and sandbox rules. |
 | [ADR-0](../history/ADR-0.md) | Reliability contract |
 | [ADR-0B](../history/ADR-0B.md) | Stable replay key and fingerprint ordering |
 | [ADR-1](../history/ADR-1.md) | Atomic root AdmissionStore |

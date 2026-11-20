@@ -8,16 +8,15 @@ jobs, supervises their process groups, and exposes a small JSON-RPC interface.
 Agentbus depends on nothing in the delegate/convo-relay/witness set.
 
 `delegate` imports `github.com/charlesnpx/agentbus/client`, pins a released
-Agentbus version, and its installer invokes `agentbus configure-codex-sandbox`;
-changes to those surfaces can break Delegate's build or installer.
+Agentbus version; changes to the client API require coordinated consumer updates.
 
 `convo-relay` embeds `github.com/charlesnpx/agentbus/engine` and its adapters;
 changes to those packages or their APIs can break its build.
 
-Version 0.14.0 serves protocol version 3. The published contract is
-[docs/protocol.md](docs/protocol.md). Operator details, including the required
-state-root break for this release, are in
-[docs/operations.md](docs/operations.md).
+Version 0.18.0 serves protocol version 4 and uses store format 2. The published
+contract is [docs/protocol.md](docs/protocol.md). See
+[docs/deployment-0.18.md](docs/deployment-0.18.md) for fresh deployment and
+[docs/operations.md](docs/operations.md) for ongoing operation.
 
 ## CLI
 
@@ -26,19 +25,19 @@ agentbus version [--json]
 agentbus --help
 agentbus backends [--json]
 agentbus serve [--foreground] [--max-jobs <n>] [--max-jobs-per-backend <n>] [--max-queued <n>] [--prune-interval 24h]
-agentbus status [--job <id>] [--tag <key=value>] [--state <state>] [--workspace-key <key>] [--limit <n>] [--before <cursor> | --all] [--json]
-agentbus transcript --job <id> [--follow] [--kind <kind>] [--since <timestamp>] [--since-ordinal <n>] [--last <n>] [--limit <n>] [--json]
-agentbus result --job <id> [--wait [--wait-timeout <duration>]] [--json]
-agentbus cancel --job <id> [--json]
+agentbus status [<job-id>] [--tag <key=value>] [--state <state>] [--workspace-key <key>] [--limit <n>] [--before <cursor> | --all] [--json]
+agentbus transcript <job-id> [--follow] [--kind <kind>] [--since <timestamp>] [--since-ordinal <n>] [--last <n>] [--limit <n>] [--json]
+agentbus result <job-id> [--wait [--wait-timeout <duration>]] [--json]
+agentbus cancel <job-id> [--json]
 agentbus prune [--apply] [--successful-older-than 168h] [--failed-older-than 720h] [--json]
-agentbus steer --job <id> --request-id <messageId> --message-file <path|-> [--json]
-agentbus configure-codex-sandbox [--writable-root <absolute-path>]... [--json]
+agentbus steer <job-id> --request-id <messageId> --message-file <path|-> [--json]
+agentbus session discard <job-id> [--json]
 ~~~
 
 Help exits successfully without starting or contacting the daemon. Use
 `agentbus -h`, `agentbus help`, or `agentbus status --help` for usage.
 
-Status without `--job` prints the 50 newest matching jobs. JSON output includes
+Status without a job ID prints the 50 newest matching jobs. JSON output includes
 `truncated: true` and `nextCursor` when another page exists; text output prints
 the continuation cursor on stderr. Continue with that cursor, or request full
 history explicitly:
@@ -53,15 +52,15 @@ agentbus status --all
 `limit`; the CLI sends a limit by default. `--all` explicitly omits that limit.
 
 `result --wait` observes the job with `job.get` until it becomes terminal or
-the observation timeout expires. The default timeout is 30m. Expiry prints the
-current record and exits 16; if the first lookup times out before a record is
-available, it prints a timeout message to stderr and exits 16. It does not cancel
-the job. Durations need explicit units: `2400` is ambiguous, so use `2400s` or
-`40m`.
+the observation timeout expires. The default timeout is 30m. Expiry exits 16;
+JSON output includes the latest record when available. It does not cancel or
+extend the job. Durations need explicit units: `2400` is ambiguous, so use
+`2400s` or `40m`. Plain output is exactly the verified result artifact bytes,
+including an empty result or any trailing newlines.
 
 ~~~sh
-agentbus result --job "$JOB_ID" --wait --wait-timeout 30m
-agentbus result --job "$JOB_ID" --wait --wait-timeout 2400s --json
+agentbus result "$JOB_ID" --wait --wait-timeout 30m
+agentbus result "$JOB_ID" --wait --wait-timeout 2400s --json
 ~~~
 
 `transcript --follow` pages by ordinal until the job is terminal and its
@@ -70,17 +69,20 @@ by a summary object containing `gap`. Ctrl-C stops observation without
 cancelling the job.
 
 ~~~sh
-agentbus transcript --job "$JOB_ID" --follow --kind message
-agentbus transcript --job "$JOB_ID" --follow --json
+agentbus transcript "$JOB_ID" --follow --kind message
+agentbus transcript "$JOB_ID" --follow --json
 ~~~
 
-Singleton flags cannot be repeated (`--job a --job b` is a usage error).
+Options may appear before or after the job ID. Singleton flags cannot be repeated.
 Repeatable filters such as `--tag` and `--state` keep accepting multiple values.
+Successful status and transcript reads exit zero for every stored job state;
+result and cancellation commands use the outcome codes in the operations guide.
 
-Job submission uses the typed job.submit protocol method. There is no CLI submit
-command.
+Delegate submits tasks and reviews through the typed `job.submit` method;
+Agentbus provides status, result, cancel, and steer commands. There is no
+Agentbus CLI submit command.
 
-The daemon runs at most 4 jobs at once and 2 per backend by default, and keeps
+The daemon runs at most 12 jobs at once and 12 per backend by default, and keeps
 up to 64 additional jobs waiting. These are starting values, not measured
 optima. Set positive integer limits with `agentbus serve`; zero is rejected.
 The values apply when a daemon starts and do not change an already serving daemon.
@@ -88,51 +90,18 @@ When the waiting queue is full, a new job.submit is rejected with
 `queue_full` (CLI exit code 19). A matching deduplicated request does not use
 another queue entry. Job execution timeouts begin when a job gets a slot;
 `queuedAt` and `startedAt` show its wait and execution start.
-For a queued job, `status --job <id>` prints its position among jobs for the
+For a queued job, `status <job-id>` prints its position among jobs for the
 same backend and the current backend and total running limits. `status --json`
-with `--job` includes the same optional `queue` projection as `job.get`.
+with a job ID includes the same optional `queue` projection as `job.get`.
 
 TaskSpec `inputMode` is `fixed` when omitted. Set it to `steerable` only when
 the running task may receive follow-up instructions. `agentbus steer` submits
-one caller-identified message from a file or stdin; `status --job` shows the
+one caller-identified message from a file or stdin; `status <job-id>` shows the
 mode and text-free steer receipts. A steerable job retains one public job ID,
 deadline, permission envelope, model, effort, and schema. Delivery may be
 native or interrupt-and-continue depending on the adapter. Delivery uncertainty
 is reported without automatic redelivery; a steerable task does not guarantee
 that a provider follows the instruction or rolls back tools already started.
-TaskSpec `localIPC` is supported for Codex write and verify jobs on macOS and
-Linux; it is an optional request. On macOS, Unix sockets are limited to a
-short, private per-job IPC directory used as `TMPDIR`; TCP loopback is shared
-with the host.
-The macOS profile grants no Docker socket access or outbound domains. On Linux,
-the Codex profile allows connections to any host Unix socket at a path the job
-can read, except masked paths: `/run/user/<uid>`, `/run/docker.sock`,
-`/var/run/docker.sock`, the directory of `$SSH_AUTH_SOCK` (or just that socket
-file when its directory is shared with a job writable path), and the Agentbus
-daemon socket and token file. Linux abstract sockets, host loopback TCP and
-external network connections remain blocked. Linux `localIPC` therefore has a
-broader Unix socket scope than macOS.
-
-Local-IPC jobs set `TMPDIR` to the private IPC directory, set
-`SCCACHE_SERVER_UDS=<ipc>/sccache.sock`, and set
-`SCCACHE_DIR=<scratch>/cache/sccache`. Each sandboxed command starts its own
-sccache server, which exits with that command. Its cache lasts for the job. It
-is removed with the managed home when the job completes without
-`--retain-session`; failed, canceled and unknown jobs keep it with the
-resumable session until prune. Agentbus checks the longest
-expected socket path under the resolved IPC directory,
-`<resolved-ipc>/sccacheXXXXXX/sock`, before launch; if its byte length exceeds
-107 bytes on Linux or 103 bytes on macOS, the job fails with
-`backend_unavailable`.
-
-Before a Linux local-IPC job launches, Agentbus checks that the Codex sandbox
-can bind a Unix socket using that job's profile. If it cannot, the job fails
-with `backend_unavailable` and a diagnostic beginning `local IPC is unsupported
-by the Codex sandbox on this host:`. There is no weaker fallback. Agentbus
-caches the probe result by Codex executable path and version. The IPC directory
-is removed on completion, cancellation, timeout and restart recovery. Agentbus
-does not run `sccache --stop-server`. Claude and Cursor requests are rejected.
-A resumed job follows the new TaskSpec's `localIPC` value.
 Codex uses native app-server `turn/steer`; confirmation means its correlated
 JSON-RPC success response arrived before the steer context ended. No response
 before that deadline is reported as unconfirmed.
@@ -149,73 +118,51 @@ Cursor steering uses ACP interrupt-and-continue on the same session. Its
 prompt drained; ACP provides no separate acceptance acknowledgement before the
 new prompt's response.
 
-Set AGENTBUS_STATE_ROOT to select daemon state. Otherwise Agentbus uses
-$XDG_STATE_HOME/agentbus or ~/.local/state/agentbus.
+Set `AGENTBUS_STATE_ROOT` to select daemon state. Otherwise Agentbus uses
+`$XDG_STATE_HOME/agentbus/v2` or `~/.local/state/agentbus/v2`. Format 2 starts
+with fresh state and does not import older databases.
+The new default root is nested under the old default root; see the deployment
+guide before archiving or removing any earlier state.
+Set `AGENTBUS_NO_AUTOSTART=1` to prevent client commands from starting a daemon;
+empty or `0` enables normal autostart, and other values are invalid. An explicit
+`agentbus serve` still works.
 
-Writable jobs get private Go build, temporary, npm, Corepack, pnpm, and Yarn
-caches under their managed state directory, outside the repository. Codex
-workspace-write jobs can write there through the OS sandbox's managed writable
-root. Agentbus resolves the daemon's `GOMODCACHE` once (from the daemon
-environment, or `go env GOMODCACHE` with a short timeout) and leaves jobs
-pointing at that populated host cache for reads; it never replaces it with an
-empty per-job directory. The Codex sandbox allows reading the host module cache
-on macOS and Linux while keeping it outside the writable roots. If no cache
-path resolves, Agentbus leaves `GOMODCACHE` at its default. Codex jobs set
-`GOPROXY=off`, so a missing module fails with Go's own offline lookup error
-instead of repeated DNS retries. `-mod=readonly` only restricts module-file
-changes; it is not a filesystem sandbox.
+Automatic diagnostic pruning runs after readiness and every 24 hours by
+default; `serve --prune-interval 0` disables it. `agentbus prune` previews
+eligible logs and transcript files, and `--apply` removes them. Completed-job
+diagnostics default to seven days and other terminal diagnostics to 30 days.
+Prune preserves results, request bindings, job records, and conversation homes.
 
-Agentbus has three execution intentions. **Inspect** asks for no source writes.
-Codex uses its OS read-only sandbox with network denied; Claude restricts shell
-tools through its allowed/denied tool lists but has no OS filesystem boundary;
-Cursor uses its agent permission mode. Inspect does not create job-private
-scratch or writable caches. **Verify** sets TaskSpec `verify: true` with
-`write: false` and runs Codex in a disposable copy of the Git work tree. The
-copy contains tracked and untracked, non-ignored files as they exist when the
-job starts, has no `.git` metadata, and sits under managed scratch. Codex's OS
-sandbox grants writes only to that copy and scratch, adding the private IPC
-directory when `localIPC` is requested. Verify turns do not get the sandbox's
-implicit `/tmp` and `TMPDIR` writable grants; managed scratch remains writable
-through its explicit root. Network access is denied apart from the requested
-local IPC. The submitted source is not a writable root. Verify is refused for
-Claude and Cursor because their configured modes do not enforce
-that boundary. It requires a Git work tree, cannot resume or retain a session,
-and is limited to 2 GiB and 200,000 copied entries. **Edit** grants workspace
-writes. Ordinary Codex edits use the OS sandbox with managed scratch and network denied; trusted
-full-access Codex edits have no OS filesystem boundary. Claude edits have no OS
-filesystem boundary, and Cursor uses its agent permission mode.
+Codex conversation homes are private to the root job and reused by its
+continuations. A completed job requires `retainSession` and a provider session
+ID for continuation; unsuccessful jobs with a session ID are retained. Agentbus
+refuses a continuation while any job in the lineage is active or has uncertain
+cleanup. `agentbus session discard <job-id>` permanently revokes continuation
+for the whole inactive Codex conversation, including retained descendants, then
+removes its owned home. It leaves job history and results intact. Retained homes
+can contain substantial provider-managed data and are never pruned by age.
 
-A disposable copy protects the submitted tree by workflow arrangement; by
-itself it is not an OS security boundary for a process running as the same user
-without a sandbox.
-Verify therefore requires Codex's OS sandbox and refuses backends that cannot
-enforce the requested read-only boundary. Codex sandboxed jobs check that the
-OS sandbox can start before launching app-server; a failed check ends the job
-as `backend_unavailable` without a weaker fallback. `job.get` and
-`agentbus status --job <id>` expose the posture recorded at start, including
-intent, whether the submitted source is writable, shell policy, local IPC,
-network and Git metadata policy, scratch/cache paths, and enforcement strength.
-For verify, the posture also records the frozen copy path and its Git HEAD and
-dirty status. `localIPC` is `denied` for ordinary sandboxed Codex jobs,
-`all-unix-sockets` for Linux Codex jobs requesting local IPC, `private-dir` for
-macOS Codex jobs requesting it, and `unenforced` for trusted full-access Codex
-edits and Claude/Cursor. Linux's `all-unix-sockets` posture is not equivalent
-to macOS's `private-dir` posture. `sourceWritable` describes the
-submitted source tree; `enforcement` identifies an OS sandbox, agent
-permissions, or no filesystem boundary.
+Every task supplies an `inspect` or `edit` intent. Inspect asks the provider
+not to edit project source or configuration; it may use ordinary build and
+test artifacts, caches, temporary files, and local services. Edit asks the
+provider to make only the requested changes. Both use the same host execution
+policy. Intent is an instruction, not a filesystem, network, credential, or
+tool-permission boundary; host and provider restrictions can still apply.
 
-`configure-codex-sandbox` adds Agentbus's state and cache roots to
-`$CODEX_HOME/config.toml` (or `~/.codex/config.toml`), preserving existing TOML
-comments and formatting. Repeat `--writable-root` to add another absolute root.
+Agentbus inherits the daemon environment, applies adapter values, then the
+session's `EnvOverlay`. It does not create per-job build caches or override
+normal cache, temp, or Go proxy settings. The caller selects the workspace and
+must provide separate mutable workspaces when concurrent edits could conflict.
 
 `agentbus backends` calls the read-only `backend.inspect` method. It reports
 each configured backend's resolved executable path, version, and configured
-default model/effort. JSON entries use `backend`, `executablePath`, `version`,
-`defaultModel`, `defaultEffort`, and `error` when applicable. Each version
-probe is one bounded `--version` call per
-executable path and modification time for the daemon's lifetime; a failed
-backend is reported in its own entry. It does not query accounts, billing, or
-model catalogues. Use `--json` for the protocol response shape.
+default model/effort. The JSON response also reports the connected daemon's
+release, executable path, and protocol version. Entries use `backend`,
+`executablePath`, `version`, `defaultModel`, `defaultEffort`, and `error` when
+applicable. Each version probe is one bounded `--version` call per executable
+path and modification time for the daemon's lifetime; a failed backend is
+reported in its own entry. It does not query accounts, billing, or model
+catalogues. Use `--json` for the protocol response shape.
 
 The daemon accepts intentional per-backend defaults through
 `AGENTBUS_CODEX_DEFAULT_MODEL`, `AGENTBUS_CODEX_DEFAULT_EFFORT`,
@@ -225,10 +172,11 @@ explicit TaskSpec model or effort takes precedence. `modelRequested` and
 `effortRequested` in job.get record only values submitted in the TaskSpec, so
 they are omitted when the daemon supplied a default. `modelReported` and
 `effortReported` contain the latest values the provider reported; they are not
-filled from the request. **Requested is not executed**: provider telemetry is
+filled from the request. `selection` is the immutable model/effort chosen at
+start, and is distinct from those observations. **Requested is not executed**: provider telemetry is
 the evidence of what was observed, and it may be absent.
 
-Detailed job.get responses and `agentbus status --job <id>` expose `deadline`
+Detailed job.get responses and `agentbus status <job-id>` expose `deadline`
 and `remainingMs` for running jobs with a finite timeout, plus
 `resumable: {eligible, reason}` derived from the existing session and retention
 rules. Failed, canceled, and unknown terminal jobs keep their backend session
@@ -236,6 +184,9 @@ without `--retain-session`; completed jobs require session retention. Resume
 eligibility requires a recorded backend session ID, which is not exposed on the
 job record. The human-readable `reason` names the retention rule that applied.
 **Eligible is not guaranteed**: the provider may still reject a resume.
+The default execution deadline is two hours for both intents; an explicit
+`timeoutMs: 0` is unlimited. A finite job may receive one best-effort deadline
+notice at 90% of its execution budget, including in fixed input mode.
 `cancellationReason` records `operator`, `deadline`, `daemon_shutdown`, or
 `provider_interruption` independently of the existing terminal state.
 

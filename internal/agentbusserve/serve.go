@@ -11,7 +11,7 @@ import (
 	"github.com/charlesnpx/agentbus/internal/service"
 )
 
-// Config is the version-3 service configuration. agentbusserve owns only the
+// Config is the version-4 service configuration. agentbusserve owns only the
 // foreground-process/readiness bridge; service owns daemon behavior.
 type Config = service.Config
 type BackendDefaults = service.BackendDefaults
@@ -47,7 +47,7 @@ func (guard *readinessPublicationGuard) Ready(ctx context.Context, reporter *dae
 	return reporter.Ready(canonicalRoot, socketPath)
 }
 
-// Serve runs the version-3 service while preserving the launcher's readiness
+// Serve runs the version-4 service while preserving the launcher's readiness
 // FD protocol. The readiness frame is published only after service has bound
 // its socket and completed restart reconciliation.
 func Serve(ctx context.Context, cfg Config) error {
@@ -146,11 +146,11 @@ func Serve(ctx context.Context, cfg Config) error {
 		shutdownErr := server.Shutdown(shutdownCtx)
 		cancelShutdown()
 		stopService()
-		serveErr := <-done
 		if shutdownErr != nil && !errors.Is(shutdownErr, service.ErrShutdownNotServing) {
 			reportStartupFailure(reporter, shutdownErr)
 			return shutdownErr
 		}
+		serveErr := <-done
 		if shutdownErr != nil && errors.Is(shutdownErr, service.ErrShutdownNotServing) && cleanServeTerminationAfterCancel(ctx, serveErr) {
 			return nil
 		}

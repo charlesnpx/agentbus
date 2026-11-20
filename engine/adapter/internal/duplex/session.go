@@ -1,7 +1,6 @@
 package duplex
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -11,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
@@ -38,13 +38,13 @@ var (
 // EmitFunc emits one engine event from a driver.
 type EmitFunc func(engine.Event)
 
-const resultSegmentBoundaryEvent = "duplex.ResultSegmentBoundary"
+const orderedFrameDropEvent = "duplex.OrderedFrameDrop"
 
-// ResultSegmentBoundary returns a driver control event that clears the
-// fallback text used for an empty result. turnEmitter consumes it without
-// exposing it to callers.
-func ResultSegmentBoundary() engine.Event {
-	return engine.Event{Type: resultSegmentBoundaryEvent}
+// OrderedFrameDrop reports one recoverable omission before a driver consumes
+// any subsequent frame. The emitter accounts for it only after delivery.
+func OrderedFrameDrop(frame *OverlongFrameError) engine.Event {
+	drops := summarizeFrameDrop(frame)
+	return engine.Event{Type: orderedFrameDropEvent, Text: frameDropWarning(drops), Metadata: drops.EventMetadata()}
 }
 
 // Driver owns provider-specific turn semantics over a live duplex connection.
@@ -74,12 +74,11 @@ type SessionConfig struct {
 
 // Session is one resumable duplex process session.
 type Session struct {
-	runner          command.Runner
-	driver          Driver
-	opts            engine.SessionOpts
-	envOverlay      []string
-	writeEnvOverlay []string
-	interruptGrace  time.Duration
+	runner         command.Runner
+	driver         Driver
+	opts           engine.SessionOpts
+	envOverlay     []string
+	interruptGrace time.Duration
 
 	mu sync.Mutex
 	// id is the provider-confirmed resume ID supplied to the next turn. It is
@@ -94,21 +93,22 @@ type activeTurn struct {
 	running    command.RunningCommand
 	conn       *Conn
 	retirement *retirement
-	steerMu    sync.RWMutex
-	turnDone   bool
+	turnDone   atomic.Bool
 
 	interruptOnce sync.Once
 	interruptErr  error
 }
 
 type retirement struct {
-	done        chan struct{}
-	observation command.FinalObservation
+	done                  chan struct{}
+	observation           command.FinalObservation
+	deadlineExpiredAtWait bool
 }
 
 type turnResult struct {
-	resumeID string
-	err      error
+	resumeID    string
+	err         error
+	disposition turnDisposition
 }
 
 // NewSession constructs a duplex runtime session.
@@ -120,28 +120,22 @@ func NewSession(config SessionConfig) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	writeEnvOverlay, err := validatedEnvironmentOverlay(config.Options.WriteEnvOverlay)
-	if err != nil {
-		return nil, err
-	}
 
 	opts := config.Options
 	// The shared runtime owns the validated overlays and applies them after
 	// every driver ExecSpec. Drivers do not need the caller-owned maps.
 	opts.EnvOverlay = nil
-	opts.WriteEnvOverlay = nil
 	grace := config.InterruptGrace
 	if grace == 0 {
 		grace = DefaultInterruptGrace
 	}
 	return &Session{
-		runner:          config.Runner,
-		driver:          config.Driver,
-		opts:            opts,
-		envOverlay:      envOverlay,
-		writeEnvOverlay: writeEnvOverlay,
-		interruptGrace:  grace,
-		id:              config.ResumeID,
+		runner:         config.Runner,
+		driver:         config.Driver,
+		opts:           opts,
+		envOverlay:     envOverlay,
+		interruptGrace: grace,
+		id:             config.ResumeID,
 	}, nil
 }
 
@@ -216,14 +210,14 @@ func (s *Session) TurnWithRunner(ctx context.Context, input engine.TurnInput, ru
 		return nil, err
 	}
 
-	var stderr bytes.Buffer
+	var stderr diagnosticTail
 	var stderrLog *engine.CappedLogWriter
 	stderrCapture := &captureWarningTracker{source: "stderr"}
 	stderrWriter := io.Writer(&stderr)
 	if input.LogPaths.Stderr != "" {
 		stderrLog, err = engine.NewCappedLogWriter(input.LogPaths.Stderr, 0)
 		if err != nil {
-			stderrCapture.fail(err)
+			stderrCapture.failOpen(input.LogPaths.Stderr, err)
 			stderrLog = nil
 		} else {
 			stderrWriter = io.MultiWriter(&stderr, stderrCapture.tolerantWriter(stderrLog))
@@ -234,7 +228,7 @@ func (s *Session) TurnWithRunner(ctx context.Context, input engine.TurnInput, ru
 	if input.LogPaths.Stdout != "" {
 		stdoutLog, err = engine.NewCappedLogWriter(input.LogPaths.Stdout, 0)
 		if err != nil {
-			stdoutCapture.fail(err)
+			stdoutCapture.failOpen(input.LogPaths.Stdout, err)
 			stdoutLog = nil
 		}
 	}
@@ -242,12 +236,8 @@ func (s *Session) TurnWithRunner(ctx context.Context, input engine.TurnInput, ru
 	// Contract: driver ExecSpec.Env is an ADDITIVE layer over the full inherited
 	// process environment, not a replacement or isolation mechanism (no current
 	// driver sets it). The session overlay is applied last and wins. The private
-	// scratch overlay is available to write and Verify turns only.
-	if input.Write || s.opts.Verify {
-		spec.Env = normalizeEnvironment(runtime.GOOS, os.Environ(), spec.Env, s.envOverlay, s.writeEnvOverlay)
-	} else {
-		spec.Env = normalizeEnvironment(runtime.GOOS, os.Environ(), spec.Env, s.envOverlay)
-	}
+	// session overlay wins over inherited and adapter-provided values.
+	spec.Env = normalizeEnvironment(runtime.GOOS, os.Environ(), spec.Env, s.envOverlay)
 	running, err := runner.Start(turnCtx, spec)
 	if err != nil {
 		if stdoutLog != nil {
@@ -325,7 +315,7 @@ func normalizeEnvironment(goos string, layers ...[]string) []string {
 	return env
 }
 
-func (s *Session) runTurn(driverCtx context.Context, driverCancel context.CancelFunc, turnCtx context.Context, turnCancel context.CancelFunc, input engine.TurnInput, resumeID string, active *activeTurn, stdoutPipe io.ReadCloser, stderrPipe io.ReadCloser, stderrWriter io.Writer, stderr *bytes.Buffer, stdoutLog *engine.CappedLogWriter, stderrLog *engine.CappedLogWriter, stderrCapture *captureWarningTracker, events chan<- engine.Event) {
+func (s *Session) runTurn(driverCtx context.Context, driverCancel context.CancelFunc, turnCtx context.Context, turnCancel context.CancelFunc, input engine.TurnInput, resumeID string, active *activeTurn, stdoutPipe io.ReadCloser, stderrPipe io.ReadCloser, stderrWriter io.Writer, stderr *diagnosticTail, stdoutLog *engine.CappedLogWriter, stderrLog *engine.CappedLogWriter, stderrCapture *captureWarningTracker, events chan<- engine.Event) {
 	defer close(events)
 	defer turnCancel()
 	defer driverCancel()
@@ -338,42 +328,60 @@ func (s *Session) runTurn(driverCtx context.Context, driverCancel context.Cancel
 	}()
 
 	driverDone := make(chan turnResult, 1)
-	emit := turnEmitter(events)
+	emit := turnEmitter(events, active.conn.drops)
 	go func() {
-		id, err := s.driver.RunTurn(driverCtx, active.conn, resumeID, s.opts, input, emit)
-		driverDone <- turnResult{resumeID: id, err: err}
+		id, err := s.driver.RunTurn(driverCtx, active.conn, resumeID, s.opts, input, emit.emit)
+		driverDone <- turnResult{resumeID: id, err: err, disposition: captureTurnDisposition(turnCtx)}
 	}()
 
-	result, earlyExit := waitForTurnResult(driverDone, active.retirement)
-	active.steerMu.Lock()
-	active.turnDone = true
-	active.steerMu.Unlock()
+	result, earlyExit, abandoned := waitForTurnResult(turnCtx, driverDone, active.retirement, active.running)
+	// Retirement and local capture together have one bounded post-completion
+	// window, even for embedded runners that leave a reader open after exit.
+	readerDeadline := time.NewTimer(turnRetirementGrace + turnRetirementInterruptGrace)
+	defer readerDeadline.Stop()
+	active.turnDone.Store(true)
+	if abandoned {
+		driverCancel()
+		_ = active.conn.CloseStdin()
+		_ = stdoutPipe.Close()
+		_ = stderrPipe.Close()
+		// Cooperative drivers can still report a provider session ID observed
+		// before cancellation. Bound this join for uncooperative drivers.
+		timer := time.NewTimer(250 * time.Millisecond)
+		select {
+		case settled := <-driverDone:
+			if settled.resumeID != "" {
+				result.resumeID = settled.resumeID
+			}
+		case <-timer.C:
+		}
+		timer.Stop()
+	}
+	// Prevent a driver that ignores cancellation from emitting after the event
+	// stream closes. It cannot write captures once both local readers stop.
+	emit.stop()
 	result, earlyExit = classifyTurnResult(result, earlyExit)
-	dispositionAtResult := captureTurnDisposition(turnCtx)
+	dispositionAtResult := result.disposition
 	if errors.Is(result.err, ErrFrameTooLarge) && !errors.Is(result.err, engine.ErrTransportFrameTooLarge) {
 		result.err = fmt.Errorf("%w: %w", engine.ErrTransportFrameTooLarge, result.err)
 	}
 	_ = active.conn.CloseStdin()
+	if result.err != nil {
+		// A failed decoder must promptly release its pipe, even if the child
+		// continues running or the process cleanup is uncertain.
+		_ = stdoutPipe.Close()
+	}
 	drainDone = make(chan struct{})
 	go func() {
 		active.conn.drainReader()
 		close(drainDone)
 	}()
-	observation, normalRetirement := waitForTurnRetirement(active)
-	var stderrCopyErr error
-	if normalRetirement {
-		stderrCopyErr = <-stderrDone
-	} else {
-		// A forced give-up has no trustworthy backend output boundary. Close the
-		// stderr reader so the copier can finish. Preserve copier failures other
-		// than the one this deliberate close causes. An os/exec pipe reports
-		// io.ErrClosedPipe rather than os.ErrClosed, so both are suppressed.
-		_ = stderrPipe.Close()
-		stderrCopyErr = <-stderrDone
-		if errors.Is(stderrCopyErr, io.ErrClosedPipe) || errors.Is(stderrCopyErr, os.ErrClosed) {
-			stderrCopyErr = nil
-		}
+	settledBeforeDeadline := !earlyExit && !abandoned && !dispositionAtResult.timedOut && !dispositionAtResult.canceled
+	observation, normalRetirement := waitForTurnRetirement(active, settledBeforeDeadline)
+	if abandoned {
+		normalRetirement = false
 	}
+	stderrCopyErr := waitForLocalReaders(stdoutPipe, stderrPipe, drainDone, stderrDone, normalRetirement, readerDeadline.C)
 
 	if result.resumeID != "" {
 		s.setID(result.resumeID)
@@ -383,15 +391,12 @@ func (s *Session) runTurn(driverCtx context.Context, driverCancel context.Cancel
 	// caller's deadline.
 	completedSessionID := s.ID()
 	disposition := dispositionAtResult
-	if normalRetirement {
-		if drainDone == nil {
-			active.conn.drainReader()
-		} else {
-			<-drainDone
-		}
-	} else {
-		_ = stdoutPipe.Close()
-		<-drainDone
+	if result.err == nil && !earlyExit && errors.Is(stderrCopyErr, command.ErrOutputDrainExpired) {
+		// The semantic result was accepted before post-exit local teardown.
+		stderrCopyErr = nil
+	}
+	if stderrCopyErr != nil {
+		stderrCopyErr = fmt.Errorf("incomplete backend transport: stderr read: %w", stderrCopyErr)
 	}
 	frameDrops := active.conn.FrameDrops()
 	if !frameDrops.Empty() {
@@ -423,6 +428,44 @@ func (s *Session) runTurn(driverCtx context.Context, driverCancel context.Cancel
 	events <- turnFinalEvent(completedSessionID, disposition, observation)
 }
 
+func waitForLocalReaders(stdout, stderr io.ReadCloser, stdoutDone <-chan struct{}, stderrDone <-chan error, normalRetirement bool, deadline <-chan time.Time) error {
+	forced := !normalRetirement
+	closeReaders := func() {
+		_ = stdout.Close()
+		_ = stderr.Close()
+	}
+	if forced {
+		closeReaders()
+	}
+	var stderrErr error
+	if forced {
+		stderrErr = <-stderrDone
+	} else {
+		select {
+		case stderrErr = <-stderrDone:
+		case <-deadline:
+			forced = true
+			closeReaders()
+			stderrErr = <-stderrDone
+		}
+	}
+	if forced {
+		<-stdoutDone
+	} else {
+		select {
+		case <-stdoutDone:
+		case <-deadline:
+			forced = true
+			closeReaders()
+			<-stdoutDone
+		}
+	}
+	if forced && (errors.Is(stderrErr, io.ErrClosedPipe) || errors.Is(stderrErr, os.ErrClosed) || errors.Is(stderrErr, command.ErrOutputDrainExpired)) {
+		return nil
+	}
+	return stderrErr
+}
+
 // Steer forwards one follow-up instruction to the optional driver extension
 // only while its RunTurn is active. The shared RunTurn keeps sole ownership of
 // the provider stream reader.
@@ -434,9 +477,7 @@ func (s *Session) Steer(ctx context.Context, msg engine.SteerMessage) (engine.St
 	if active == nil {
 		return engine.SteerDelivery{}, engine.ErrSteerNotActive
 	}
-	active.steerMu.RLock()
-	defer active.steerMu.RUnlock()
-	if active.turnDone {
+	if active.turnDone.Load() {
 		return engine.SteerDelivery{}, engine.ErrSteerNotActive
 	}
 	steerer, ok := driver.(SteerDriver)
@@ -446,29 +487,68 @@ func (s *Session) Steer(ctx context.Context, msg engine.SteerMessage) (engine.St
 	return steerer.Steer(ctx, active.conn, msg)
 }
 
-func waitForTurnResult(driverDone <-chan turnResult, retirement *retirement) (turnResult, bool) {
+func waitForTurnResult(ctx context.Context, driverDone <-chan turnResult, retirement *retirement, running command.RunningCommand) (turnResult, bool, bool) {
 	select {
 	case result := <-driverDone:
-		return result, false
+		return result, false, false
+	default:
+	}
+	select {
+	case result := <-driverDone:
+		return result, false, false
+	case <-ctx.Done():
+		return turnResult{err: ctx.Err(), disposition: captureTurnDisposition(ctx)}, false, true
 	case <-retirement.done:
+		if retirement.observation.CleanupErr != nil {
+			select {
+			case result := <-driverDone:
+				return result, false, false
+			default:
+				transportErr := errors.New("incomplete backend transport: process cleanup is uncertain")
+				return turnResult{err: errors.Join(transportErr, retirement.observation.ExecutionErr), disposition: captureTurnDisposition(ctx)}, true, true
+			}
+		}
+	}
+	// DirectCommandRunner supplies its already-running post-exit deadline.
+	// Other runners get a bounded fallback for an uncooperative reader.
+	var expired <-chan struct{}
+	var fallback <-chan time.Time
+	var timer *time.Timer
+	if owner, ok := running.(interface{ OutputDrainExpired() <-chan struct{} }); ok {
+		expired = owner.OutputDrainExpired()
+	} else {
+		timer = time.NewTimer(DefaultInterruptGrace)
+		defer timer.Stop()
+		fallback = timer.C
+	}
+	select {
+	case result := <-driverDone:
+		return result, true, false
+	case <-ctx.Done():
+		return turnResult{err: ctx.Err(), disposition: captureTurnDisposition(ctx)}, false, true
+	case <-expired:
 		select {
 		case result := <-driverDone:
-			return result, false
+			return result, true, false
 		default:
 		}
-		result := <-driverDone
-		return result, true
+		return turnResult{err: command.ErrOutputDrainExpired, disposition: captureTurnDisposition(ctx)}, true, true
+	case <-fallback:
+		return turnResult{err: command.ErrOutputDrainExpired, disposition: captureTurnDisposition(ctx)}, true, true
 	}
 }
 
-// waitForTurnRetirement preserves the old prompt-retirement observation. Once
-// that grace is exhausted, the process interrupt is best-effort and any
-// observation it produces is intentionally discarded: it describes teardown,
-// not the already-settled semantic turn. A zero observation keeps execution
-// failure and return-code fields unknown instead of manufacturing a failure.
-func waitForTurnRetirement(active *activeTurn) (command.FinalObservation, bool) {
+// waitForTurnRetirement preserves a prompt-retirement observation unless a
+// turn had already settled before its deadline terminated the
+// process. Once the grace is exhausted, the process interrupt is best-effort;
+// its exit observation likewise describes teardown, not the semantic turn.
+// In either case, retain cleanup uncertainty independently.
+func waitForTurnRetirement(active *activeTurn, settledBeforeDeadline bool) (command.FinalObservation, bool) {
 	if observation, ok := waitForRetirement(active.retirement, turnRetirementGrace); ok {
-		return observation, true
+		if settledBeforeDeadline && active.retirement.deadlineExpiredAtWait {
+			return command.FinalObservation{CleanupErr: observation.CleanupErr}, observation.CleanupErr == nil
+		}
+		return observation, observation.CleanupErr == nil
 	}
 
 	interruptCtx, cancel := context.WithTimeout(context.Background(), turnRetirementInterruptGrace)
@@ -476,9 +556,14 @@ func waitForTurnRetirement(active *activeTurn) (command.FinalObservation, bool) 
 		_ = active.conn.Interrupt(interruptCtx)
 	}()
 
-	_, _ = waitForRetirement(active.retirement, turnRetirementInterruptGrace)
+	observation, ok := waitForRetirement(active.retirement, turnRetirementInterruptGrace)
 	cancel()
-	return command.FinalObservation{}, false
+	if !ok {
+		return command.FinalObservation{CleanupErr: errors.New("process retirement is unproven after local teardown")}, false
+	}
+	// Exit status caused by the teardown interrupt cannot replace the already
+	// accepted semantic outcome. Preserve cleanup uncertainty independently.
+	return command.FinalObservation{CleanupErr: observation.CleanupErr}, false
 }
 
 func waitForRetirement(retirement *retirement, grace time.Duration) (command.FinalObservation, bool) {
@@ -634,7 +719,7 @@ func collectNativeInterruptErr(nativeDone <-chan error, nativeErr error) error {
 func startRetirement(ctx context.Context, running command.RunningCommand) *retirement {
 	retirement := &retirement{done: make(chan struct{})}
 	go func() {
-		retirement.observation = finalObservation(ctx, running)
+		retirement.observation, retirement.deadlineExpiredAtWait = finalObservation(ctx, running)
 		close(retirement.done)
 	}()
 	return retirement
@@ -653,8 +738,17 @@ func (r *retirement) wait(ctx context.Context) (command.FinalObservation, error)
 	}
 }
 
-func finalObservation(ctx context.Context, running command.RunningCommand) command.FinalObservation {
+func finalObservation(ctx context.Context, running command.RunningCommand) (command.FinalObservation, bool) {
 	exit, waitErr := running.Wait(ctx)
+	// Capture the deadline at process wait completion, before FinalObservation
+	// may spend additional time resolving cleanup. A later deadline must not
+	// obscure an execution failure that was already observed.
+	deadlineExpired := false
+	select {
+	case <-ctx.Done():
+		deadlineExpired = errors.Is(ctx.Err(), context.DeadlineExceeded)
+	default:
+	}
 	if observer, ok := running.(command.FinalObserver); ok {
 		observation, err := observer.FinalObservation(context.WithoutCancel(ctx))
 		if observation.Exit == (command.ExitObservation{}) {
@@ -663,9 +757,9 @@ func finalObservation(ctx context.Context, running command.RunningCommand) comma
 		if observation.ExecutionErr == nil && observation.CleanupErr == nil {
 			observation.ExecutionErr = errors.Join(waitErr, err)
 		}
-		return observation
+		return observation, deadlineExpired
 	}
-	return command.FinalObservation{Exit: exit, ExecutionErr: waitErr}
+	return command.FinalObservation{Exit: exit, ExecutionErr: waitErr}, deadlineExpired
 }
 
 func (s *Session) setID(id string) {
@@ -698,23 +792,36 @@ func captureTurnDisposition(ctx context.Context) turnDisposition {
 	}
 }
 
-func emitCompletionEvents(disposition turnDisposition, events chan<- engine.Event, driverErr error, earlyExit bool, observation command.FinalObservation, stderr *bytes.Buffer, stderrCopyErr error) {
+func emitCompletionEvents(disposition turnDisposition, events chan<- engine.Event, driverErr error, earlyExit bool, observation command.FinalObservation, stderr *diagnosticTail, stderrCopyErr error) {
 	if disposition.timedOut {
 		events <- warning("backend turn timed out")
 		return
 	}
-	var providerFailure *engine.ProviderFailureError
-	structuredProviderFailure := errors.As(driverErr, &providerFailure) && providerFailure != nil
+	// A failed process can close stdin before its write finishes. In that case
+	// report the exit and stderr instead of the resulting broken-pipe error.
+	failedExit := (observation.Exit.Exited && observation.Exit.Code != 0) || observation.Exit.Signal != ""
+	if isBrokenStdinPipe(driverErr) && failedExit {
+		driverErr = nil
+		if observation.ExecutionErr == nil {
+			if observation.Exit.Signal != "" {
+				observation.ExecutionErr = fmt.Errorf("backend exited on signal %s", observation.Exit.Signal)
+			} else {
+				observation.ExecutionErr = fmt.Errorf("backend exited with status %d", observation.Exit.Code)
+			}
+		}
+	}
 	if driverErr != nil {
 		events <- terminalError(driverErr)
 	}
 	if observation.CleanupErr != nil {
 		events <- warning(observation.CleanupErr.Error())
 	}
+	if driverErr != nil {
+		// The protocol error is the primary evidence; a later exit or stderr
+		// must not replace it, particularly for structured provider failures.
+		return
+	}
 	if observation.ExecutionErr != nil || (earlyExit && driverErr == nil) {
-		if structuredProviderFailure {
-			return
-		}
 		msg := strings.TrimSpace(stderr.String())
 		if msg == "" && stderrCopyErr != nil {
 			msg = stderrCopyErr.Error()
@@ -728,7 +835,7 @@ func emitCompletionEvents(disposition turnDisposition, events chan<- engine.Even
 		events <- terminalError(errors.New(msg))
 		return
 	}
-	if stderrCopyErr != nil && !structuredProviderFailure {
+	if stderrCopyErr != nil {
 		events <- terminalError(stderrCopyErr)
 	}
 }
@@ -767,21 +874,45 @@ func hasExecutionFailure(err error) bool {
 	return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
 }
 
-func turnEmitter(events chan<- engine.Event) EmitFunc {
-	var lastAgentMessage string
-	return func(ev engine.Event) {
-		if ev.Type == resultSegmentBoundaryEvent {
-			lastAgentMessage = ""
-			return
-		}
-		if ev.Type == engine.EventAgentText && ev.Text != "" {
-			lastAgentMessage = ev.Text
-		}
-		if ev.Type == engine.EventResultMessage && ev.Text == "" {
-			ev.Text = lastAgentMessage
-		}
-		events <- capEvent(ev)
+type eventEmitter struct {
+	events chan<- engine.Event
+	done   chan struct{}
+	drops  *frameDropTracker
+	once   sync.Once
+	mu     sync.RWMutex
+}
+
+func turnEmitter(events chan<- engine.Event, drops *frameDropTracker) *eventEmitter {
+	return &eventEmitter{events: events, done: make(chan struct{}), drops: drops}
+}
+
+func (emitter *eventEmitter) emit(ev engine.Event) {
+	orderedDrop := ev.Type == orderedFrameDropEvent
+	if orderedDrop {
+		ev.Type = engine.EventWarning
 	}
+	emitter.mu.RLock()
+	defer emitter.mu.RUnlock()
+	select {
+	case <-emitter.done:
+		return
+	default:
+	}
+	select {
+	case emitter.events <- capEvent(ev):
+		if orderedDrop {
+			if drops, ok := engine.TransportFrameDropsFromMetadata(ev.Metadata); ok {
+				emitter.drops.markReported(drops)
+			}
+		}
+	case <-emitter.done:
+	}
+}
+
+func (emitter *eventEmitter) stop() {
+	emitter.once.Do(func() { close(emitter.done) })
+	emitter.mu.Lock()
+	emitter.mu.Unlock()
 }
 
 func copyAndClose(dst io.Writer, src io.ReadCloser) error {
@@ -791,7 +922,9 @@ func copyAndClose(dst io.Writer, src io.ReadCloser) error {
 }
 
 func capEvent(ev engine.Event) engine.Event {
-	ev.RawText = ev.Text
+	if ev.RawText == "" {
+		ev.RawText = ev.Text
+	}
 	text := engine.TruncateEventText([]byte(ev.Text), engine.DefaultEventTextCap)
 	ev.Text = text.Text
 	ev.Truncated = ev.Truncated || text.Truncated

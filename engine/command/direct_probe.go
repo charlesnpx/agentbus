@@ -8,8 +8,7 @@ import (
 	"strings"
 )
 
-// DirectProbeRunner preserves legacy executable lookup and short probe
-// commands while keeping probing behind an explicit interface.
+// DirectProbeRunner resolves executables and runs short probe commands.
 type DirectProbeRunner struct{}
 
 func (DirectProbeRunner) LookPath(file string) (string, error) {

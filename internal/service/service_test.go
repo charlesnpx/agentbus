@@ -7,13 +7,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -61,6 +61,7 @@ func newTestServer(t *testing.T, root string, cfg Config) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
+	server.processScopeFn = func() (jobstore.ProcessScope, error) { return testProcessScope(), nil }
 	t.Cleanup(server.closeJobStore)
 	return server
 }
@@ -330,8 +331,8 @@ func TestListenRefusesConcurrentStaleSocketReplacement(t *testing.T) {
 		t.Fatalf("loser listen error = %v, want ErrDaemonAlreadyListening", loserListen.err)
 	}
 	var typed DaemonAlreadyListeningError
-	if !errors.As(loserListen.err, &typed) || typed.SocketPath != socketPath {
-		t.Fatalf("loser listen error = %#v, want typed socket path %q", loserListen.err, socketPath)
+	if !errors.As(loserListen.err, &typed) || typed.SocketPath != loser.socketPath {
+		t.Fatalf("loser listen error = %#v, want typed socket path %q", loserListen.err, loser.socketPath)
 	}
 	connection, err := net.DialTimeout("unix", socketPath, time.Second)
 	if err != nil {
@@ -425,19 +426,29 @@ func TestStaleBinaryDrainsActiveJobThenStopsAfterAcceptSettles(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	listener := &drainTestListener{closed: make(chan struct{})}
-	acceptSettled := make(chan struct{})
+	lifecycle := &serveLifecycle{
+		listener: listener, cancel: cancel,
+		acceptSettled: make(chan struct{}), serveDone: make(chan struct{}),
+		shutdownDone: make(chan struct{}), connections: make(map[net.Conn]struct{}),
+		pruneCancel: func() {},
+	}
+	if err := server.registerLifecycle(lifecycle); err != nil {
+		t.Fatal(err)
+	}
 	idleDone := make(chan struct{})
 	go func() {
 		_, _ = listener.Accept()
-		close(acceptSettled)
+		lifecycle.settleAccept()
 	}()
 	go func() {
-		server.idleLoop(ctx, cancel, listener, socketFileIdentity{}, acceptSettled)
+		server.idleLoop(ctx)
 		close(idleDone)
 	}()
 	t.Cleanup(func() {
 		cancel()
 		_ = listener.Close()
+		lifecycle.settleAccept()
+		server.clearLifecycle(lifecycle)
 		select {
 		case <-idleDone:
 		case <-time.After(time.Second):
@@ -482,9 +493,22 @@ func TestStaleBinaryDrainsActiveJobThenStopsAfterAcceptSettles(t *testing.T) {
 		t.Fatal("stale daemon did not close its listener after the job ended")
 	}
 	select {
+	case <-lifecycle.acceptSettled:
+	case <-time.After(idleCheckInterval / 2):
+		t.Fatal("stale daemon did not wait for its accept loop to settle")
+	}
+	select {
 	case <-ctx.Done():
 	case <-time.After(idleCheckInterval / 2):
-		t.Fatal("stale daemon waited for another idle-check interval after its accept loop settled")
+		t.Fatal("stale daemon did not finish shutdown after its accept loop settled")
+	}
+	select {
+	case <-lifecycle.shutdownDone:
+		if lifecycle.shutdownErr != nil {
+			t.Fatalf("stale daemon shutdown error = %v", lifecycle.shutdownErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stale daemon shutdown did not complete")
 	}
 	select {
 	case <-idleDone:
@@ -563,7 +587,7 @@ func submissionParams(workspaceKey, requestID, backend, cwd, prompt string) prot
 		TaskSpec: protocol.TaskSpec{
 			Backend: backend,
 			CWD:     cwd,
-			Write:   false,
+			Intent:  engine.IntentInspect,
 			Prompt:  prompt,
 		},
 	}
@@ -590,8 +614,8 @@ func TestJobSubmitReplaySurvivesDeletedWorkspace(t *testing.T) {
 func TestJobSubmitOmittedSessionRetentionPreservesReplayHash(t *testing.T) {
 	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "codex"}}})
 	workspaceKey, requestID, cwd := "workspace-omitted-retention", "request-omitted-retention", t.TempDir()
-	legacy := json.RawMessage(fmt.Sprintf(`{"workspaceKey":%q,"requestId":%q,"taskSpec":{"backend":"codex","cwd":%q,"prompt":"same task","write":false}}`, workspaceKey, requestID, cwd))
-	first := submitResultForTest(t, server.handleJobSubmit(legacy))
+	omitted := json.RawMessage(fmt.Sprintf(`{"workspaceKey":%q,"requestId":%q,"taskSpec":{"backend":"codex","cwd":%q,"prompt":"same task","intent":"inspect"}}`, workspaceKey, requestID, cwd))
+	first := submitResultForTest(t, server.handleJobSubmit(omitted))
 
 	replay := submitResultForTest(t, submitForTest(t, server, submissionParams(workspaceKey, requestID, "codex", cwd, "same task")))
 	if !replay.Deduplicated || replay.JobID != first.JobID {
@@ -654,7 +678,7 @@ func TestJobSubmitInvalidOutputSchemaLeavesNoBinding(t *testing.T) {
 			workspaceKey := "workspace-invalid-schema-" + tt.name
 			requestID := "request-invalid-schema-" + tt.name
 			cwd := t.TempDir()
-			invalidRaw := json.RawMessage(fmt.Sprintf(`{"workspaceKey":%q,"requestId":%q,"taskSpec":{"backend":"codex","cwd":%q,"write":false,"prompt":"task","outputSchema":%s}}`, workspaceKey, requestID, cwd, tt.schema))
+			invalidRaw := json.RawMessage(fmt.Sprintf(`{"workspaceKey":%q,"requestId":%q,"taskSpec":{"backend":"codex","cwd":%q,"intent":"inspect","prompt":"task","outputSchema":%s}}`, workspaceKey, requestID, cwd, tt.schema))
 			invalid := server.handleJobSubmit(invalidRaw)
 			if invalid.err == nil || invalid.err.Data.Code != protocol.ErrorInvalidTaskSpec {
 				t.Fatalf("invalid schema outcome = %#v, want invalid task spec", invalid.err)
@@ -675,7 +699,7 @@ func TestJobSubmitInvalidOutputSchemaLeavesNoBinding(t *testing.T) {
 				t.Fatalf("records after invalid schema = %+v, want none", records)
 			}
 
-			correctedRaw := json.RawMessage(fmt.Sprintf(`{"workspaceKey":%q,"requestId":%q,"taskSpec":{"backend":"codex","cwd":%q,"write":false,"prompt":"task","outputSchema":{}}}`, workspaceKey, requestID, cwd))
+			correctedRaw := json.RawMessage(fmt.Sprintf(`{"workspaceKey":%q,"requestId":%q,"taskSpec":{"backend":"codex","cwd":%q,"intent":"inspect","prompt":"task","outputSchema":{}}}`, workspaceKey, requestID, cwd))
 			corrected := submitResultForTest(t, server.handleJobSubmit(correctedRaw))
 			if corrected.Deduplicated || corrected.State != protocol.PublicStateQueued {
 				t.Fatalf("corrected schema result = %+v, want a new queued job", corrected)
@@ -687,10 +711,10 @@ func TestJobSubmitInvalidOutputSchemaLeavesNoBinding(t *testing.T) {
 func TestJobSubmitEquivalentNumericOutputSchemaSpellingsReplay(t *testing.T) {
 	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "codex"}}})
 	workspaceKey, requestID, cwd := "workspace-jcs-number", "request-jcs-number", t.TempDir()
-	firstRaw := json.RawMessage(fmt.Sprintf(`{"workspaceKey":%q,"requestId":%q,"taskSpec":{"backend":"codex","cwd":%q,"write":false,"prompt":"task","outputSchema":{"type":"number","minimum":1.0}}}`, workspaceKey, requestID, cwd))
+	firstRaw := json.RawMessage(fmt.Sprintf(`{"workspaceKey":%q,"requestId":%q,"taskSpec":{"backend":"codex","cwd":%q,"intent":"inspect","prompt":"task","outputSchema":{"type":"number","minimum":1.0}}}`, workspaceKey, requestID, cwd))
 	first := submitResultForTest(t, server.handleJobSubmit(firstRaw))
 
-	secondRaw := json.RawMessage(fmt.Sprintf(`{"requestId":%q,"taskSpec":{"outputSchema":{"minimum":1e0,"type":"number"},"prompt":"task","write":false,"cwd":%q,"backend":"codex"},"workspaceKey":%q}`, requestID, cwd, workspaceKey))
+	secondRaw := json.RawMessage(fmt.Sprintf(`{"requestId":%q,"taskSpec":{"outputSchema":{"minimum":1e0,"type":"number"},"prompt":"task","intent":"inspect","cwd":%q,"backend":"codex"},"workspaceKey":%q}`, requestID, cwd, workspaceKey))
 	replay := submitResultForTest(t, server.handleJobSubmit(secondRaw))
 	if !replay.Deduplicated || replay.JobID != first.JobID || replay.State != protocol.PublicStateQueued {
 		t.Fatalf("numeric-spelling replay = %+v, want queued deduplication of %q", replay, first.JobID)
@@ -811,9 +835,44 @@ func TestJobSubmitRejectsTimeoutAboveMaximum(t *testing.T) {
 	}
 }
 
+func TestTimeoutResolutionDefaultUnlimitedAndBounds(t *testing.T) {
+	zero, positive := int64(0), int64(1234)
+	maximum, over, negative := protocol.MaxTimeout.Milliseconds(), protocol.MaxTimeout.Milliseconds()+1, int64(-1)
+	for _, test := range []struct {
+		name      string
+		requested *int64
+		effective int64
+		source    string
+		invalid   bool
+	}{
+		{name: "omitted", effective: protocol.DefaultTimeout.Milliseconds(), source: engine.TimeoutSourceDaemonDefault},
+		{name: "unlimited", requested: &zero, source: engine.TimeoutSourceClient},
+		{name: "positive", requested: &positive, effective: positive, source: engine.TimeoutSourceClient},
+		{name: "maximum", requested: &maximum, effective: maximum, source: engine.TimeoutSourceClient},
+		{name: "above maximum", requested: &over, invalid: true},
+		{name: "negative", requested: &negative, invalid: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, problem := timeoutFromMillis(test.requested)
+			if test.invalid {
+				if problem == nil || got != nil {
+					t.Fatalf("invalid timeout = %#v, %#v", got, problem)
+				}
+				return
+			}
+			if problem != nil || got == nil || got.Effective != test.effective || got.Source != test.source || (got.Requested == nil) != (test.requested == nil) {
+				t.Fatalf("timeout = %#v, %#v", got, problem)
+			}
+			if test.requested != nil && *got.Requested != *test.requested {
+				t.Fatalf("requested = %d, want %d", *got.Requested, *test.requested)
+			}
+		})
+	}
+}
+
 func TestJobSubmitRejectsUnknownTaskSpecField(t *testing.T) {
 	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "codex"}}})
-	raw := json.RawMessage(fmt.Sprintf(`{"workspaceKey":"workspace-unknown-field","requestId":"request-unknown-field","taskSpec":{"backend":"codex","cwd":%q,"write":false,"prompt":"task","unexpected":true}}`, t.TempDir()))
+	raw := json.RawMessage(fmt.Sprintf(`{"workspaceKey":"workspace-unknown-field","requestId":"request-unknown-field","taskSpec":{"backend":"codex","cwd":%q,"intent":"inspect","prompt":"task","unexpected":true}}`, t.TempDir()))
 	outcome := server.handleJobSubmit(raw)
 	if outcome.err == nil || outcome.err.Data.Code != protocol.ErrorInvalidTaskSpec {
 		t.Fatalf("unknown taskSpec field outcome = %#v, want invalid task spec", outcome.err)
@@ -824,7 +883,7 @@ func TestJobSubmitRejectsUnknownInputMode(t *testing.T) {
 	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "codex"}}})
 	for _, mode := range []string{"maybe", ""} {
 		t.Run(fmt.Sprintf("mode-%q", mode), func(t *testing.T) {
-			raw := json.RawMessage(fmt.Sprintf(`{"workspaceKey":"workspace-unknown-input-mode","requestId":"request-unknown-input-mode","taskSpec":{"backend":"codex","cwd":"/workspace","write":false,"prompt":"task","inputMode":%q}}`, mode))
+			raw := json.RawMessage(fmt.Sprintf(`{"workspaceKey":"workspace-unknown-input-mode","requestId":"request-unknown-input-mode","taskSpec":{"backend":"codex","cwd":"/workspace","intent":"inspect","prompt":"task","inputMode":%q}}`, mode))
 			outcome := server.handleJobSubmit(raw)
 			if outcome.err == nil || outcome.err.Data.Code != protocol.ErrorInvalidTaskSpec {
 				t.Fatalf("unknown inputMode outcome = %#v, want invalid_task_spec", outcome.err)
@@ -833,23 +892,9 @@ func TestJobSubmitRejectsUnknownInputMode(t *testing.T) {
 	}
 }
 
-func TestOmittedInputModeAndLocalIPCPreserveBaseTaskSpecHash(t *testing.T) {
-	raw := json.RawMessage(`{"workspaceKey":"workspace-omitted-mode","requestId":"request-omitted-mode","taskSpec":{"backend":"codex","cwd":"/workspace","prompt":"do work","write":true}}`)
-	input, err := parseJobSubmitInput(raw)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := sha256.Sum256(input.canonicalTaskSpec)
-	// Golden from the base TaskSpec wire shape, which had neither optional field.
-	const want = "7a22b85c1404f61b27ea2df61765d20cef408966134b4a5d547f164f6f9d3d97"
-	if gotHex := hex.EncodeToString(got[:]); gotHex != want {
-		t.Fatalf("omitted inputMode request hash = %s, want base golden %s; taskSpec=%s", gotHex, want, input.canonicalTaskSpec)
-	}
-}
-
 func TestInputModeParticipatesInTaskSpecHash(t *testing.T) {
-	base := `{"workspaceKey":"workspace-mode-hash","requestId":"request-mode-hash","taskSpec":{"backend":"codex","cwd":"/workspace","prompt":"do work","write":true}}`
-	steerable := `{"workspaceKey":"workspace-mode-hash","requestId":"request-mode-hash","taskSpec":{"backend":"codex","cwd":"/workspace","prompt":"do work","write":true,"inputMode":"steerable"}}`
+	base := `{"workspaceKey":"workspace-mode-hash","requestId":"request-mode-hash","taskSpec":{"backend":"codex","cwd":"/workspace","prompt":"do work","intent":"edit"}}`
+	steerable := `{"workspaceKey":"workspace-mode-hash","requestId":"request-mode-hash","taskSpec":{"backend":"codex","cwd":"/workspace","prompt":"do work","intent":"edit","inputMode":"steerable"}}`
 	baseInput, err := parseJobSubmitInput(json.RawMessage(base))
 	if err != nil {
 		t.Fatal(err)
@@ -860,23 +905,6 @@ func TestInputModeParticipatesInTaskSpecHash(t *testing.T) {
 	}
 	if sha256.Sum256(baseInput.canonicalTaskSpec) == sha256.Sum256(steerableInput.canonicalTaskSpec) {
 		t.Fatal("steerable TaskSpec hash equals omitted-inputMode base hash")
-	}
-}
-
-func TestLegacyJobProjectsFixedInputMode(t *testing.T) {
-	server := newTestServer(t, t.TempDir(), Config{})
-	record := jobstore.Record{
-		JobID: "legacy-job", WorkspaceKey: "legacy-workspace", RequestID: "legacy-request",
-		Backend: "codex", State: protocol.PublicStateQueued, Cleanup: protocol.CleanupClean,
-		TaskSpec:  json.RawMessage(`{"backend":"codex","cwd":"/workspace","prompt":"task","write":false}`),
-		CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
-	}
-	wire, err := server.jobRecordWire(record)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if wire.InputMode != protocol.InputModeFixed || wire.Steers == nil || len(wire.Steers) != 0 {
-		t.Fatalf("legacy job projection = inputMode:%q steers:%#v, want fixed and an empty list", wire.InputMode, wire.Steers)
 	}
 }
 
@@ -969,7 +997,7 @@ func TestJobSubmitCompletedTargetRemainsRejected(t *testing.T) {
 	params := submissionParams("resume-completed-target", "resume", "codex", t.TempDir(), "continue")
 	params.TaskSpec.ResumeJobID = source.JobID
 	outcome := submitForTest(t, server, params)
-	const wantReason = "completed jobs are not resumable unless submitted with session retention; submit a new job"
+	const wantReason = "cleanup_uncertain"
 	if outcome.err == nil || outcome.err.Data.Code != protocol.ErrorInvalidTaskSpec || outcome.err.Data.JobID != source.JobID || !strings.Contains(outcome.err.Message, wantReason) {
 		t.Fatalf("resume completed target = %#v, want typed invalid-task error for %q", outcome.err, source.JobID)
 	}
@@ -1019,4 +1047,12 @@ func TestJobSubmitResumeTargetParticipatesInReplayIdentity(t *testing.T) {
 	if len(records) != 3 {
 		t.Fatalf("records after conflicting resume identity = %d, want two sources and one new job", len(records))
 	}
+}
+
+func testProcessScope() jobstore.ProcessScope {
+	scope := jobstore.ProcessScope{BootID: "test-boot", RootDevice: "1", RootInode: "2"}
+	if runtime.GOOS == "linux" {
+		scope.PIDNamespace = "pid:[42]"
+	}
+	return scope
 }

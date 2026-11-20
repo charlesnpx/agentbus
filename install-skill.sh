@@ -183,19 +183,6 @@ build_agentbus() {
     return
   fi
 
-  # Air-gapped installs resolve through a pre-populated Go module cache. Keep
-  # this fallback only for source trees that still carry a vendor/ directory.
-  if [[ -d "$REPO_ROOT/vendor" ]]; then
-    add_warning "go build -mod=readonly failed; used legacy -mod=vendor fallback; air-gapped installs should pre-populate GOMODCACHE"
-    if (
-      cd -- "$REPO_ROOT"
-      go build -mod=vendor -trimpath -ldflags "-X main.version=$VERSION" -o "$output" ./cmd/agentbus
-    ) 2>>"$err_file"; then
-      rm -f -- "$err_file"
-      return
-    fi
-  fi
-
   printf 'agentbus installer: go build failed\n' >&2
   sed 's/^/go build: /' "$err_file" >&2
   rm -f -- "$err_file"
@@ -207,62 +194,7 @@ live_install_root() {
   canonical_existing_dir "$HOME"
 }
 
-record_codex_sandbox_action() {
-  local config_path agentbus_state agentbus_cache codex_home state_home cache_home
-  case "$OPERATION" in
-    plan)
-      if [[ -n "${HOME:-}" && "$HOME" == /* ]]; then
-        codex_home=${CODEX_HOME:-"$HOME/.codex"}
-        state_home=${XDG_STATE_HOME:-"$HOME/.local/state"}
-        if [[ -n "${AGENTBUS_STATE_ROOT:-}" ]]; then
-          agentbus_state=$AGENTBUS_STATE_ROOT
-        else
-          agentbus_state="$state_home/agentbus"
-        fi
-        if [[ "${OSTYPE:-}" == darwin* ]]; then
-          agentbus_cache="$HOME/Library/Caches/agentbus"
-        else
-          cache_home=${XDG_CACHE_HOME:-"$HOME/.cache"}
-          agentbus_cache="$cache_home/agentbus"
-        fi
-        if [[ "$codex_home" == /* && "$state_home" == /* && "$agentbus_state" == /* && "$agentbus_cache" == /* && ( -z "${XDG_CACHE_HOME:-}" || "$XDG_CACHE_HOME" == /* ) ]]; then
-          config_path="$codex_home/config.toml"
-          add_warning "codex sandbox writable_roots would-configure: $agentbus_state, $agentbus_cache (config $config_path)"
-        else
-          add_warning "codex sandbox writable_roots skipped: HOME, CODEX_HOME, AGENTBUS_STATE_ROOT, XDG_CACHE_HOME, and XDG_STATE_HOME must resolve to absolute paths"
-        fi
-      else
-        add_warning "codex sandbox writable_roots skipped: HOME, CODEX_HOME, AGENTBUS_STATE_ROOT, XDG_CACHE_HOME, and XDG_STATE_HOME must resolve to absolute paths"
-      fi
-      ;;
-    uninstall)
-      add_warning "codex sandbox writable_roots entries left in place; uninstall does not remove security configuration automatically"
-      ;;
-    install)
-      local live_root
-      live_root=$(live_install_root) || {
-        [[ -n "$INSTALL_ROOT_ARG" ]] && return 0
-        add_warning "codex sandbox writable_roots skipped: live HOME directory is unavailable"
-        return 0
-      }
-      # mise-en-place invokes Agentbus installers with a temporary
-      # --install-root, then copies the staged file into the live destination.
-      # Configuring from that staged invocation would mutate the user's Codex
-      # sandbox even though the staged binary has not been installed live.
-      # This expected skip is intentionally silent rather than a warning.
-      if [[ "$ROOT" != "$live_root" ]]; then
-        return 0
-      fi
 
-      local result
-      if result=$("$TOOL_PATH" configure-codex-sandbox 2>&1); then
-        add_warning "$result"
-      else
-        add_warning "codex sandbox writable_roots skipped: $result"
-      fi
-      ;;
-  esac
-}
 
 report_live_daemon_upgrade() {
   [[ "$OPERATION" == "install" ]] || return 0
@@ -285,7 +217,7 @@ report_live_daemon_upgrade() {
       continue
     fi
     matched=1
-    add_warning "running agentbus daemon (pid $pid) will restart on the new binary once it has no clients or active jobs; in-flight jobs are not interrupted"
+    add_warning "running agentbus daemon (pid $pid) will drain accepted work and exit when its binary becomes stale; the next ordinary client can start the selected binary"
   done
   if [[ $matched -eq 0 ]]; then
     add_warning "no matching running agentbus daemon found at $TOOL_PATH"
@@ -316,7 +248,6 @@ case "$OPERATION" in
     ;;
 esac
 
-record_codex_sandbox_action
 
 print_warnings() {
   printf '[%s]' "$WARNINGS_JSON"

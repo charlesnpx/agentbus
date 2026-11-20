@@ -46,6 +46,7 @@ var backendFailureClassPatterns = []backendFailureClassPattern{
 			"unknown model",
 			"model_not_found",
 			"unrecognized_model",
+			"invalid model value",
 		},
 	},
 }

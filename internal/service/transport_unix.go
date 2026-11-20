@@ -57,10 +57,22 @@ func (c *connection) serve() {
 			})
 			continue
 		}
-		outcome := c.server.handle(c, request)
+		admitted := false
+		var outcome requestOutcome
+		if request.Method != protocol.MethodHello && c.hello {
+			admitted = c.server.beginRequest()
+		}
+		if request.Method != protocol.MethodHello && c.hello && !admitted {
+			outcome.err = protocol.NewError(protocol.ErrorDaemonDraining, "daemon is draining", protocol.ErrorData{})
+		} else {
+			outcome = c.server.handle(c, request)
+		}
 		if len(request.ID) != 0 {
 			response := protocol.Response{JSONRPC: "2.0", ID: request.ID, Result: outcome.result, Error: outcome.err}
 			_ = c.writeResponse(response)
+		}
+		if admitted {
+			c.server.endRequest()
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -89,10 +101,14 @@ func (c *connection) writeOversizedRequestResponse(response protocol.Response) e
 }
 
 func requiresRequestID(method string) bool {
-	return method == protocol.MethodHello || method == protocol.MethodBackendInspect || method == protocol.MethodArtifactsPrune
+	return method == protocol.MethodHello || method == protocol.MethodBackendInspect || method == protocol.MethodArtifactsPrune || method == protocol.MethodSessionDiscard
 }
 
 func (c *connection) writeResponse(response protocol.Response) error {
+	if err := c.conn.SetWriteDeadline(time.Now().Add(oversizedWriteTimeout)); err != nil {
+		return err
+	}
+	defer c.conn.SetWriteDeadline(time.Time{})
 	return writeFrame(c.conn, response)
 }
 
@@ -138,6 +154,8 @@ func (s *Server) handle(connection *connection, request protocol.Request) reques
 		return s.handleBackendInspect(request.Params)
 	case protocol.MethodArtifactsPrune:
 		return s.handleArtifactsPrune(request.Params)
+	case protocol.MethodSessionDiscard:
+		return s.handleSessionDiscard(request.Params)
 	case protocol.MethodJobSteer:
 		return s.handleJobSteer(request.Params)
 	default:
@@ -154,12 +172,14 @@ func (s *Server) handleHello(connection *connection, raw json.RawMessage) reques
 		return requestOutcome{err: protocol.NewError(protocol.ErrorUnauthorized, "missing or invalid hello token", protocol.ErrorData{})}
 	}
 	if params.ClientProtocolVersion != ProtocolVersion {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorVersionMismatch, "protocol major version mismatch", protocol.ErrorData{ServerProtocolVersion: ProtocolVersion})}
+		return requestOutcome{err: protocol.NewError(protocol.ErrorVersionMismatch, "protocol version mismatch", protocol.ErrorData{ServerProtocolVersion: ProtocolVersion, ClientProtocolVersion: params.ClientProtocolVersion, ClientRelease: releaseName(params.ClientRelease), DaemonRelease: releaseName(s.release), DaemonExecutable: s.daemonExecutable()})}
 	}
 	connection.hello = true
 	return requestOutcome{result: protocol.HelloResult{
-		ProtocolVersion: ProtocolVersion,
-		BackendMetadata: s.backendMetadata(),
+		ProtocolVersion:  ProtocolVersion,
+		DaemonRelease:    releaseName(s.release),
+		DaemonExecutable: s.daemonExecutable(),
+		BackendMetadata:  s.backendMetadata(),
 	}}
 }
 
@@ -174,10 +194,11 @@ func ensureStateRoot(root string) (string, error) {
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return "", err
 	}
-	if err := os.Chmod(root, 0o700); err != nil {
+	abs, err := filepath.Abs(root)
+	if err != nil {
 		return "", err
 	}
-	return root, nil
+	return filepath.EvalSymlinks(abs)
 }
 
 func ensureToken(path, configured string) (string, error) {
@@ -515,4 +536,20 @@ func decodeStrict(raw json.RawMessage, dst any) error {
 
 func invalidParams(err error) requestOutcome {
 	return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
+}
+
+func releaseName(value string) string {
+	if value == "" || value == "dev" {
+		return "unknown"
+	}
+	return value
+}
+func (s *Server) daemonExecutable() string {
+	s.mu.Lock()
+	path := s.executablePath
+	s.mu.Unlock()
+	if path == "" {
+		path, _ = os.Executable()
+	}
+	return path
 }

@@ -39,41 +39,7 @@ func TestSessionInterruptUsesProtocolDefaultGrace(t *testing.T) {
 	}
 }
 
-func TestDirectCommandRunnerBuffersUndrainedStreams(t *testing.T) {
-	running, err := (DirectCommandRunner{}).Start(context.Background(), ExecSpec{
-		Argv: []string{"/bin/sh", "-c", "printf stdout; printf stderr >&2"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = running.Stdin().Close() }()
-	defer func() { _ = running.Stdout().Close() }()
-	defer func() { _ = running.Stderr().Close() }()
-
-	exit, err := running.Wait(context.Background())
-	if err != nil {
-		t.Fatalf("Wait err = %v", err)
-	}
-	if !exit.Exited || exit.Code != 0 {
-		t.Fatalf("exit = %+v, want clean exit", exit)
-	}
-	stdout, err := io.ReadAll(running.Stdout())
-	if err != nil {
-		t.Fatalf("stdout read err = %v", err)
-	}
-	if string(stdout) != "stdout" {
-		t.Fatalf("stdout = %q, want stdout", string(stdout))
-	}
-	stderr, err := io.ReadAll(running.Stderr())
-	if err != nil {
-		t.Fatalf("stderr read err = %v", err)
-	}
-	if string(stderr) != "stderr" {
-		t.Fatalf("stderr = %q, want stderr", string(stderr))
-	}
-}
-
-func TestDirectCommandRunnerWaitBoundsRetainedStdoutAfterLeaderExit(t *testing.T) {
+func TestDirectCommandRunnerClosesRetainedPipeAfterLeaderExit(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("retained stdout fixture is unix shell-specific")
 	}
@@ -83,58 +49,19 @@ func TestDirectCommandRunnerWaitBoundsRetainedStdoutAfterLeaderExit(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = running.Stdin().Close() }()
-	defer func() { _ = running.Stdout().Close() }()
-	defer func() { _ = running.Stderr().Close() }()
-
-	done := make(chan error, 1)
-	go func() {
-		exit, err := running.Wait(context.Background())
-		if err != nil {
-			done <- err
-			return
-		}
-		if !exit.Exited || exit.Code != 0 {
-			done <- errors.New("leader did not exit cleanly")
-			return
-		}
-		done <- nil
-	}()
-
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("Wait err = %v", err)
-		}
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("Wait blocked on descendant-retained stdout after leader exit")
+	defer running.Stdin().Close()
+	defer running.Stdout().Close()
+	defer running.Stderr().Close()
+	done := make(chan struct{})
+	go func() { defer close(done); _, _ = io.Copy(io.Discard, running.Stderr()) }()
+	stdout, readErr := io.ReadAll(running.Stdout())
+	if string(stdout) != "leader-output\n" || !errors.Is(readErr, ErrOutputDrainExpired) {
+		t.Fatalf("stdout = %q, err = %v, want output and drain expiry", stdout, readErr)
 	}
-
-	stdout, err := io.ReadAll(running.Stdout())
-	if err != nil {
-		t.Fatalf("stdout read err = %v", err)
-	}
-	if string(stdout) != "leader-output\n" {
-		t.Fatalf("stdout = %q, want leader output", string(stdout))
-	}
-}
-
-func TestDirectOutputBufferReportsTruncationAfterBufferedBytes(t *testing.T) {
-	buf := newDirectOutputBuffer(8)
-	if _, err := buf.Write([]byte("0123456789abcdef")); err != nil {
-		t.Fatal(err)
-	}
-	got := make([]byte, 16)
-	n, err := buf.Read(got)
-	if err != nil {
-		t.Fatalf("first Read err = %v", err)
-	}
-	if string(got[:n]) != "89abcdef" {
-		t.Fatalf("buffered tail = %q, want retained tail", string(got[:n]))
-	}
-	n, err = buf.Read(got)
-	if n != 0 || !errors.Is(err, ErrOutputTruncated) {
-		t.Fatalf("second Read n=%d err=%v, want ErrOutputTruncated", n, err)
+	<-done
+	exit, err := running.Wait(context.Background())
+	if err != nil || !exit.Exited || exit.Code != 0 {
+		t.Fatalf("exit = %+v, err = %v", exit, err)
 	}
 }
 

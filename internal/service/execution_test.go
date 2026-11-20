@@ -100,7 +100,7 @@ func queuedExecutionRecordWithInputMode(t *testing.T, server *Server, backend, p
 		Backend:      backend,
 		CWD:          t.TempDir(),
 		Prompt:       prompt,
-		Write:        false,
+		Intent:       engine.IntentInspect,
 		InputMode:    inputMode,
 		TimeoutMS:    timeoutMS,
 		OutputSchema: append(json.RawMessage(nil), outputSchema...),
@@ -117,7 +117,7 @@ func queuedExecutionRecordWithInputMode(t *testing.T, server *Server, backend, p
 		jobstore.RequestKey{WorkspaceKey: "execution-workspace", RequestID: "execution-request"},
 		raw,
 		func(id string) (jobstore.Record, error) {
-			record := jobstore.Record{JobID: id, Backend: backend, CWD: spec.CWD, Write: spec.Write}
+			record := jobstore.Record{JobID: id, Backend: backend, CWD: spec.CWD, Intent: spec.Intent}
 			if spec.InputMode != "" {
 				record.InputMode = spec.InputMode
 			}
@@ -224,7 +224,7 @@ func TestExecutionWarnsSteerableJobAtDeadlineThreshold(t *testing.T) {
 	if warning.ID != deadlineWarningMessageID {
 		t.Fatalf("warning ID = %q, want %q", warning.ID, deadlineWarningMessageID)
 	}
-	const wantPrefix = "agentbus: about 10% of this task's time limit remains (deadline "
+	const wantPrefix = "agentbus: "
 	if !strings.HasPrefix(warning.Text, wantPrefix) {
 		t.Fatalf("warning text = %q, want prefix %q", warning.Text, wantPrefix)
 	}
@@ -251,51 +251,31 @@ func TestExecutionWarnsSteerableJobAtDeadlineThreshold(t *testing.T) {
 	}
 }
 
-func TestExecutionDoesNotWarnFixedModeJob(t *testing.T) {
+func TestExecutionWarnsFixedModeAfterLateInitialization(t *testing.T) {
 	oldWait := waitForDeadlineWarning
-	var timerCalls atomic.Int64
-	waitForDeadlineWarning = func(context.Context, time.Duration) bool {
-		timerCalls.Add(1)
-		return false
-	}
+	armed := make(chan time.Duration, 1)
+	waitForDeadlineWarning = func(_ context.Context, delay time.Duration) bool { armed <- delay; return true }
 	t.Cleanup(func() { waitForDeadlineWarning = oldWait })
-
-	session := &deadlineWarningTestSession{
-		events: executionEvents(engine.Event{Type: engine.EventResultMessage, Text: "done"}),
-		steers: make(chan engine.SteerMessage, 1),
+	session := &testSteerSession{entered: make(chan engine.SteerMessage, 1), delivery: engine.SteerDelivery{Mechanism: engine.SteerMechanismNative, Confirmed: true}}
+	server, store, run, jobID := newRunningSteerTestJob(t, protocol.InputModeFixed, session, true)
+	server.startDeadlineWarning(jobID, run, session, context.Background(), time.Now().Add(-9500*time.Millisecond), 10*time.Second, protocol.InputModeFixed)
+	select {
+	case delay := <-armed:
+		if delay != 0 {
+			t.Fatalf("late warning delay = %s", delay)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("warning not armed")
 	}
-	backend := &executionFakeBackend{name: "warning-fixed-fake"}
-	backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) { return session, nil }
-	server := newExecutionServer(t, backend)
-	timeoutMS := int64(10_000)
-	record := queuedExecutionRecordWithInputMode(t, server, backend.Name(), "finish", &timeoutMS, protocol.InputModeFixed, nil)
-	run := newActiveExecution(record.JobID, backend)
-	run.slotAcquiredAt = time.Now().UTC()
-	server.executionMu.Lock()
-	if server.executions == nil {
-		server.executions = make(map[string]*activeExecution)
+	select {
+	case message := <-session.entered:
+		if message.ID != deadlineWarningMessageID {
+			t.Fatalf("warning = %#v", message)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fixed job did not receive deadline notice")
 	}
-	server.executions[record.JobID] = run
-	server.executionMu.Unlock()
-	server.runJob(context.Background(), record, run)
-
-	if got := timerCalls.Load(); got != 0 {
-		t.Fatalf("deadline warning timer calls = %d, want 0", got)
-	}
-	if got := session.calls.Load(); got != 0 {
-		t.Fatalf("session steer calls = %d, want 0", got)
-	}
-	store, err := server.ensureJobStore()
-	if err != nil {
-		t.Fatal(err)
-	}
-	stored, err := store.Get(record.JobID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(stored.Steers) != 0 {
-		t.Fatalf("fixed job steer records = %#v, want none", stored.Steers)
-	}
+	run.retireTurn(store, turnOutcome{cleanup: protocol.CleanupClean})
 }
 
 func claimedResultSession(result string) *executionFakeSession {
@@ -421,7 +401,7 @@ func TestExecutionNoncompliantSchemaUsesOneSuccessfulCorrection(t *testing.T) {
 					input.OnProcessStart(engine.ProcessRef{PID: 4107, PGID: 4107, StartTime: "initial-token"}, 0)
 					return executionEvents(engine.Event{Type: engine.EventResultMessage, Text: initialResult}), nil
 				case 2:
-					if input.Write {
+					if input.Intent != engine.IntentInspect {
 						t.Fatal("correction turn was write-enabled")
 					}
 					correctionPrompt = input.Prompt
@@ -496,7 +476,7 @@ func TestExecutionFailedCorrectionPreservesOriginalNoncompliantResult(t *testing
 					input.OnProcessStart(engine.ProcessRef{PID: 4109, PGID: 4109, StartTime: "failed-initial-token"}, 0)
 					return executionEvents(engine.Event{Type: engine.EventResultMessage, Text: initialResult}), nil
 				case 2:
-					if input.Write {
+					if input.Intent != engine.IntentInspect {
 						t.Fatal("correction turn was write-enabled")
 					}
 					input.OnProcessStart(engine.ProcessRef{PID: 4110, PGID: 4110, StartTime: "failed-correction-token"}, 0)
@@ -786,8 +766,8 @@ func TestExecutionResultArtifactFailureTerminalizesAsStorageFailure(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.State != protocol.PublicStateFailed || got.FailureClass != protocol.FailureClassStorage {
-		t.Fatalf("terminal record = state %q class %q, want failed storage", got.State, got.FailureClass)
+	if got.State != protocol.PublicStateFailed || got.FailureClass != protocol.FailureClassStorage || got.FailureStage != "finalize" {
+		t.Fatalf("terminal record = state %q class %q stage %q, want failed storage finalize", got.State, got.FailureClass, got.FailureStage)
 	}
 	if !strings.Contains(got.FailureReason, "persist final result artifact") ||
 		!(strings.Contains(got.FailureReason, "exist") || strings.Contains(got.FailureReason, "directory")) {
@@ -819,10 +799,7 @@ func TestManagedCodexHomeSurvivesTerminalStorageFailure(t *testing.T) {
 	if _, err := store.MarkStarting(record.JobID); err != nil {
 		t.Fatal(err)
 	}
-	layout, err := engine.LayoutForWorkspace(server.stateRoot, t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	layout := engine.WorkspaceLayout{Root: server.stateRoot, Namespace: filepath.Join(server.stateRoot, "sessions"), Codex: filepath.Join(server.stateRoot, "sessions", "codex")}
 	home, err := createManagedCodexHome(layout, record.JobID)
 	if err != nil {
 		t.Fatal(err)
@@ -842,8 +819,8 @@ func TestManagedCodexHomeSurvivesTerminalStorageFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.State != protocol.PublicStateFailed || got.FailureClass != protocol.FailureClassStorage {
-		t.Fatalf("terminal record = state %q class %q, want failed storage fallback", got.State, got.FailureClass)
+	if got.State != protocol.PublicStateFailed || got.FailureClass != protocol.FailureClassStorage || got.FailureStage != "finalize" {
+		t.Fatalf("terminal record = state %q class %q stage %q, want failed storage finalize fallback", got.State, got.FailureClass, got.FailureStage)
 	}
 	if got.BackendSessionID != "terminal-storage-session" {
 		t.Fatalf("backend session ID = %q, want session retained by failed record", got.BackendSessionID)
@@ -1026,8 +1003,8 @@ func TestLatestObservedModelAndEffortReplaceEarlierValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Model != requestedModel || got.Effort != requestedEffort || got.ModelReported != "latest-model" || got.EffortReported != "high" {
-		t.Fatalf("requested/observed selection = requested %q/%q observed %q/%q", got.Model, got.Effort, got.ModelReported, got.EffortReported)
+	if got.Selection == nil || got.Selection.Model != requestedModel || got.Selection.Effort != requestedEffort || got.ModelReported != "latest-model" || got.EffortReported != "high" {
+		t.Fatalf("selected/observed values = selection %#v observed %q/%q", got.Selection, got.ModelReported, got.EffortReported)
 	}
 	wireOutcome := server.handleJobGet(mustJSON(t, protocol.JobGetParams{JobID: submitted.JobID}))
 	wire := wireOutcome.result.(protocol.JobRecordWire)
@@ -1259,11 +1236,7 @@ func TestExecutionResumeFollowsManagedHomeLineage(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	sourceLayout, err := engine.LayoutForWorkspace(server.stateRoot, source.CWD)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sourceHome := filepath.Join(sourceLayout.Codex, source.JobID)
+	sourceHome := filepath.Join(server.stateRoot, "sessions", "codex", source.JobID)
 	if err := os.MkdirAll(sourceHome, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -1281,7 +1254,7 @@ func TestExecutionResumeFollowsManagedHomeLineage(t *testing.T) {
 			Backend:     backend.Name(),
 			CWD:         t.TempDir(),
 			Prompt:      "continue from the source thread",
-			Write:       false,
+			Intent:      engine.IntentInspect,
 			ResumeJobID: resumeJobID,
 		}
 		raw, err := json.Marshal(spec)
@@ -1292,7 +1265,7 @@ func TestExecutionResumeFollowsManagedHomeLineage(t *testing.T) {
 			jobstore.RequestKey{WorkspaceKey: workspace, RequestID: requestID},
 			raw,
 			func(id string) (jobstore.Record, error) {
-				return jobstore.Record{JobID: id, Backend: spec.Backend, CWD: spec.CWD, Write: spec.Write}, nil
+				return jobstore.Record{JobID: id, Backend: spec.Backend, CWD: spec.CWD, Intent: spec.Intent}, nil
 			},
 		)
 		if err != nil || deduplicated {
@@ -1310,12 +1283,8 @@ func TestExecutionResumeFollowsManagedHomeLineage(t *testing.T) {
 	if firstTerminal.State != protocol.PublicStateFailed || firstTerminal.BackendSessionID != "thread-first-resumed" {
 		t.Fatalf("first resumed terminal = %+v, want failed with its new recorded session", firstTerminal)
 	}
-	firstLayout, err := engine.LayoutForWorkspace(server.stateRoot, firstResumed.CWD)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(filepath.Join(firstLayout.Codex, firstResumed.JobID)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("read-only first resumed home stat = %v, want no new managed thread home", err)
+	if _, err := os.Stat(filepath.Join(server.stateRoot, "sessions", "codex", firstResumed.JobID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("inspect first resumed home stat = %v, want no new managed thread home", err)
 	}
 
 	secondResumed := newResumed("second-resume-workspace", "second-resume-request", firstResumed.JobID)
@@ -1335,60 +1304,63 @@ func TestExecutionResumeFollowsManagedHomeLineage(t *testing.T) {
 	}
 }
 
-func TestJobSubmitRejectsCodexResumeWithoutPerJobHome(t *testing.T) {
-	for _, tt := range []struct {
-		name       string
-		config     func(*testing.T, *Config)
-		wantReason string
-	}{
-		{
-			name: "inherited home",
-			config: func(_ *testing.T, cfg *Config) {
-				cfg.CodexHomeInherit = true
-			},
-			wantReason: "inherited CODEX_HOME",
-		},
-		{
-			name: "override home",
-			config: func(t *testing.T, cfg *Config) {
-				cfg.CodexHomeOverride = t.TempDir()
-			},
-			wantReason: "AGENTBUS_CODEX_HOME override",
-		},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			backend := &executionFakeBackend{name: "codex"}
-			cfg := Config{Backends: []engine.Backend{backend}}
-			tt.config(t, &cfg)
-			server := newTestServer(t, t.TempDir(), cfg)
-			source := queuedExecutionRecord(t, server, backend.Name(), "source", nil)
-			store, err := server.ensureJobStore()
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, err := store.MarkTerminal(source.JobID, jobstore.TerminalUpdate{
-				State:            protocol.PublicStateFailed,
-				Cleanup:          protocol.CleanupClean,
-				BackendSessionID: "thread-source",
-				FailureClass:     protocol.FailureClassBackendError,
-				FailureReason:    "source turn stopped",
-			}); err != nil {
-				t.Fatal(err)
-			}
+func TestExecutionPersistsExplicitEmptyResultAfterAssistantText(t *testing.T) {
+	backend := &executionFakeBackend{name: "empty-result"}
+	backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) {
+		return &executionFakeSession{turn: func(_ context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
+			input.OnProcessStart(engine.ProcessRef{PID: 4212, PGID: 4212, StartTime: "empty-token"}, 0)
+			return executionEvents(engine.Event{Type: engine.EventAgentText, Text: "earlier status"}, engine.Event{Type: engine.EventResultMessage, Text: ""}), nil
+		}}, nil
+	}
+	server := newExecutionServer(t, backend)
+	record := queuedExecutionRecord(t, server, backend.Name(), "empty result", nil)
+	runExecution(t, server, record)
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := os.ReadFile(got.Artifacts.Result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(nil)
+	if got.State != protocol.PublicStateCompleted || len(artifact) != 0 || got.ResultBytes != 0 || got.ResultSHA256 != hex.EncodeToString(sum[:]) {
+		t.Fatalf("empty result record = %#v, artifact length = %d", got, len(artifact))
+	}
+}
 
-			params := submissionParams("non-managed-resume-"+strings.ReplaceAll(tt.name, " ", "-"), "resume", backend.Name(), t.TempDir(), "continue")
-			params.TaskSpec.ResumeJobID = source.JobID
-			outcome := submitForTest(t, server, params)
-			if outcome.err == nil || outcome.err.Data.Code != protocol.ErrorInvalidTaskSpec || outcome.err.Data.JobID != source.JobID || !strings.Contains(outcome.err.Message, tt.wantReason) {
-				t.Fatalf("rejected resume submission = %#v, want invalid task spec explaining %q for %q", outcome.err, tt.wantReason, source.JobID)
-			}
-			records, err := store.List()
-			if err != nil {
-				t.Fatal(err)
-			}
-			if len(records) != 1 || records[0].JobID != source.JobID {
-				t.Fatalf("records after rejected resume = %#v, want only source %q", records, source.JobID)
-			}
-		})
+func TestDeadlineDuringRetirementPreservesAcceptedResult(t *testing.T) {
+	backend := &executionFakeBackend{name: "accepted-before-deadline"}
+	backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) {
+		return &executionFakeSession{turn: func(ctx context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
+			input.OnProcessStart(engine.ProcessRef{PID: 4214, PGID: 4214, StartTime: "completed-token"}, 0)
+			events := make(chan engine.Event, 2)
+			events <- engine.Event{Type: engine.EventResultMessage, Text: "accepted result"}
+			go func() {
+				<-ctx.Done()
+				events <- engine.Event{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{}}
+				close(events)
+			}()
+			return events, nil
+		}, interrupt: func(context.Context) error { return nil }}, nil
+	}
+	server := newExecutionServer(t, backend)
+	timeout := int64(100)
+	record := queuedExecutionRecord(t, server, backend.Name(), "deadline after completion", &timeout)
+	runExecution(t, server, record)
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != protocol.PublicStateCompleted || got.ResultText != "accepted result" {
+		t.Fatalf("deadline changed accepted result: %#v", got)
 	}
 }

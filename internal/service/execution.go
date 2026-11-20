@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"log"
 	"math"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -51,6 +50,7 @@ type activeExecution struct {
 	claimRecorded          bool
 	claimErr               error
 	processClaim           *jobstore.ProcessClaim
+	claimScope             jobstore.ProcessScope
 	interruptOnce          sync.Once
 	interruptErr           error
 	itemCount              int
@@ -78,6 +78,8 @@ type activeExecution struct {
 	steerWorkerStarted     bool
 	deadlineWarningCancel  context.CancelFunc
 	deadlineWarningDone    chan struct{}
+	cancelFinalized        chan struct{}
+	captureDrains          []<-chan struct{}
 }
 
 // activeTurn owns the one retirement receipt for a turn. A cancellation can
@@ -415,7 +417,7 @@ func (run *activeExecution) interrupt() error {
 // an adapter while startTurn holds launchMu. The owner persists it immediately
 // after startTurn releases that lock, before the active turn can retire.
 func (run *activeExecution) noteProcessClaim(ref engine.ProcessRef) {
-	claim := jobstore.ProcessClaim{PID: ref.PID, PGID: ref.PGID, StartToken: ref.StartTime}
+	claim := jobstore.ProcessClaim{PID: ref.PID, PGID: ref.PGID, StartToken: ref.StartTime, Scope: run.claimScope}
 	run.mu.Lock()
 	if run.claimAttempted {
 		run.claimErr = errors.New("backend reported more than one process claim for one turn")
@@ -675,6 +677,9 @@ func (s *Server) startQueuedJobLocked(queued queuedJob) {
 		defer s.executionWG.Done()
 		defer s.touchActivity()
 		s.runJob(parent, queued.record, run)
+		// A canceled embedded adapter may close its event stream late. Keep the
+		// execution registered until its local capture writers have stopped.
+		run.waitCaptureDrains()
 		s.executionMu.Lock()
 		if s.executions[queued.record.JobID] == run {
 			delete(s.executions, queued.record.JobID)
@@ -686,6 +691,7 @@ func (s *Server) startQueuedJobLocked(queued queuedJob) {
 		s.dispatchQueuedLocked()
 		s.executionMu.Unlock()
 		s.activeJobs.Add(-1)
+		s.notifyQuietChange()
 	}()
 }
 
@@ -694,7 +700,15 @@ func (s *Server) startQueuedJobLocked(queued queuedJob) {
 // a provider process. The process-claim callback runs only after the retained
 // adapter has forked and execed into its own process group.
 func (s *Server) runJob(parent context.Context, record jobstore.Record, run *activeExecution) {
-	defer s.closeManagedCodexHome(record.JobID)
+	defer func() {
+		run.mu.Lock()
+		cancelFinalized := run.cancelFinalized
+		run.mu.Unlock()
+		if cancelFinalized != nil {
+			<-cancelFinalized
+		}
+		s.closeManagedCodexHome(record.JobID)
+	}()
 	if parent == nil {
 		parent = context.Background()
 	}
@@ -771,184 +785,43 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassBackendUnavailable, fmt.Errorf("backend %q is unavailable", record.Backend), nil)
 		return
 	}
-	codexSandboxed := true
-	policy, hasSandboxPolicy := run.backend.(interface {
-		CodexSandboxRequired(write, localIPC bool) bool
-	})
-	if spec.Verify && !hasSandboxPolicy {
-		s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassBackendUnavailable, errors.New("verify requires Codex OS sandbox support"), nil)
-		return
+	selectedModel := taskSpecOptionalString(spec.Model)
+	selectedEffort := taskSpecOptionalString(spec.Effort)
+	if defaults := s.backendDefaults[record.Backend]; selectedModel == "" {
+		selectedModel = defaults.Model
 	}
-	if hasSandboxPolicy {
-		codexSandboxed = policy.CodexSandboxRequired(record.Write, spec.LocalIPC) || spec.Verify
-		if codexSandboxed {
-			if err := s.ensureCodexSandbox(jobCtx, run.backend); err != nil {
-				if jobCtx.Err() != nil {
-					s.finishStartError(store, record, jobCtx, jobCtx.Err())
-					return
-				}
-				s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassBackendUnavailable,
-					fmt.Errorf("Codex OS sandbox cannot start on this host: %w", err), nil)
-				return
-			}
-		}
+	if defaults := s.backendDefaults[record.Backend]; selectedEffort == "" {
+		selectedEffort = defaults.Effort
 	}
-	requestedModel := record.Model
-	requestedEffort := record.Effort
-	if defaults := s.backendDefaults[record.Backend]; defaults.Model != "" && requestedModel == "" {
-		requestedModel = defaults.Model
-	}
-	if defaults := s.backendDefaults[record.Backend]; defaults.Effort != "" && requestedEffort == "" {
-		requestedEffort = defaults.Effort
-	}
-	opts := engine.SessionOpts{
-		CWD:      record.CWD,
-		Write:    record.Write,
-		LocalIPC: spec.LocalIPC,
-		Verify:   spec.Verify,
-		Model:    requestedModel,
-		Effort:   requestedEffort,
-		Timeout:  timeout,
-	}
-	var (
-		layout         engine.WorkspaceLayout
-		managed        *managedCodexHome
-		cache          jobCachePaths
-		caches         map[string]string
-		frozenCopyPath string
-		frozenSource   *protocol.FrozenSource
-	)
+	selection := protocol.InvocationSelection{Model: selectedModel, Effort: selectedEffort}
+	opts := engine.SessionOpts{CWD: record.CWD, Model: selectedModel, Effort: selectedEffort, Timeout: timeout}
 	if record.Backend == "codex" {
-		layout, err = engine.LayoutForWorkspace(s.stateRoot, record.CWD)
-		if err != nil {
-			s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("prepare Codex workspace layout: %w", err), nil)
-			return
-		}
+		layout := codexLayout(s.stateRoot)
 		if resumeTarget != nil {
 			codexHome, err := s.resumeCodexHome(store, *resumeTarget)
 			if err != nil {
 				s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("prepare resumed Codex home: %w", err), nil)
 				return
 			}
-			if codexHome != "" {
-				opts.EnvOverlay = map[string]string{"CODEX_HOME": codexHome}
-			}
+			opts.EnvOverlay = map[string]string{"CODEX_HOME": codexHome}
 		} else {
-			codexHome, prepared, err := s.prepareCodexHome(layout, record.JobID)
-			if prepared != nil {
-				s.rememberManagedCodexHome(record.JobID, prepared)
+			codexHome, managed, err := s.prepareCodexHome(layout, record.JobID)
+			if managed != nil {
+				s.rememberManagedCodexHome(record.JobID, managed)
 			}
 			if err != nil {
 				s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("prepare Codex home: %w", err), nil)
 				return
 			}
-			managed = prepared
-			if codexHome != "" {
-				opts.EnvOverlay = map[string]string{"CODEX_HOME": codexHome}
-			}
-		}
-		if opts.EnvOverlay == nil {
-			opts.EnvOverlay = make(map[string]string)
-		}
-		// The offline Codex sandbox may read the daemon's populated module
-		// cache, but does not get a private empty replacement or network access.
-		if s.moduleCache != "" {
-			opts.EnvOverlay["GOMODCACHE"] = s.moduleCache
-		}
-		opts.EnvOverlay["GOPROXY"] = "off"
-	} else if record.Write {
-		layout, err = engine.LayoutForWorkspace(s.stateRoot, record.CWD)
-		if err != nil {
-			s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("prepare job workspace layout: %w", err), nil)
-			return
+			opts.EnvOverlay = map[string]string{"CODEX_HOME": codexHome}
 		}
 	}
-	if record.Write || spec.Verify {
-		cache, managed, err = prepareJobCache(layout, record.JobID, managed)
-		if managed != nil {
-			s.rememberManagedCodexHome(record.JobID, managed)
-		}
-		if err != nil {
-			s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("prepare job cache: %w", err), nil)
-			return
-		}
-		if record.Backend == "codex" {
-			opts.WriteSandboxRoot = cache.root
-		}
-		if spec.Verify {
-			frozenCopyPath = filepath.Join(cache.root, "src")
-			identity, copyErr := createFrozenCopyContext(jobCtx, record.CWD, frozenCopyPath)
-			if copyErr != nil {
-				if jobCtx.Err() != nil {
-					s.finishStartError(store, record, jobCtx, jobCtx.Err())
-					return
-				}
-				s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("prepare frozen verification copy: %w", copyErr), nil)
-				return
-			}
-			frozenSource = &identity
-			opts.CWD = frozenCopyPath
-		}
-		if spec.LocalIPC {
-			ipcRoot, rootErr := createLocalIPCRoot()
-			if rootErr != nil {
-				s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassBackendUnavailable, rootErr, nil)
-				return
-			}
-			opts.LocalIPCRoot = ipcRoot
-			if localIPCGOOS == "linux" {
-				opts.LocalIPCDenyPaths = localIPCDenyPaths(s.stateRoot, opts.CWD, cache.root, ipcRoot)
-			}
-			s.rememberManagedLocalIPCRoot(record.JobID, ipcRoot)
-		}
-		opts.WriteEnvOverlay = map[string]string{
-			"GOCACHE":              cache.goBuild,
-			"TMPDIR":               cache.tmp,
-			"npm_config_cache":     cache.npm,
-			"COREPACK_HOME":        cache.corepack,
-			"XDG_CACHE_HOME":       cache.xdg,
-			"npm_config_store_dir": cache.pnpm,
-			"YARN_CACHE_FOLDER":    cache.yarn,
-		}
-		if spec.LocalIPC {
-			opts.WriteEnvOverlay["TMPDIR"] = opts.LocalIPCRoot
-			opts.WriteEnvOverlay["SCCACHE_SERVER_UDS"] = filepath.Join(opts.LocalIPCRoot, "sccache.sock")
-			opts.WriteEnvOverlay["SCCACHE_DIR"] = cache.sccache
-		}
-		caches = make(map[string]string, len(opts.WriteEnvOverlay)+1)
-		for key, value := range opts.WriteEnvOverlay {
-			caches[key] = value
-		}
+	claimScope, err := s.currentProcessScope()
+	if err != nil {
+		s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("establish process claim scope: %w", err), nil)
+		return
 	}
-	if record.Backend == "codex" && s.moduleCache != "" {
-		if caches == nil {
-			caches = make(map[string]string, 1)
-		}
-		caches["GOMODCACHE"] = s.moduleCache
-	}
-	if len(caches) == 0 {
-		caches = nil
-	}
-	if spec.LocalIPC && localIPCGOOS == "linux" {
-		if err := s.ensureCodexLocalIPCSandbox(jobCtx, run.backend, opts); err != nil {
-			if jobCtx.Err() != nil {
-				s.finishStartError(store, record, jobCtx, jobCtx.Err())
-				return
-			}
-			s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassBackendUnavailable,
-				fmt.Errorf("local IPC is unsupported by the Codex sandbox on this host: %w", err), nil)
-			return
-		}
-	}
-	scratch := ""
-	if record.Write || spec.Verify {
-		scratch = cache.root
-	}
-	posture := executionPosture(record.Backend, record.Write, spec.Verify, spec.LocalIPC, localIPCGOOS, codexSandboxed, scratch, caches)
-	if spec.Verify {
-		posture.FrozenCopy = frozenCopyPath
-		posture.FrozenSource = frozenSource
-	}
+	run.claimScope = claimScope
 	if run.cancellationRequested() {
 		s.discardManagedCodexHome(record.JobID)
 		return
@@ -956,7 +829,7 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 
 	// Persist the execution description in the same transaction as the
 	// starting marker, before a backend process can be spawned.
-	started, err := store.MarkStartingWithExecution(record.JobID, &posture)
+	started, err := store.MarkStartingWithSelection(record.JobID, selection)
 	if err != nil {
 		s.discardManagedCodexHome(record.JobID)
 		// A failed or ambiguous starting commit must never license a spawn. Try
@@ -1007,7 +880,7 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 	run.beginTurn()
 	events, err, canceled := run.startTurn(store, session, jobCtx, engine.TurnInput{
 		Prompt:   spec.Prompt,
-		Write:    spec.Write,
+		Intent:   spec.Intent,
 		Timeout:  timeout,
 		LogPaths: logPaths,
 	})
@@ -1077,16 +950,10 @@ func taskSpecFromRecord(record jobstore.Record) (protocol.TaskSpec, error) {
 	if spec.InputMode != "" && spec.InputMode != protocol.InputModeFixed && spec.InputMode != protocol.InputModeSteerable {
 		return spec, fmt.Errorf("durable task spec has invalid inputMode %q", spec.InputMode)
 	}
-	if err := validateVerifyTaskSpec(spec); err != nil {
-		return spec, fmt.Errorf("durable task spec has invalid verify: %w", err)
-	}
-	if err := validateLocalIPCSpec(spec); err != nil {
-		return spec, fmt.Errorf("durable task spec has invalid localIPC: %w", err)
-	}
 	if record.InputMode != "" && record.InputMode != protocol.EffectiveInputMode(spec.InputMode) {
 		return spec, errors.New("durable task spec inputMode disagrees with job record")
 	}
-	if spec.Backend != record.Backend || spec.CWD == "" || spec.Prompt == "" || spec.Write != record.Write {
+	if spec.Backend != record.Backend || spec.CWD == "" || spec.Prompt == "" || !spec.Intent.Valid() || spec.Intent != record.Intent {
 		return spec, errors.New("durable task spec disagrees with job record")
 	}
 	return spec, nil
@@ -1109,30 +976,11 @@ func resumeTargetForExecution(store *jobstore.Store, spec protocol.TaskSpec) (*j
 	return &target, nil
 }
 
-// validateCodexResumeHome rejects compatibility home modes because the source
-// record does not retain their original path. A resumed thread must use the
-// durable per-job home that actually owns it.
-func (s *Server) validateCodexResumeHome() error {
-	if s == nil {
-		return errors.New("nil service server")
-	}
-	if s.codexHomeInherit {
-		return errors.New("cannot resume Codex job with inherited CODEX_HOME: the source job home was not recorded")
-	}
-	if strings.TrimSpace(s.codexHomeOverride) != "" {
-		return errors.New("cannot resume Codex job with AGENTBUS_CODEX_HOME override: the source job home was not recorded")
-	}
-	return nil
-}
-
 // resumeCodexHome returns the exact CODEX_HOME at the root of a resume
 // lineage: that is where the backend thread actually lives. It intentionally
 // never creates a replacement, because a missing thread home must fail the new
 // job rather than making a fresh thread look like a resume.
 func (s *Server) resumeCodexHome(store *jobstore.Store, source jobstore.Record) (string, error) {
-	if err := s.validateCodexResumeHome(); err != nil {
-		return "", err
-	}
 	threadSource, err := resumeThreadSource(store, source)
 	if err != nil {
 		return "", err
@@ -1140,15 +988,12 @@ func (s *Server) resumeCodexHome(store *jobstore.Store, source jobstore.Record) 
 	if threadSource.JobID == "" || filepath.Base(threadSource.JobID) != threadSource.JobID || threadSource.CWD == "" {
 		return "", errors.New("resume target has no valid managed Codex home identity")
 	}
-	path := filepath.Join(s.stateRoot, "workspaces", engine.WorkspaceKey(threadSource.CWD), "codex", threadSource.JobID)
-	info, err := os.Lstat(path)
+	home, err := openExistingManagedCodexHome(codexLayout(s.stateRoot), threadSource.JobID)
 	if err != nil {
 		return "", fmt.Errorf("inspect source Codex home: %w", err)
 	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-		return "", errors.New("source Codex home is not a directory")
-	}
-	return path, nil
+	defer home.close()
+	return home.path, nil
 }
 
 // resumeThreadSource follows persisted resumeJobId links to the job that
@@ -1216,11 +1061,14 @@ func (s *Server) evaluateOutputSchema(store *jobstore.Store, record jobstore.Rec
 		return original, backendSessionID, contract, cleanup, diagnostics
 	}
 	if err := ctx.Err(); err != nil {
-		return original, backendSessionID, contract, cleanup, diagnostics
+		return original, backendSessionID, contract, cleanup, append(diagnostics, "schema correction unavailable: "+err.Error())
+	}
+	if cleanup != protocol.CleanupClean {
+		return original, backendSessionID, contract, cleanup, append(diagnostics, "schema correction unavailable: initial cleanup is uncertain")
 	}
 	initialClaimAttempted, initialClaimRecorded, initialClaimErr := run.claimStatus()
 	if initialClaimErr != nil || !initialClaimAttempted || !initialClaimRecorded {
-		return original, backendSessionID, contract, cleanup, diagnostics
+		return original, backendSessionID, contract, cleanup, append(diagnostics, "schema correction unavailable: initial process claim was not recorded")
 	}
 
 	// collectTurn returns only after the initial event stream closes. The
@@ -1260,10 +1108,15 @@ func (s *Server) evaluateOutputSchema(store *jobstore.Store, record jobstore.Rec
 // runCorrectionTurn starts the sole read-only correction turn after the
 // initial turn has retired.
 func (s *Server) runCorrectionTurn(store *jobstore.Store, record jobstore.Record, run *activeExecution, session engine.Session, ctx context.Context, timeout time.Duration, logPaths engine.LogPaths, items *itemAssembler, prompt string) turnOutcome {
+	scope, scopeErr := s.currentProcessScope()
+	if scopeErr != nil {
+		return turnOutcome{err: fmt.Errorf("establish correction process claim scope: %w", scopeErr), cleanup: protocol.CleanupClean}
+	}
+	run.claimScope = scope
 	run.beginTurn()
 	events, err, canceled := run.startTurn(store, session, ctx, engine.TurnInput{
 		Prompt:   prompt,
-		Write:    false,
+		Intent:   engine.IntentInspect,
 		Timeout:  timeout,
 		LogPaths: logPaths,
 	})
@@ -1381,6 +1234,7 @@ type turnOutcome struct {
 	err              error
 	timedOut         bool
 	interrupted      bool
+	turnFinalSeen    bool
 	cleanup          protocol.Cleanup
 	diagnostics      []string
 }
@@ -1404,11 +1258,17 @@ func collectTurn(s *Server, ctx context.Context, run *activeExecution, events <-
 			}
 			if drainTurnEvents(s, run, events, &outcome, &assistant, &result, &hasResult, items) {
 				outcome.text = attemptFinalText(hasResult, result, assistant.String())
+				// A built-in adapter's final observation says whether the deadline
+				// was already reached when semantic completion was accepted. A
+				// later deadline during retirement cannot rewrite that result.
+				if outcome.turnFinalSeen && (hasResult || assistant.Len() > 0) && outcome.err == nil && !outcome.timedOut && !outcome.interrupted && !run.cancellationRequested() {
+					return outcome
+				}
 			} else {
 				outcome.cleanup = protocol.CleanupUncertain
 				outcome.diagnostics = append(outcome.diagnostics, "backend event stream did not close after containment grace")
 				items.writer.markIncomplete()
-				discardTurnEvents(events)
+				run.trackCaptureDrain(discardTurnEvents(events))
 			}
 			outcome.err = ctx.Err()
 			return outcome
@@ -1472,6 +1332,7 @@ func absorbTurnEvent(run *activeExecution, outcome *turnOutcome, assistant *stri
 		if event.TurnFinal == nil {
 			return
 		}
+		outcome.turnFinalSeen = true
 		if strings.TrimSpace(event.TurnFinal.BackendSessionID) != "" {
 			outcome.backendSessionID = event.TurnFinal.BackendSessionID
 		}
@@ -1491,14 +1352,29 @@ func absorbTurnEvent(run *activeExecution, outcome *turnOutcome, assistant *stri
 	}
 }
 
-func discardTurnEvents(events <-chan engine.Event) {
-	if events == nil {
-		return
-	}
+func discardTurnEvents(events <-chan engine.Event) <-chan struct{} {
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		for range events {
 		}
 	}()
+	return done
+}
+
+func (run *activeExecution) trackCaptureDrain(done <-chan struct{}) {
+	run.mu.Lock()
+	run.captureDrains = append(run.captureDrains, done)
+	run.mu.Unlock()
+}
+
+func (run *activeExecution) waitCaptureDrains() {
+	run.mu.Lock()
+	drains := append([]<-chan struct{}(nil), run.captureDrains...)
+	run.mu.Unlock()
+	for _, done := range drains {
+		<-done
+	}
 }
 
 func cleanupAfterContextStop(run *activeExecution, contextErr error) (protocol.Cleanup, []string) {
@@ -1668,32 +1544,26 @@ func (s *Server) markTerminal(store *jobstore.Store, jobID string, terminal jobs
 			terminal.Cleanup = protocol.CleanupUncertain
 			terminal.Diagnostics = append(terminal.Diagnostics, "inspect managed Codex home terminal record: "+getErr.Error())
 		} else if current.State.IsTerminal() {
-			if recordUsesVerify(current) {
-				if copyErr := removeFrozenCopyFromManagedHome(home); copyErr != nil {
-					log.Printf("agentbus service: job %s frozen verification copy cleanup after terminal race: %v", jobID, copyErr)
-				}
-			}
 			home.close()
-			s.discardRecordedLocalIPCRoot(current)
 			return
 		} else {
 			cleanupRecord = current
 			cleanupRecord.State = terminal.State
-			if recordUsesVerify(cleanupRecord) {
-				if copyErr := removeFrozenCopyFromManagedHome(home); copyErr != nil {
-					terminal.Cleanup = protocol.CleanupUncertain
-					terminal.Diagnostics = append(terminal.Diagnostics, "frozen verification copy cleanup: "+copyErr.Error())
-				}
+			if terminal.BackendSessionID != "" {
+				cleanupRecord.BackendSessionID = terminal.BackendSessionID
 			}
 		}
 	}
 	_, err := store.MarkTerminal(jobID, terminal)
 	if err == nil {
-		s.discardManagedLocalIPCRoot(jobID, "")
 		if home != nil {
 			cleanup, diagnostics := finalizeManagedCodexHome(home, cleanupRecord, terminal.Cleanup, terminal.Diagnostics)
-			if cleanup != terminal.Cleanup && len(diagnostics) > len(terminal.Diagnostics) {
-				log.Printf("agentbus service: job %s managed Codex home cleanup after terminal write: %s", jobID, diagnostics[len(diagnostics)-1])
+			_ = cleanup
+			if len(diagnostics) > len(terminal.Diagnostics) {
+				diagnostic := boundProviderValue(diagnostics[len(diagnostics)-1], 512)
+				if _, appendErr := store.AppendDiagnostic(jobID, diagnostic); appendErr != nil {
+					log.Printf("agentbus service: job %s managed Codex home cleanup: %s", jobID, diagnostic)
+				}
 			}
 		}
 		return
@@ -1702,7 +1572,6 @@ func (s *Server) markTerminal(store *jobstore.Store, jobID string, terminal jobs
 		if home != nil {
 			home.close()
 		}
-		s.discardManagedLocalIPCRoot(jobID, "")
 		// ErrTerminal is the store-enforced first-terminal-wins result. A
 		// later observer never retries or overwrites that recorded outcome.
 		return
@@ -1715,20 +1584,18 @@ func (s *Server) markTerminal(store *jobstore.Store, jobID string, terminal jobs
 			Cleanup:          terminal.Cleanup,
 			BackendSessionID: terminal.BackendSessionID,
 			FailureClass:     protocol.FailureClassStorage,
+			FailureStage:     "finalize",
 			FailureReason:    executionFailureReason(storageCause),
 			Diagnostics:      appendRecordDiagnostics(terminal.Diagnostics, []string{storageDiagnostic}),
 			FinishedAt:       time.Now().UTC(),
 		}
 		if _, failureErr := store.MarkTerminal(jobID, failed); failureErr == nil {
-			s.discardManagedLocalIPCRoot(jobID, "")
 			if home != nil {
 				home.close()
 			}
 			return
 		} else if !errors.Is(failureErr, jobstore.ErrTerminal) {
 			err = errors.Join(err, fmt.Errorf("persist storage failure terminal record: %w", failureErr))
-		} else {
-			s.discardManagedLocalIPCRoot(jobID, "")
 		}
 	}
 	if home != nil {

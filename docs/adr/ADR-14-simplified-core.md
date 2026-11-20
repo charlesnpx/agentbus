@@ -1,5 +1,11 @@
 # ADR-14: Simplified core
 
+**Historical decision, superseded.** [ADR-15](ADR-15-protocol4-intent.md) and
+the current protocol and operations docs define the release contract. In
+particular, every conflicting protocol, CLI, sandbox, per-job cache, home,
+retention, and old-root deletion instruction below is superseded. The text is
+preserved to explain the earlier design; it is not deployment guidance.
+
 ADR-13 expressly leaves worker-launch removal for a separate deletion-oriented
 review as a non-goal. This ADR is that review. It completes the de-escalation
 that ADR-13 began.
@@ -9,7 +15,8 @@ that ADR-13 began.
 Agentbus becomes a small generic job service. It retains durable identified
 submission, one job lifecycle, inline JSON Schema validation, and process-group
 supervision. It deletes the durable admission-control, process-proof,
-held-worker, and parallel-projection machinery. This ADR is NORMATIVE.
+held-worker, and parallel-projection machinery. This was the decision at the
+time; ADR-15 defines the current release.
 
 ADR-14 supersedes the ADRs identified in the ADR index. Their historical files
 are retained under docs/history; their location does not preserve normative
@@ -669,6 +676,10 @@ error and prevents socket bind. Preflight is a safety check, not another store
 or a repair path.
 
 ### Required operator break
+
+This historical section is superseded by the
+[0.18 deployment guide](../deployment-0.18.md), especially its warning about
+the new root being nested in the old default root.
 
 VERSION 0.13.0 AND PROTOCOL VERSION 3 ARE A CLEAN BREAK. There is no
 compatibility shim and no state migration. Old state roots are abandoned. Before

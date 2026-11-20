@@ -6,9 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,7 +21,6 @@ const appServerRequestTimeout = 15 * time.Second
 
 type appServerDriver struct {
 	binary         string
-	writePolicy    WritePolicy
 	requestTimeout time.Duration
 	nextID         atomic.Uint64
 
@@ -47,10 +43,9 @@ type activeAppServerTurn struct {
 	steerResponses     map[string]chan map[string]any
 }
 
-func newAppServerDriver(binary string, writePolicy WritePolicy) *appServerDriver {
+func newAppServerDriver(binary string) *appServerDriver {
 	return &appServerDriver{
 		binary:         binary,
-		writePolicy:    writePolicy,
 		requestTimeout: appServerRequestTimeout,
 		active:         make(map[*duplex.Conn]*activeAppServerTurn),
 	}
@@ -58,36 +53,15 @@ func newAppServerDriver(binary string, writePolicy WritePolicy) *appServerDriver
 
 func (d *appServerDriver) ExecSpec(_ string, opts engine.SessionOpts, _ engine.TurnInput) (command.ExecSpec, error) {
 	argv := []string{d.binaryName(), "app-server"}
-	if opts.LocalIPC {
-		if !opts.Write && !opts.Verify {
-			return command.ExecSpec{}, errors.New("Codex local IPC requires a write-enabled or verify job")
-		}
-		if opts.CWD == "" || opts.WriteSandboxRoot == "" || opts.LocalIPCRoot == "" {
-			return command.ExecSpec{}, errors.New("Codex local IPC requires workspace, scratch, and private temp roots")
-		}
-		argv = append(argv, localIPCConfigArgsForWorkspace(opts.CWD, opts.WriteSandboxRoot, opts.LocalIPCRoot, runtime.GOOS, opts.LocalIPCDenyPaths, !opts.Verify, !opts.Verify)...)
-	}
 	return command.ExecSpec{
 		Argv: argv,
 		Dir:  opts.CWD,
 	}, nil
 }
 
-// CodexSandboxArgs returns the CLI sandbox overrides used to probe a local-IPC
-// session. The profile fields come from the same builder used by app-server.
-func (b *backend) CodexSandboxArgs(opts engine.SessionOpts) ([]string, error) {
-	if !opts.LocalIPC {
-		return nil, errors.New("Codex local IPC sandbox args require local IPC")
-	}
-	if opts.CWD == "" || opts.WriteSandboxRoot == "" || opts.LocalIPCRoot == "" {
-		return nil, errors.New("Codex local IPC requires workspace, scratch, and private temp roots")
-	}
-	args := localIPCConfigArgsForWorkspace(opts.CWD, opts.WriteSandboxRoot, opts.LocalIPCRoot, runtime.GOOS, opts.LocalIPCDenyPaths, !opts.Verify, !opts.Verify)
-	return append(args, "-P", localIPCPermissionProfile), nil
-}
-
 func (d *appServerDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resumeID string, opts engine.SessionOpts, input engine.TurnInput, emit duplex.EmitFunc) (string, error) {
 	rpc := d.newRPC(conn, emit)
+	rpc.threadID = resumeID
 	// Session.Turn exposes the logical turn before this provider handshake.
 	// Register now so an early steer waits for the app-server's turn ID.
 	active := newActiveAppServerTurn(resumeID)
@@ -115,10 +89,11 @@ func (d *appServerDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resume
 	if id := extractThreadID(threadResult); id != "" {
 		threadID = id
 	}
-	emitCodexSelection(threadResult, rpc.emit)
 	if threadID == "" {
 		return "", errors.New("codex app-server thread response missing thread id")
 	}
+	rpc.threadID = threadID
+	emitCodexThreadSelection(threadResult, opts, rpc.emit)
 
 	observer := &turnObserver{emit: emit}
 	// A turn can stop after item/started without ever delivering its matching
@@ -126,11 +101,10 @@ func (d *appServerDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resume
 	// including transport errors and cancellation paths that bypass completion.
 	defer observer.flushPendingToolItems()
 	active.setThreadID(threadID)
-	turnResult, err := rpc.request(ctx, "turn/start", turnStartParams(threadID, opts, input, d.writePolicy), observer, active.writeTurnStart(conn))
+	turnResult, err := rpc.request(ctx, "turn/start", turnStartParams(threadID, opts, input), observer, active.writeTurnStart(conn))
 	if err != nil {
 		return threadID, err
 	}
-	emitCodexSelection(turnResult, rpc.emit)
 	turnID := extractTurnID(turnResult)
 	if turnID == "" {
 		return threadID, errors.New("codex app-server turn/start response missing turn id")
@@ -494,6 +468,7 @@ type appServerRPC struct {
 	conn           *duplex.Conn
 	emit           duplex.EmitFunc
 	requestTimeout time.Duration
+	threadID       string
 }
 
 func (c *appServerRPC) handshake(ctx context.Context) error {
@@ -574,6 +549,9 @@ func (c *appServerRPC) nextFrame(ctx context.Context) (duplex.Frame, error) {
 			if frame.Err != nil {
 				var overlong *duplex.OverlongFrameError
 				if errors.As(frame.Err, &overlong) && codexOverlongFrameCanBeSkipped(overlong) {
+					if c.emit != nil {
+						c.emit(duplex.OrderedFrameDrop(overlong))
+					}
 					continue
 				}
 				return duplex.Frame{}, codexTransportReadError(frame.Err)
@@ -772,8 +750,13 @@ func (c *appServerRPC) handleNotification(frame duplex.Frame) {
 		return
 	}
 	method := firstString(frame.Object, "method")
-	if isCodexSelectionNotification(method) {
-		emitCodexSelection(paramsMap(frame.Object), c.emit)
+	if method == "thread/settings/updated" {
+		params := paramsMap(frame.Object)
+		if c.threadID != "" && firstString(params, "threadId") == c.threadID {
+			if settings, ok := firstMap(params, "threadSettings"); ok {
+				emitCodexSelection(firstString(settings, "model"), firstString(settings, "effort"), c.emit)
+			}
+		}
 	}
 	if method != "warning" && method != "error" && method != "config/warning" && method != "guardian/warning" {
 		return
@@ -783,74 +766,46 @@ func (c *appServerRPC) handleNotification(frame duplex.Frame) {
 	}
 }
 
-func isCodexSelectionNotification(method string) bool {
-	switch method {
-	case "thread/started", "thread/updated", "thread/model/changed", "thread/settings/changed", "thread/settings/updated",
-		"turn/started", "model/changed", "settings/updated", "config/settings/updated":
-		return true
-	default:
-		return false
-	}
-}
-
-func emitCodexSelection(value any, emit duplex.EmitFunc) {
+func emitCodexThreadSelection(value any, opts engine.SessionOpts, emit duplex.EmitFunc) {
 	if emit == nil {
 		return
 	}
-	model, effort := codexSelectionValues(value)
-	if model == "" && effort == "" {
+	object, ok := value.(map[string]any)
+	if !ok {
 		return
 	}
-	emit(engine.Event{Type: engine.EventModelReported, ModelReported: model, EffortReported: effort})
+	// The thread/start and resume responses report these fields. A turn-level
+	// effort override has not yet been observed when this response arrives.
+	model := firstString(object, "model")
+	effort := firstString(object, "reasoningEffort")
+	if opts.Effort != "" {
+		effort = ""
+	}
+	emitCodexSelection(model, effort, emit)
 }
 
-func codexSelectionValues(value any) (string, string) {
-	var model, effort string
-	var visit func(any, int)
-	visit = func(current any, depth int) {
-		if depth > 5 || model != "" && effort != "" {
-			return
-		}
-		object, ok := current.(map[string]any)
-		if !ok {
-			return
-		}
-		if model == "" {
-			model = firstString(object, "model", "modelId", "model_id", "currentModel", "current_model", "modelName", "model_name")
-			if model == "" {
-				if detail, ok := firstMap(object, "model"); ok {
-					model = firstString(detail, "id", "modelId", "model_id", "name")
-				}
-			}
-		}
-		if effort == "" {
-			effort = firstString(object, "effort", "reasoningEffort", "reasoning_effort", "effortLevel", "reasoningLevel", "reasoning_level")
-			if effort == "" {
-				if detail, ok := firstMap(object, "reasoning"); ok {
-					effort = firstString(detail, "effort", "level")
-				}
-			}
-		}
-		for _, key := range []string{"thread", "turn", "settings", "config", "modelSettings", "model_settings", "threadSettings", "reasoning"} {
-			if nested, ok := firstMap(object, key); ok {
-				visit(nested, depth+1)
-			}
-		}
+func emitCodexSelection(model, effort string, emit duplex.EmitFunc) {
+	if model != "" || effort != "" {
+		emit(engine.Event{Type: engine.EventModelReported, ModelReported: model, EffortReported: effort})
 	}
-	visit(value, 0)
-	return strings.TrimSpace(model), strings.TrimSpace(effort)
 }
 
 type turnObserver struct {
 	emit               duplex.EmitFunc
-	lastCompletedAgent string
-	agentDeltaSeen     map[string]bool
-	agentDeltaText     map[string]*strings.Builder
-	lastDeltaAgentItem string
+	agentItems         map[string]*agentItem
+	latestAgentItem    string
+	terminalText       *string
 	pendingToolItems   map[string]pendingToolItem
 	pendingToolItemIDs []string
 	emittedToolItemIDs map[string]struct{}
 	completion         *turnCompletion
+}
+
+type agentItem struct {
+	delta         strings.Builder
+	deltaSeen     bool
+	completedText string
+	completed     bool
 }
 
 type pendingToolItem struct {
@@ -872,7 +827,7 @@ func (o *turnObserver) handle(frame duplex.Frame) bool {
 	payload := paramsMap(frame.Object)
 	switch method {
 	case "item/agentMessage/delta":
-		if text := firstString(payload, "delta", "text"); text != "" {
+		if text := textFrom(payload); text != "" {
 			o.appendAgentDelta(payload, text)
 			o.emitEvent(engine.Event{Type: engine.EventAgentText, Text: text, Metadata: frame.Object})
 		}
@@ -893,10 +848,11 @@ func (o *turnObserver) handleItem(method string, payload map[string]any, metadat
 	kind := normalizeKind(firstString(item, "type"))
 	switch kind {
 	case "agentmessage", "assistantmessage", "message":
+		entry := o.observeAgentItem(agentDeltaItemIDOrDefault(payload))
 		if method == "item/completed" {
-			if text := textFrom(item); text != "" {
-				o.lastCompletedAgent = text
-				if !o.hasAgentDelta(payload) {
+			if text, present := agentMessageText(item); present {
+				entry.completed, entry.completedText = true, text
+				if !entry.deltaSeen && text != "" {
 					o.emitEvent(engine.Event{Type: engine.EventAgentText, Text: text, Metadata: metadata})
 				}
 			}
@@ -994,12 +950,22 @@ func (o *turnObserver) emitToolItem(item map[string]any, metadata map[string]any
 func (o *turnObserver) complete(payload map[string]any) {
 	turn, _ := firstMap(payload, "turn")
 	if turn != nil {
-		if text := lastAgentMessageFromTurn(turn); text != "" {
-			o.lastCompletedAgent = text
+		for _, raw := range anySlice(turn["items"]) {
+			item, ok := raw.(map[string]any)
+			if !ok || normalizeKind(firstString(item, "type")) != "agentmessage" {
+				continue
+			}
+			entry := o.observeAgentItem(agentDeltaItemIDOrDefault(map[string]any{"item": item}))
+			if text, present := agentMessageText(item); present {
+				entry.completed, entry.completedText = true, text
+			}
 		}
 	}
-	if text := firstString(payload, "last_agent_message", "lastAgentMessage"); text != "" {
-		o.lastCompletedAgent = text
+	for _, key := range []string{"last_agent_message", "lastAgentMessage"} {
+		if text, ok := payload[key].(string); ok {
+			o.terminalText = &text
+			break
+		}
 	}
 	status := firstString(payload, "status")
 	if status == "" && turn != nil {
@@ -1051,39 +1017,50 @@ func (o *turnObserver) emitEvent(ev engine.Event) {
 
 const defaultAgentDeltaItemID = "\x00agent-delta-default"
 
-func (o *turnObserver) hasAgentDelta(payload map[string]any) bool {
-	return o.agentDeltaSeen[agentDeltaItemIDOrDefault(payload)]
+func (o *turnObserver) observeAgentItem(itemID string) *agentItem {
+	if o.agentItems == nil {
+		o.agentItems = make(map[string]*agentItem)
+	}
+	item := o.agentItems[itemID]
+	if item == nil {
+		item = &agentItem{}
+		o.agentItems[itemID] = item
+		o.latestAgentItem = itemID
+	}
+	return item
 }
 
 func (o *turnObserver) appendAgentDelta(payload map[string]any, text string) {
-	itemID := agentDeltaItemIDOrDefault(payload)
-	if o.agentDeltaSeen == nil {
-		o.agentDeltaSeen = make(map[string]bool)
-	}
-	o.agentDeltaSeen[itemID] = true
-	if o.agentDeltaText == nil {
-		o.agentDeltaText = make(map[string]*strings.Builder)
-	}
-	builder := o.agentDeltaText[itemID]
-	if builder == nil {
-		builder = &strings.Builder{}
-		o.agentDeltaText[itemID] = builder
-	}
-	builder.WriteString(text)
-	o.lastDeltaAgentItem = itemID
+	item := o.observeAgentItem(agentDeltaItemIDOrDefault(payload))
+	item.deltaSeen = true
+	item.delta.WriteString(text)
 }
 
 func (o *turnObserver) resultText() string {
-	if o.lastCompletedAgent != "" {
-		return o.lastCompletedAgent
+	if o.terminalText != nil {
+		return *o.terminalText
 	}
-	if o.lastDeltaAgentItem == "" {
-		return ""
-	}
-	if builder := o.agentDeltaText[o.lastDeltaAgentItem]; builder != nil {
-		return builder.String()
+	if item := o.agentItems[o.latestAgentItem]; item != nil {
+		if item.completed {
+			return item.completedText
+		}
+		return item.delta.String()
 	}
 	return ""
+}
+
+func agentMessageText(item map[string]any) (string, bool) {
+	for _, key := range []string{"message", "text", "content", "result", "output"} {
+		if value, ok := item[key]; ok {
+			if text, ok := value.(string); ok {
+				return text, true
+			}
+			if text := stringValue(value); text != "" {
+				return text, true
+			}
+		}
+	}
+	return "", false
 }
 
 func finishTurnCompletion(threadID string, active *activeAppServerTurn, observer *turnObserver) (string, error) {
@@ -1242,12 +1219,7 @@ func threadParams(opts engine.SessionOpts, input engine.TurnInput, resumeID stri
 	params := map[string]any{
 		"approvalPolicy": "never",
 	}
-	workspaceWrite := input.Write || opts.Verify
-	if opts.LocalIPC && workspaceWrite {
-		params["permissions"] = localIPCPermissionProfile
-	} else {
-		params["sandbox"] = sandboxMode(workspaceWrite)
-	}
+	params["sandbox"] = "danger-full-access"
 	if opts.CWD != "" {
 		params["cwd"] = opts.CWD
 	}
@@ -1260,7 +1232,7 @@ func threadParams(opts engine.SessionOpts, input engine.TurnInput, resumeID stri
 	return params
 }
 
-func turnStartParams(threadID string, opts engine.SessionOpts, input engine.TurnInput, writePolicy WritePolicy) map[string]any {
+func turnStartParams(threadID string, opts engine.SessionOpts, input engine.TurnInput) map[string]any {
 	params := map[string]any{
 		"threadId":       threadID,
 		"approvalPolicy": "never",
@@ -1269,20 +1241,7 @@ func turnStartParams(threadID string, opts engine.SessionOpts, input engine.Turn
 			"text": input.Prompt,
 		}},
 	}
-	workspaceWrite := input.Write || opts.Verify
-	if opts.LocalIPC && workspaceWrite {
-		params["permissions"] = localIPCPermissionProfile
-	} else {
-		if opts.Verify {
-			writePolicy = WritePolicyWorkspaceOffline
-		}
-		policy := sandboxPolicy(workspaceWrite, opts.CWD, opts.WriteSandboxRoot, writePolicy)
-		if opts.Verify {
-			policy["excludeSlashTmp"] = true
-			policy["excludeTmpdirEnvVar"] = true
-		}
-		params["sandboxPolicy"] = policy
-	}
+	params["sandboxPolicy"] = map[string]any{"type": "dangerFullAccess"}
 	if opts.CWD != "" {
 		params["cwd"] = opts.CWD
 	}
@@ -1293,138 +1252,6 @@ func turnStartParams(threadID string, opts engine.SessionOpts, input engine.Turn
 		params["effort"] = opts.Effort
 	}
 	return params
-}
-
-func localIPCConfigArgs(workspace, scratch, ipcRoot string) []string {
-	return localIPCConfigArgsForWorkspace(workspace, scratch, ipcRoot, runtime.GOOS, nil, true, true)
-}
-
-func localIPCConfigArgsForWorkspace(workspace, scratch, ipcRoot, targetGOOS string, denyPaths []string, includeGitMetadata, includeSystemTemp bool) []string {
-	type filesystemEntry struct {
-		path       string
-		permission string
-	}
-	entries := make([]filesystemEntry, 0, 6+len(denyPaths))
-	indices := make(map[string]int, 6+len(denyPaths))
-	setFilesystemPermission := func(path, permission string) {
-		if index, ok := indices[path]; ok {
-			entries[index].permission = permission
-			return
-		}
-		indices[path] = len(entries)
-		entries = append(entries, filesystemEntry{path: path, permission: permission})
-	}
-	setFilesystemPermission(":root", "read")
-	setFilesystemPermission(workspace, "write")
-	setFilesystemPermission(scratch, "write")
-	setFilesystemPermission(ipcRoot, "write")
-	if includeSystemTemp && targetGOOS != "linux" {
-		setFilesystemPermission("/tmp", "write")
-	}
-	if includeGitMetadata {
-		setFilesystemPermission(filepath.Join(workspace, ".git"), "read")
-	}
-	if targetGOOS == "linux" {
-		for _, path := range denyPaths {
-			setFilesystemPermission(path, "deny")
-		}
-	}
-	filesystemParts := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		filesystemParts = append(filesystemParts, tomlString(entry.path)+"=\""+entry.permission+"\"")
-	}
-	filesystem := "{" + strings.Join(filesystemParts, ",") + "}"
-	args := []string{
-		"-c", `default_permissions=":workspace"`,
-		"-c", "features.network_proxy=true",
-		"-c", "permissions." + localIPCPermissionProfile + ".filesystem=" + filesystem,
-		"-c", "permissions." + localIPCPermissionProfile + ".network.enabled=true",
-		"-c", "permissions." + localIPCPermissionProfile + ".network.allow_local_binding=true",
-	}
-	if targetGOOS == "linux" {
-		args = append(args, "-c", "permissions."+localIPCPermissionProfile+".network.dangerously_allow_all_unix_sockets=true")
-	} else {
-		args = append(args, "-c", "permissions."+localIPCPermissionProfile+".network.unix_sockets={"+tomlString(ipcRoot)+"=\"allow\"}")
-	}
-	return args
-}
-
-func tomlString(value string) string {
-	var quoted strings.Builder
-	quoted.Grow(len(value) + 2)
-	quoted.WriteByte('"')
-	for _, r := range value {
-		switch r {
-		case '\\':
-			quoted.WriteString(`\\`)
-		case '"':
-			quoted.WriteString(`\"`)
-		case '\b':
-			quoted.WriteString(`\b`)
-		case '\t':
-			quoted.WriteString(`\t`)
-		case '\n':
-			quoted.WriteString(`\n`)
-		case '\f':
-			quoted.WriteString(`\f`)
-		case '\r':
-			quoted.WriteString(`\r`)
-		default:
-			if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
-				fmt.Fprintf(&quoted, `\u%04X`, r)
-			} else {
-				quoted.WriteRune(r)
-			}
-		}
-	}
-	quoted.WriteByte('"')
-	return quoted.String()
-}
-
-func sandboxMode(write bool) string {
-	if write {
-		return "workspace-write"
-	}
-	return "read-only"
-}
-
-func sandboxPolicy(write bool, cwd, writeSandboxRoot string, writePolicy WritePolicy) map[string]any {
-	if !write {
-		return map[string]any{
-			"type":          "readOnly",
-			"networkAccess": false,
-		}
-	}
-	if writePolicy == WritePolicyTrusted {
-		return map[string]any{
-			"type": "dangerFullAccess",
-		}
-	}
-	policy := map[string]any{
-		"type":          "workspaceWrite",
-		"networkAccess": writePolicy == WritePolicyWorkspaceNetwork,
-	}
-	roots := make([]string, 0, 2)
-	if root := workspaceRoot(cwd); root != "" {
-		roots = append(roots, root)
-	}
-	if writeSandboxRoot != "" {
-		roots = append(roots, writeSandboxRoot)
-	}
-	if len(roots) > 0 {
-		policy["writableRoots"] = roots
-	}
-	return policy
-}
-
-func workspaceRoot(cwd string) string {
-	if cwd != "" {
-		return cwd
-	}
-	if wd, err := os.Getwd(); err == nil {
-		return wd
-	}
-	return ""
 }
 
 func declineResponse(method string, params map[string]any) (map[string]any, bool) {
@@ -1521,20 +1348,6 @@ func extractTurnID(result any) string {
 		return firstString(turn, "id", "turnId", "turn_id")
 	}
 	return ""
-}
-
-func lastAgentMessageFromTurn(turn map[string]any) string {
-	var last string
-	for _, raw := range anySlice(turn["items"]) {
-		item, ok := raw.(map[string]any)
-		if !ok || normalizeKind(firstString(item, "type")) != "agentmessage" {
-			continue
-		}
-		if text := textFrom(item); text != "" {
-			last = text
-		}
-	}
-	return last
 }
 
 func toolName(item map[string]any) string {
